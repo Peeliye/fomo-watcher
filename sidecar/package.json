@@ -1,0 +1,22 @@
+{
+  "name": "fomo-browser-sidecar",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node realtime-sidecar.mjs",
+    "test": "node --test test-fast-shadow.mjs",
+    "build:privy": "esbuild privy-keeper.jsx --bundle --outfile=privy-keeper.bundle.js --format=iife --platform=browser --minify",
+    "start:privy": "node privy-keeper.mjs",
+    "start:browser-debug": "node sidecar.mjs"
+  },
+  "dependencies": {
+    "@privy-io/react-auth": "2.5.0",
+    "dotenv": "^17.0.0",
+    "playwright-core": "^1.55.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

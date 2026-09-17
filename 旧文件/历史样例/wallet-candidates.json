@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "active": false,
+  "purpose": "Research-only wallet candidates. This file is never loaded by the risk pipeline.",
+  "reviewedAt": "2026-09-11T02:30:00+08:00",
+  "candidates": [
+    {
+      "kolId": "aefe2ddd-c580-5245-a2f5-e4ed62f7ef10",
+      "handle": "frankdegods",
+      "status": "partially-verified",
+      "addresses": [
+        {
+          "family": "evm",
+          "address": "0x696d1265c8fc4f14797abebfae3c43ebfa9d8e28",
+          "status": "unverified-candidate"
+        },
+        {
+          "family": "solana",
+          "address": "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ",
+          "status": "promoted-to-registry",
+          "confirmedAt": "2026-09-11T02:47:38+08:00"
+        }
+      ],
+      "sources": [
+        "https://www.fomoscan.sh/walletchecker/frankdegods",
+        "https://app.cielo.finance/profile/0x696d1265c8fc4f14797abebfae3c43ebfa9d8e28/activity",
+        "https://socialtrade.fun/"
+      ],
+      "blocker": "The Solana address was user-confirmed and promoted. The EVM address remains isolated because sources may identify an app-managed Fomo wallet."
+    },
+    {
+      "kolId": "e8d56799-ed96-54cf-92ff-31feee0db00c",
+      "handle": "notanicecat69",
+      "status": "unverified-candidate",
+      "addresses": [
+        {
+          "family": "evm",
+          "address": "0xb02208d1b27811480cf6171bccc2b7af9513cddb"
+        }
+      ],
+      "sources": [
+        "https://app.cielo.finance/profile/0xb02208d1b27811480cf6171bccc2b7af9513cddb/activity"
+      ],
+      "blocker": "Third-party label only; current balance/activity does not prove this is the KOL's external trading wallet."
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+.env
+config.yaml
+data/
+sidecar/node_modules/
+sidecar/pnpm-lock.yaml
+__pycache__/
+*.pyc
+.pip-cache/
+.pnpm-store/
+.venv/
+.pytest_cache/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+.DS_Store
+Thumbs.db

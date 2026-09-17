@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "walletId": "primary-multichain",
+  "mode": "disabled",
+  "signer": {
+    "backend": "disabled",
+    "reference": null
+  },
+  "accounts": [
+    {
+      "accountId": "primary-evm",
+      "family": "evm",
+      "address": "0x4Ccb77f12801EE8853a9CC3782828678c8F5584b",
+      "chainIds": [
+        "1",
+        "56",
+        "4663",
+        "5042",
+        "8453"
+      ]
+    },
+    {
+      "accountId": "primary-solana",
+      "family": "solana",
+      "address": "6vhVnKoVeCYDZVTuhSpvJByEpuj3gboEbLaKzCkxPn7W",
+      "chainIds": [
+        "1399811149"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "asset": {
+    "liquidityUsd": 250000,
+    "marketCapUsd": 1000000,
+    "buyTaxBps": 0,
+    "sellTaxBps": 0,
+    "topHolderPercent": 8,
+    "privilegesKnownSafe": true,
+    "sellSimulationPassed": true,
+    "routeAllowlisted": true
+  },
+  "quotes": [
+    {
+      "provider": "quote-a",
+      "outputAmount": "1000000",
+      "priceImpactBps": 30,
+      "capturedAt": "2026-09-10T00:00:00+00:00"
+    },
+    {
+      "provider": "quote-b",
+      "outputAmount": "995000",
+      "priceImpactBps": 32,
+      "capturedAt": "2026-09-10T00:00:00+00:00"
+    }
+  ],
+  "exposure": {
+    "perTokenUsd": 0,
+    "perKolDailyUsd": 0,
+    "globalDailyUsd": 0,
+    "openPositions": 0,
+    "chainExposurePercent": 0,
+    "nativeGasReserveUsd": 100
+  },
+  "health": {
+    "clockOffsetMs": 5,
+    "primaryStreamConnected": true,
+    "whitelistFresh": true,
+    "evmRpcBlockLag": 0,
+    "solanaRpcSlotLag": 0,
+    "circuitBreakerTripped": false
+  },
+  "exitPlanReady": true,
+  "transactionSimulationPassed": true
+}

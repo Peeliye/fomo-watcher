@@ -1,0 +1,29 @@
+[project]
+name = "fomo-watcher"
+version = "0.2.0"
+description = "Multi-chain KOL signal monitor and shadow copy-trading risk console"
+requires-python = ">=3.11"
+dependencies = [
+  "curl-cffi>=0.13,<1",
+  "PyYAML>=6.0,<7",
+  "tzdata>=2025.2",
+  "keyring>=25.0,<26",
+  "python-dotenv>=1.0,<2",
+  "bip-utils>=2.9,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0,<10",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["fomo", "scripts", "run.py"]

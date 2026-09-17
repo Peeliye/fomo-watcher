@@ -1,0 +1,17 @@
+{
+  "signalId": "solana_processed:1399811149:example-signature",
+  "source": "solana_processed",
+  "observedAt": "2026-09-10T00:00:00+00:00",
+  "sourceTimestamp": "2026-09-10T00:00:00+00:00",
+  "chainId": "1399811149",
+  "kolId": "example-kol-id",
+  "wallet": "11111111111111111111111111111111",
+  "walletConfidence": 0.95,
+  "originalTx": "example-signature",
+  "side": "buy",
+  "tokenIn": "So11111111111111111111111111111111111111112",
+  "tokenOut": "example-token-mint",
+  "estimatedUsd": 500,
+  "decoder": "jupiter-swap@1",
+  "rawPayloadHash": "example-sha256"
+}

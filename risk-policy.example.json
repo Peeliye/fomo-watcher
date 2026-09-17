@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "mode": "shadow",
+  "liveTrading": {
+    "enabled": false,
+    "requireStartupArmFlag": true,
+    "requireSignerAllowlist": true,
+    "requireExitPlan": true
+  },
+  "identity": {
+    "minimumWalletConfidenceForShadow": 0.6,
+    "minimumWalletConfidenceForLive": 0.9,
+    "mappingMaxAgeDays": 30,
+    "allowInferredWalletsForLive": false
+  },
+  "signals": {
+    "allowedSources": [
+      "fomo",
+      "evm_pending",
+      "solana_preprocessed",
+      "solana_processed"
+    ],
+    "maximumAgeMs": {
+      "fomo": 2000,
+      "evm_pending": 750,
+      "solana_preprocessed": 250,
+      "solana_processed": 800
+    },
+    "dedupeWindowSeconds": 900,
+    "rejectUnknownSide": true,
+    "rejectUnknownDecoder": true
+  },
+  "execution": {
+    "paperBuyUsd": 10,
+    "maximumLiveBuyUsd": 10,
+    "maximumPriceImpactBps": 100,
+    "maximumSlippageBps": 150,
+    "maximumQuoteAgeMs": 750,
+    "maximumQuoteDivergenceBps": 100,
+    "minimumIndependentQuotes": 2,
+    "requireSimulation": true,
+    "copyOriginalCalldata": false,
+    "allowSkipPreflight": false,
+    "parallelBroadcastProviders": 2
+  },
+  "asset": {
+    "minimumLiquidityUsd": 100000,
+    "minimumMarketCapUsd": 100000,
+    "maximumBuyTaxBps": 500,
+    "maximumSellTaxBps": 500,
+    "maximumTopHolderPercent": 20,
+    "requireSellSimulation": true,
+    "rejectMutableOrUnknownPrivileges": true,
+    "rejectEvmDelegateCall": true,
+    "rejectUnknownSolanaCpi": true,
+    "rejectToken2022TransferHooksByDefault": true
+  },
+  "exposure": {
+    "maximumPerTokenUsd": 20,
+    "maximumPerKolDailyUsd": 50,
+    "maximumGlobalDailyUsd": 100,
+    "maximumOpenPositions": 5,
+    "maximumChainExposurePercent": 50,
+    "minimumNativeGasReserveUsd": 25
+  },
+  "exit": {
+    "hardStopLossPercent": 8,
+    "maximumHoldingMinutes": 30,
+    "mirrorKolSells": true,
+    "stopAddingWhenExitUnavailable": true,
+    "takeProfit": {
+      "enabled": false,
+      "shadowLevelsPercent": [10, 20, 50]
+    }
+  },
+  "circuitBreakers": {
+    "maximumClockOffsetMs": 100,
+    "maximumConsecutiveExecutionFailures": 3,
+    "failureRateWindowMinutes": 10,
+    "maximumFailureRatePercent": 20,
+    "maximumDailyRealizedLossUsd": 20,
+    "maximumEvmRpcBlockLag": 1,
+    "maximumSolanaRpcSlotLag": 2,
+    "tripOnWhitelistExpiry": true,
+    "tripOnPrimaryStreamDisconnect": true,
+    "manualResetRequired": true
+  },
+  "audit": {
+    "appendOnly": true,
+    "redactSecrets": true,
+    "hashRawPayload": true,
+    "recordRejectedSignals": true,
+    "recordQuoteAndSimulation": true,
+    "recordTransactionLifecycle": true
+  }
+}

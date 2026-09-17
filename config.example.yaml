@@ -1,0 +1,136 @@
+poll_seconds: 30
+timezone: Asia/Shanghai
+state_db: data/state.sqlite3
+
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+
+wallet_management:
+  watchlist_path: watch-wallets.json
+  audit_log_path: data/wallet-management-audit.ndjson
+  maximum_import_rows: 500
+
+targets:
+  - handle: DumbCrayonEater
+    enabled: true
+
+account_feed: true
+browser_sidecar: false
+
+filters:
+  min_usd_change: 10
+  min_token_change: 0.000001
+
+# 模拟跟单覆盖 Fomo 当前支持的全部链；只记录决策，不签名或发送交易。
+copy_trading:
+  enabled: true
+  mode: paper
+  network_ids: [1, 56, 4663, 8453, 1399811149]
+  event_types: [swap_buy, single_user_buy]
+  fixed_usd: 10
+  min_target_buy_usd: 100
+  max_signal_age_seconds: 5
+  whitelist_max_age_seconds: 600
+  min_market_cap_usd: 100000
+  max_slippage_bps: 200
+  per_token_limit_usd: 20
+  per_kol_daily_limit_usd: 50
+  daily_limit_usd: 100
+  max_open_positions: 5
+  log_path: data/paper-orders.ndjson
+
+# 只读风控流水线：钱包未登记时只记录 needs_identity，不猜测归属。
+read_only_risk:
+  enabled: true
+  policy_path: risk-policy.example.json
+  registry_path: wallet-registry.json
+  log_path: data/risk-decisions.ndjson
+
+smart_money:
+  enabled: true
+  database: data/wallet-intelligence.sqlite3
+  dashboard_cache_seconds: 15
+  minimum_buy_events: 20
+  minimum_distinct_tokens: 10
+  minimum_active_days: 7
+  low_cap_usd: 1000000
+  pvp_daily_buy_rate: 10
+  large_buy_thresholds:
+    - {maximum_market_cap_usd: 1000000, minimum_buy_usd: 5000}
+    - {maximum_market_cap_usd: 3000000, minimum_buy_usd: 10000}
+    - {maximum_market_cap_usd: null, minimum_buy_usd: 20000}
+
+leaderboard_monitor:
+  enabled: true
+  window: 24h
+  minute: 1
+  database: data/leaderboard.sqlite3
+  archive_dir: data/leaderboard
+
+execution:
+  wallet_profile: execution-wallet.json
+  broadcaster_enabled_env: LIVE_BROADCAST_ENABLED
+  enabled_chain_ids: [1, 56, 4663, 8453, 1399811149]
+  rpc:
+    "1": {env: RPC_ETHEREUM_URL}
+    "56": {env: RPC_BSC_URL}
+    "4663": {env: RPC_ROBINHOOD_URL}
+    "8453": {env: RPC_BASE_URL}
+    "1399811149": {env: RPC_SOLANA_URL}
+
+rpc_pool:
+  database: data/rpc-health.sqlite3
+  sample_window: 100
+  maximum_p95_latency_ms: 750
+  maximum_block_lag: 3
+  maximum_sample_age_seconds: 300
+  endpoints:
+    "1": [{provider: quicknode, role: primary, http_env: RPC_ETHEREUM_URL, ws_env: RPC_ETHEREUM_WSS, priority: 10}, {provider: alchemy, role: backup, http_env: RPC_ETHEREUM_BACKUP_URL, ws_env: RPC_ETHEREUM_BACKUP_WSS, priority: 20}]
+    "56": [{provider: quicknode, role: primary, http_env: RPC_BSC_URL, ws_env: RPC_BSC_WSS, priority: 10}, {provider: alchemy, role: backup, http_env: RPC_BSC_BACKUP_URL, ws_env: RPC_BSC_BACKUP_WSS, priority: 20}]
+    "4663": [{provider: quicknode, role: primary, http_env: RPC_ROBINHOOD_URL, ws_env: RPC_ROBINHOOD_WSS, priority: 10}, {provider: secondary, role: backup, http_env: RPC_ROBINHOOD_BACKUP_URL, ws_env: RPC_ROBINHOOD_BACKUP_WSS, priority: 20}]
+    "8453": [{provider: quicknode, role: primary, http_env: RPC_BASE_URL, ws_env: RPC_BASE_WSS, priority: 10}, {provider: alchemy, role: backup, http_env: RPC_BASE_BACKUP_URL, ws_env: RPC_BASE_BACKUP_WSS, priority: 20}]
+    "1399811149": [{provider: helius, role: primary, http_env: RPC_SOLANA_URL, ws_env: RPC_SOLANA_WSS, priority: 10}, {provider: quicknode, role: backup, http_env: RPC_SOLANA_BACKUP_URL, ws_env: RPC_SOLANA_BACKUP_WSS, priority: 20}]
+
+portfolio:
+  enabled: true
+  account_id: paper-main
+  database: data/portfolio.sqlite3
+  paper_exit_mode: full_on_first_sell
+  mark_stale_seconds: 300
+  daily_backup: true
+  backup_dir: data/backups
+
+execution_journal:
+  enabled: true
+  database: data/execution.sqlite3
+
+routing:
+  enabled: true
+  mode: shadow
+  prohibit_cross_chain: true
+  quote_deadline_ms: {evm: 200, solana: 160}
+  maximum_quote_age_ms: 500
+  maximum_price_impact_bps: 100
+  maximum_output_sacrifice_bps: 30
+  minimum_independent_routes: 2
+  providers:
+    "1": [{name: 0x_v2, kind: aggregator, api_key_env: ZEROX_API_KEY, adapter_env: ROUTE_0X_ENABLED}, {name: chain_direct_pool, kind: direct, requires_rpc: true, adapter_env: ROUTE_DIRECT_POOL_ENABLED}]
+    "56": [{name: 0x_v2, kind: aggregator, api_key_env: ZEROX_API_KEY, adapter_env: ROUTE_0X_ENABLED}, {name: chain_direct_pool, kind: direct, requires_rpc: true, adapter_env: ROUTE_DIRECT_POOL_ENABLED}]
+    "4663": [{name: 0x_v2, kind: aggregator, api_key_env: ZEROX_API_KEY, adapter_env: ROUTE_0X_ENABLED}, {name: chain_direct_pool, kind: direct, requires_rpc: true, adapter_env: ROUTE_DIRECT_POOL_ENABLED}]
+    "8453": [{name: 0x_v2, kind: aggregator, api_key_env: ZEROX_API_KEY, adapter_env: ROUTE_0X_ENABLED}, {name: chain_direct_pool, kind: direct, requires_rpc: true, adapter_env: ROUTE_DIRECT_POOL_ENABLED}]
+    "1399811149": [{name: jupiter_swap_v2, kind: meta_aggregator, api_key_env: JUPITER_API_KEY, adapter_env: ROUTE_JUPITER_ENABLED}, {name: solana_direct_pool, kind: direct, requires_rpc: true, adapter_env: ROUTE_DIRECT_POOL_ENABLED}]
+
+links:
+  # 不同平台的路由会变化，所以全部可配置。{ca}、{chain}、{network_id}、{trade_id} 可用。
+  fomo: "https://fomo.family/token/{ca}?chain={chain}"
+  gmgn: "https://gmgn.ai/{chain}/token/{ca}"
+  debot: "https://debot.ai/token/{chain}/{ca}"
+
+notifications:
+  telegram: false
+  feishu: false
+  wechat_work: false
+  qq_onebot: false
+  generic_webhook: false

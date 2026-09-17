@@ -1,0 +1,46 @@
+{
+  "version": 3,
+  "wallets": [
+    {
+      "kolId": "36adb85a-c0fd-5fa8-916d-8fdc32fe4237",
+      "handle": "unipcs",
+      "chainIds": [
+        "1",
+        "56",
+        "4663",
+        "8453"
+      ],
+      "address": "0xb16c60e0a93b73cd96bca5b0811715146b3f6fb4",
+      "confidence": 0.8,
+      "evidence": [
+        {
+          "type": "user-attestation",
+          "reference": "user-provided-in-codex:2026-09-11",
+          "recordedAt": "2026-09-10T18:28:03.059784+00:00"
+        }
+      ],
+      "verifiedAt": "2026-09-10T18:28:03.059784+00:00",
+      "expiresAt": "2026-10-10T18:28:03.059784+00:00",
+      "status": "shadow-only"
+    },
+    {
+      "kolId": "36adb85a-c0fd-5fa8-916d-8fdc32fe4237",
+      "handle": "unipcs",
+      "chainIds": [
+        "1399811149"
+      ],
+      "address": "5M8ACGKEXG1ojKDTMH3sMqhTihTgHYMSsZc6W8i7QW3Y",
+      "confidence": 0.8,
+      "evidence": [
+        {
+          "type": "user-attestation",
+          "reference": "user-provided-in-codex:2026-09-11",
+          "recordedAt": "2026-09-10T18:28:03.214889+00:00"
+        }
+      ],
+      "verifiedAt": "2026-09-10T18:28:03.214889+00:00",
+      "expiresAt": "2026-10-10T18:28:03.214889+00:00",
+      "status": "shadow-only"
+    }
+  ]
+}

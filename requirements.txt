@@ -1,0 +1,6 @@
+curl_cffi>=0.13,<1
+PyYAML>=6.0,<7
+tzdata>=2025.2
+keyring>=25.0,<26
+python-dotenv>=1.0,<2
+bip-utils>=2.9,<3
