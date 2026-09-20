@@ -118,8 +118,27 @@ db.commit();os._exit(0)
         self.assertEqual(people["a"]["appearCount"], 2)
         self.assertEqual(people["a"]["firstPnl"], 50)
         self.assertEqual(people["a"]["latestRankedPnl"], 200)
-        self.assertEqual(people["a"]["pnlChange"], 150)
+        self.assertEqual(people["a"]["rankedPnl24hChangeUsd"], 150)
+        self.assertEqual(people["a"]["currentPnl24hUsd"], 200)
+        self.assertTrue(people["a"]["currentValueAvailable"])
+        self.assertIsNone(people["b"]["currentPnl24hUsd"])
+        self.assertFalse(people["b"]["currentValueAvailable"])
+        self.assertEqual(people["b"]["pnlSource"], "fomo_rolling_24h")
         self.assertEqual(history[10]["status"], "not_ranked")
+
+    def test_rolling_window_change_is_not_natural_day_pnl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); archive = LeaderboardArchive(root / "rank.sqlite3", root / "leaderboard")
+            try:
+                archive.capture([member("a", "alice", 100)], captured_at=datetime(2026,9,20,0,tzinfo=timezone.utc))
+                archive.capture([member("a", "alice", 40)], captured_at=datetime(2026,9,20,1,tzinfo=timezone.utc))
+                person = archive.participants("2026-09-20")[0]
+                overview = archive.overview("2026-09-20")
+            finally: archive.close()
+        self.assertEqual(person["currentPnl24hUsd"], 40)
+        self.assertEqual(person["rankedPnl24hChangeUsd"], -60)
+        self.assertEqual(overview["pnlMetric"], "fomo_rolling_24h")
+        self.assertNotIn("pnlChange", person)
 
     def test_duplicate_hour_failure_retry_and_new_day_reset(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -339,6 +339,19 @@ class WalletIntelligenceStore:
                 "riskFlags": flags,
                 "recommendedMode": "observe_only",
                 "latestAt": str(events[-1]["event_time"]),
+                "source": "fomo_feed_behavior_observation",
+                "asOf": str(events[-1]["event_time"]),
+                "freshness": "latest_observed_feed_event",
+                "verificationStatus": "observation_only_not_pnl",
+                "metrics": {
+                    "buyEvents": {"value": len(buys), "source": "fomo_feed", "verificationStatus": "observed"},
+                    "sellEvents": {"value": len(sells), "source": "fomo_feed", "verificationStatus": "observed"},
+                    "observedBuyUsd": {
+                        "valueUsd": round(total_buy, 2),
+                        "source": "fomo_feed_reported_amount",
+                        "verificationStatus": "not_pnl",
+                    },
+                },
             }
             profiles.append(profile)
             style_counts[style] += 1
@@ -347,6 +360,8 @@ class WalletIntelligenceStore:
         return {
             "observationOnly": True,
             "performanceVerified": False,
+            "source": "fomo_feed_behavior_observation",
+            "verificationStatus": "observation_only_not_pnl",
             "totalEvents": len(rows),
             "profiled": len(profiles),
             "sufficientBehaviorSamples": sufficient,

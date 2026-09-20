@@ -21,6 +21,13 @@ export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = D
   const targetBuyUsd = Number(event.usdAmount || event.amountUsd || 0);
   const marketCapUsd = Number(event.marketCap || event.fdv || 0);
   const createdMs = Date.parse(event.createdAt || receivedAt);
+  const receivedMs = Date.parse(receivedAt);
+  const rawUpstreamAgeMs = Number.isFinite(createdMs) && Number.isFinite(receivedMs)
+    ? receivedMs - createdMs
+    : null;
+  const upstreamAgeMs = rawUpstreamAgeMs === null ? null : Math.max(0, rawUpstreamAgeMs);
+  const upstreamClockSkewMs = rawUpstreamAgeMs === null ? null : Math.max(0, -rawUpstreamAgeMs);
+  const localQueueMs = Number.isFinite(receivedMs) ? Math.max(0, nowMs - receivedMs) : null;
   const signalAgeMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : null;
   const allowedEvents = new Set(config?.eventTypes || ["swap_buy", "single_user_buy"]);
   const activeBuyEvents = new Set(config?.activeBuyEventTypes || ["swap_buy", "single_user_buy"]);
@@ -58,6 +65,11 @@ export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = D
     symbol: String(event.ticker || ""),
     networkId,
     ca: String(event.tokenAddress || ""),
+    sourceCreatedAt: String(event.createdAt || ""),
+    upstreamAgeMs: upstreamAgeMs === null ? null : Math.round(upstreamAgeMs * 1000) / 1000,
+    upstreamClockSkewMs: upstreamClockSkewMs === null ? null : Math.round(upstreamClockSkewMs * 1000) / 1000,
+    localQueueMs: localQueueMs === null ? null : Math.round(localQueueMs * 1000) / 1000,
+    // Kept for log/API compatibility and for the existing stale-signal gate.
     signalAgeMs: signalAgeMs === null ? null : Math.round(signalAgeMs * 1000) / 1000,
     targetBuyUsd,
     marketCapUsd,

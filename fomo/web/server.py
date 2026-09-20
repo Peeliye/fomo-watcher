@@ -11,6 +11,7 @@ import sqlite3
 import struct
 import threading
 import time
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -274,7 +275,13 @@ def build_risk_payload(log_path: Path, limit: int = 500, retention_days: int = 3
     }
 
 
-def build_identity_payload(registry_path: Path, risk_log_path: Path, retention_days: int = 30) -> dict[str, Any]:
+def build_identity_payload(
+    registry_path: Path,
+    risk_log_path: Path,
+    retention_days: int = 30,
+    following_path: Path | None = None,
+    intelligence_database: Path | None = None,
+) -> dict[str, Any]:
     registry = _read_json(registry_path)
     wallets = registry.get("wallets", []) if isinstance(registry.get("wallets", []), list) else []
     now = datetime.now(timezone.utc)
@@ -320,11 +327,36 @@ def build_identity_payload(registry_path: Path, risk_log_path: Path, retention_d
           "symbols":sorted({x for x in str(symbols or "").split(",") if x and x!="UNKNOWN"})[:6],
           "reason":"ambiguous_wallet_mapping" if candidate_counts[key]>1 else "wallet_not_registered"})
     backlog_rows.sort(key=lambda item:str(item.get("latestAt") or ""),reverse=True)
+    followed_document = _read_json(following_path) if following_path is not None else {}
+    followed_kols = len({str(value) for value in followed_document.get("followingIds", []) if str(value)})
+    profiled_kols = 0
+    if intelligence_database is not None and intelligence_database.exists():
+        profile_db = sqlite3.connect(f"file:{intelligence_database.as_posix()}?mode=ro", uri=True, timeout=5)
+        try:
+            profiled_kols = int(profile_db.execute("SELECT COUNT(DISTINCT kol_id) FROM intelligence_events").fetchone()[0])
+        except sqlite3.Error:
+            profiled_kols = 0
+        finally:
+            profile_db.close()
+    registered_entries = sum(1 for item in public_wallets if item["trusted"])
+    registered_unique = len({item["kolId"] for item in public_wallets if item["trusted"] and item["kolId"]})
+    expired_entries = sum(1 for item in public_wallets if item["expired"] and item["status"] != "revoked")
+    revoked_entries = sum(1 for item in public_wallets if item["status"] == "revoked")
+    pending_unique = len({item["kolId"] for item in backlog_rows if item["kolId"]})
     return {
         "registryVersion": int(registry.get("version", 1)),
-        "registered": sum(1 for item in public_wallets if item["trusted"]),
-        "revoked": sum(1 for item in public_wallets if item["status"] == "revoked"),
-        "expired": sum(1 for item in public_wallets if item["expired"] and item["status"] != "revoked"),
+        "followedKols": followed_kols,
+        "profiledKols": profiled_kols,
+        "pendingUniqueKols": pending_unique,
+        "pendingKolChainPairs": len(backlog_rows),
+        "registeredWalletEntries": registered_entries,
+        "registeredUniqueKols": registered_unique,
+        "expiredWalletEntries": expired_entries,
+        "revokedWalletEntries": revoked_entries,
+        # Compatibility aliases have explicit units above and are not used by the UI.
+        "registered": registered_entries,
+        "revoked": revoked_entries,
+        "expired": expired_entries,
         "pending": len(backlog_rows),
         "wallets": public_wallets,
         "backlog": backlog_rows,
@@ -472,6 +504,8 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
         float(settings.get("watch_interval_seconds", 0.75)),
         int(settings.get("maximum_websocket_clients", 32)),
     )
+    service_instance_id = uuid.uuid4().hex
+    service_started_at = datetime.now(timezone.utc).isoformat()
 
     def leaderboard_payload(action: str, query: dict[str, list[str]]) -> dict[str, Any] | list[dict[str, Any]]:
         store = LeaderboardArchive(leaderboard_db, leaderboard_archive,
@@ -491,12 +525,25 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
         protocol_version = "HTTP/1.1"
 
         def _send_json(self, payload: Any, status: int = 200) -> None:
+            generated_at = datetime.now(timezone.utc).isoformat()
+            if isinstance(payload, dict):
+                payload = {
+                    **payload,
+                    "serviceInstanceId": service_instance_id,
+                    "startupId": service_instance_id,
+                    "serviceStartedAt": service_started_at,
+                    "generatedAt": generated_at,
+                    "dataRevision": change_bus.revision,
+                }
             content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Fomo-Service-Instance", service_instance_id)
+                self.send_header("X-Fomo-Generated-At", generated_at)
+                self.send_header("X-Fomo-Data-Revision", str(change_bus.revision))
                 self.end_headers()
                 self.wfile.write(content)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -562,7 +609,12 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 self.send_header("Sec-WebSocket-Accept", accept)
                 self.end_headers()
                 try:
-                    self.connection.sendall(_websocket_text_frame({"type": "ready", "keys": list(change_sources)}))
+                    self.connection.sendall(_websocket_text_frame({
+                        "type": "ready", "keys": list(change_sources),
+                        "serviceInstanceId": service_instance_id,
+                        "generatedAt": datetime.now(timezone.utc).isoformat(),
+                        "dataRevision": change_bus.revision,
+                    }))
                     revision = change_bus.revision
                     while True:
                         next_revision, changed = change_bus.wait(revision, 15)
@@ -586,6 +638,20 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self._write_content(content)
+                return
+            if parsed.path == "/assets/dashboard-consistency.mjs":
+                module_path = html_path.parent / "dashboard-consistency.mjs"
+                try:
+                    content = module_path.read_bytes()
+                except OSError:
+                    self._send_json({"error": "dashboard_module_not_found"}, 404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/javascript; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self._write_content(content)
                 return
@@ -646,7 +712,8 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 return
             if parsed.path == "/api/wallet-registry":
                 self._send_json(build_identity_payload(
-                    registry_path, risk_log_path, int(risk_settings.get("audit_retention_days", 30))
+                    registry_path, risk_log_path, int(risk_settings.get("audit_retention_days", 30)),
+                    data_dir / "following-ids.json", intelligence_db,
                 ))
                 return
             if parsed.path == "/api/wallet-management":

@@ -763,12 +763,15 @@ def feed_events(feed_data: Any, allowed_user_ids: set[str] | None = None) -> lis
             or segment_text
             or ""
         )
-        if kind_raw == "thesis_created" or text:
-            kind = "thesis"
-        elif "buy" in kind_raw:
+        # The event type is authoritative for trades. A comment/description on
+        # a swap is annotation, not a thesis, and must not break the buy/sell
+        # accounting lifecycle.
+        if "buy" in kind_raw:
             kind = "buy"
         elif "sell" in kind_raw:
             kind = "sell"
+        elif kind_raw == "thesis_created":
+            kind = "thesis"
         else:
             # 转账、部署等仍作为 Feed 动态推送，使用“喊单/动态”文本承载原始摘要。
             kind = "thesis"

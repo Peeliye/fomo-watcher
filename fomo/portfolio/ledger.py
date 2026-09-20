@@ -47,6 +47,10 @@ def _event_time(value: str) -> datetime:
         return datetime.now(timezone.utc)
 
 
+def _token_key(chain_id: int, token_address: str) -> str:
+    return token_address if int(chain_id) == 1399811149 else token_address.lower()
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS portfolio_events (
   event_id TEXT PRIMARY KEY,
@@ -120,13 +124,15 @@ CREATE INDEX IF NOT EXISTS idx_fills_token ON portfolio_fills(chain_id, token_ad
 CREATE INDEX IF NOT EXISTS idx_fills_account_time ON portfolio_fills(account_id, executed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fills_account_page ON portfolio_fills(account_id, executed_at DESC, fill_id DESC);
 CREATE INDEX IF NOT EXISTS idx_fills_account_kol_side_time ON portfolio_fills(account_id, kol_id, side, executed_at);
+CREATE INDEX IF NOT EXISTS idx_fills_account_position_time
+  ON portfolio_fills(account_id, kol_id, chain_id, token_address, executed_at);
 CREATE INDEX IF NOT EXISTS idx_positions_status ON portfolio_positions(account_id, status, last_trade_at DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_open_tokens
   ON portfolio_positions(account_id, status, chain_id, token_address, symbol);
 CREATE INDEX IF NOT EXISTS idx_daily_day ON portfolio_daily(account_id, local_day DESC);
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class PortfolioLedger:
@@ -499,11 +505,12 @@ class PortfolioLedger:
                 old_quantity = _decimal(row["quantity"]) if row else Decimal("0")
                 old_cost = int(row["cost_basis_usd_micros"]) if row else 0
                 realized = int(row["realized_pnl_micros"]) if row else 0
-                initial_cost = int(row["initial_cost_usd_micros"]) if row else 0
-                recovered = int(row["recovered_principal_usd_micros"]) if row else 0
-                peak = max(price, _decimal(row["peak_price_usd"])) if row else price
+                new_cycle = row is None or old_quantity <= 0
+                initial_cost = int(row["initial_cost_usd_micros"]) if row and not new_cycle else 0
+                recovered = int(row["recovered_principal_usd_micros"]) if row and not new_cycle else 0
+                peak = max(price, _decimal(row["peak_price_usd"])) if row and not new_cycle else price
                 new_initial_cost = initial_cost + gross
-                exit_stage = str(row["exit_stage"] or "armed") if row else "armed"
+                exit_stage = str(row["exit_stage"] or "armed") if row and not new_cycle else "armed"
                 if recovered < new_initial_cost:
                     exit_stage, peak = "armed", price
                 first_bought = row["first_bought_at"] if row and old_quantity > 0 else executed_at.isoformat()
@@ -568,7 +575,11 @@ def portfolio_snapshot(
     mark_stale_seconds: int = 300,
 ) -> dict[str, Any]:
     db_path = Path(path)
-    empty = {"accountId": account_id, "openPositions": 0, "costBasisUsd": 0, "marketValueUsd": 0, "unrealizedPnlUsd": 0, "realizedPnlUsd": 0, "totalPnlUsd": 0, "positions": [], "fills": [], "daily": []}
+    empty = {"accountId": account_id, "source": "paper_portfolio_simulation",
+             "asOf": datetime.now(timezone.utc).isoformat(), "freshness": "no_data",
+             "verificationStatus": "simulated_not_live", "openPositions": 0,
+             "costBasisUsd": 0, "marketValueUsd": 0, "unrealizedPnlUsd": 0,
+             "realizedPnlUsd": 0, "totalPnlUsd": 0, "positions": [], "fills": [], "daily": []}
     if not db_path.exists():
         return empty
     db = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
@@ -592,6 +603,19 @@ def portfolio_snapshot(
             "SELECT * FROM portfolio_daily WHERE account_id=? ORDER BY local_day DESC LIMIT 90",
             (account_id,),
         ).fetchall()
+        cycle_fills: list[sqlite3.Row] = []
+        position_keys = [(str(row["kol_id"]), int(row["chain_id"]), str(row["token_address"])) for row in positions]
+        for start in range(0, len(position_keys), 250):
+            chunk = position_keys[start : start + 250]
+            clauses = " OR ".join("(kol_id=? AND chain_id=? AND token_address=?)" for _ in chunk)
+            params: list[Any] = [account_id]
+            params.extend(value for key in chunk for value in key)
+            cycle_fills.extend(db.execute(
+                """SELECT kol_id,chain_id,token_address,side,gross_usd_micros,
+                   realized_pnl_micros,executed_at FROM portfolio_fills
+                   WHERE account_id=? AND (""" + clauses + ") ORDER BY executed_at",
+                params,
+            ).fetchall())
         event_ids = [str(row["event_id"]) for row in fills]
         placeholders = ",".join("?" for _ in event_ids)
         reason_by_event = {row["event_id"]: row["reason"] for row in db.execute(
@@ -616,12 +640,30 @@ def portfolio_snapshot(
         market_total += market
         unrealized_total += market - cost
     now = datetime.now(timezone.utc)
+    fills_by_position: dict[tuple[str, int, str], list[sqlite3.Row]] = {}
+    for fill in cycle_fills:
+        fill_key = (str(fill["kol_id"]), int(fill["chain_id"]), _token_key(int(fill["chain_id"]), str(fill["token_address"])))
+        fills_by_position.setdefault(fill_key, []).append(fill)
     for row in positions:
         quantity = _decimal(row["quantity"])
         cost = int(row["cost_basis_usd_micros"])
         market = _micros(quantity * _decimal(row["last_price_usd"])) if row["status"] == "open" else 0
         unrealized = market - cost if row["status"] == "open" else 0
         realized = int(row["realized_pnl_micros"])
+        position_key = (str(row["kol_id"]), int(row["chain_id"]), _token_key(int(row["chain_id"]), str(row["token_address"])))
+        cycle_started = _event_time(row["first_bought_at"])
+        current_cycle_fills = [
+            fill for fill in fills_by_position.get(position_key, [])
+            if _event_time(fill["executed_at"]) >= cycle_started
+        ]
+        cycle_invested = sum(
+            int(fill["gross_usd_micros"]) for fill in current_cycle_fills if fill["side"] == "buy"
+        )
+        cycle_recovered = sum(
+            int(fill["gross_usd_micros"]) for fill in current_cycle_fills if fill["side"] == "sell"
+        )
+        cycle_realized = sum(int(fill["realized_pnl_micros"]) for fill in current_cycle_fills)
+        historical_realized = realized - cycle_realized
         mark_time = _event_time(row["last_mark_at"])
         mark_age = max(0.0, (now - mark_time).total_seconds())
         output_positions.append({
@@ -629,6 +671,9 @@ def portfolio_snapshot(
             "ca": row["token_address"], "symbol": row["symbol"], "quantity": str(quantity),
             "costBasisUsd": _usd(cost), "marketValueUsd": _usd(market), "unrealizedPnlUsd": _usd(unrealized),
             "realizedPnlUsd": _usd(realized), "firstBoughtAt": row["first_bought_at"],
+            "cycleInvestedUsd": _usd(cycle_invested), "cycleRecoveredUsd": _usd(cycle_recovered),
+            "cycleRealizedPnlUsd": _usd(cycle_realized),
+            "historicalRealizedPnlUsd": _usd(historical_realized),
             "lastTradeAt": row["last_trade_at"], "lastPriceUsd": float(_decimal(row["last_price_usd"])),
             "lastMarkAt": row["last_mark_at"], "status": row["status"],
             "initialCostUsd": _usd(row["initial_cost_usd_micros"]),
@@ -654,6 +699,8 @@ def portfolio_snapshot(
     } for row in daily]
     return {
         "accountId": account_id, "openPositions": open_count,
+        "source": "paper_portfolio_simulation", "asOf": now.isoformat(),
+        "freshness": "latest_paper_fill_and_market_mark", "verificationStatus": "simulated_not_live",
         "costBasisUsd": _usd(cost_total), "marketValueUsd": _usd(market_total),
         "unrealizedPnlUsd": _usd(unrealized_total), "realizedPnlUsd": _usd(realized_total),
         "totalPnlUsd": _usd(unrealized_total + realized_total),

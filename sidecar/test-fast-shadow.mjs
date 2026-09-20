@@ -31,6 +31,29 @@ test("fresh followed Solana buy is eligible", () => {
   assert.equal(record.status, "eligible");
   assert.equal(record.proposedBuyUsd, 10);
   assert.equal(record.signalAgeMs, 1000);
+  assert.equal(record.upstreamAgeMs, 1000);
+  assert.equal(record.upstreamClockSkewMs, 0);
+  assert.equal(record.localQueueMs, 0);
+});
+
+test("latency fields separate upstream delivery, local queue, and source clock skew", () => {
+  const delayed = evaluateShadow({
+    id: "latency-1", type: "swap_buy", createdAt: "2026-09-10T00:00:00Z",
+    userId: "followed", networkId: 4663, tokenAddress: "0xabc",
+    usdAmount: 500, marketCap: 1000000,
+  }, "2026-09-10T00:00:00.800Z", config, whitelist, now);
+  assert.equal(delayed.upstreamAgeMs, 800);
+  assert.equal(delayed.upstreamClockSkewMs, 0);
+  assert.equal(delayed.localQueueMs, 200);
+
+  const futureStamped = evaluateShadow({
+    id: "latency-2", type: "swap_buy", createdAt: "2026-09-10T00:00:01.500Z",
+    userId: "followed", networkId: 4663, tokenAddress: "0xabc",
+    usdAmount: 500, marketCap: 1000000,
+  }, "2026-09-10T00:00:01Z", config, whitelist, now);
+  assert.equal(futureStamped.upstreamAgeMs, 0);
+  assert.equal(futureStamped.upstreamClockSkewMs, 500);
+  assert.equal(futureStamped.localQueueMs, 0);
 });
 
 test("stranger fails closed", () => {

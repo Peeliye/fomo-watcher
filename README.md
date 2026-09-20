@@ -63,7 +63,7 @@ python run.py --config config.yaml
 
 模拟持仓内置可热更新的退出策略：默认亏损 25% 全部止损、价格达到成本 2 倍时卖出刚好覆盖累计本金的数量、出本后从最高价回撤 25% 清仓、最长持有 168 小时。策略可在“持仓 / PnL”页面修改，持久化于 `data/exit-policy.json`；只有行情未过期时才会触发，自动卖出会进入成交、已实现 PnL 与日统计。
 
-监控启动后，在浏览器打开 `http://127.0.0.1:8765` 即可查看长期可视化面板。“持仓 / PnL”包含购入时间、盈亏差额、日统计、行情陈旧提示，以及 EVM + Solana 逻辑执行钱包到 RPC 阶段的配置状态。“钱包管理”用于维护 KOL 公开地址、证据与有效期，并维护独立观察钱包的标签、通知事件和金额/市值过滤条件；支持 CSV/JSON 批量导入。自定义观察规则保存在 `watch-wallets.json`，变更审计保存在 `data/wallet-management-audit.ndjson`。该页面拒绝私钥、助记词、种子词和 Keystore 字段。页面每 3 秒读取最新记录；默认仅监听本机，不会向局域网或公网暴露数据。详细结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+监控启动后，在浏览器打开 `http://127.0.0.1:8765` 即可查看长期可视化面板。“持仓 / PnL”包含购入时间、盈亏差额、日统计、行情陈旧提示，以及 EVM + Solana 逻辑执行钱包到 RPC 阶段的配置状态。“钱包管理”用于维护 KOL 公开地址、证据与有效期，并维护独立观察钱包的标签、通知事件和金额/市值过滤条件；支持 CSV/JSON 批量导入。自定义观察规则目前**只保存配置**，尚未接入 RPC/Indexer 增量流，不会产生提醒或 PnL；未来适配器必须使用持久化 cursor/checkpoint、确定性事件 ID 和链重组回滚，禁止定时全量扫历史。页面由服务端事件驱动刷新，WebSocket 重连和页面恢复可见时立即校验当前视图，另每 5 分钟做一次一致性校验。默认仅监听本机，不会向局域网或公网暴露数据。详细结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 “RPC 管理”页面用于维护配置中预设的主备 RPC 插槽，并可对单节点或全部节点执行即时健康测试。完整 URL 只写入本机 `.env`，页面与 API 只返回脱敏主机；测试记录持久化到 `data/rpc-health.sqlite3`，配置和测试操作记录到 `data/rpc-management-audit.ndjson`。健康判定同时要求遥测新鲜、最近样本成功率不低于 95%、P95 延迟不超过配置阈值且区块落后不超限。
 
@@ -95,7 +95,7 @@ RPC 使用每链主备节点池，URL 和密钥只放在 `.env`，面板与 `dat
 账本完整性检查与在线备份：
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.portfolio_maintenance check
+.\.venv\Scripts\python.exe -m scripts.portfolio_maintenance check --paper-orders data/paper-orders.ndjson
 .\.venv\Scripts\python.exe -m scripts.portfolio_maintenance backup
 ```
 
@@ -115,9 +115,24 @@ KOL/钱包、链、代币、买卖方向、成交数量、美元金额、时间�
 .\.venv\Scripts\python.exe -m scripts.performance_backfill social data/social-identities.json
 ```
 
-结果写入 `data/verified-performance.sqlite3`，并通过 `/api/wallet-performance` 提供 FIFO 已实现/未实现
-PnL、闭环胜率、入场到峰值倍率、早期入场、峰值后暴跌、归零反弹及验证型画像。没有至少三个
-闭环代币时不会输出“已验证聪明钱”。分型策略目前仍只输出只读建议，不会签名或广播。
+结果写入 `data/verified-performance.sqlite3`。库存严格按 `KOL × 钱包 × 链 × 规范化代币地址` 执行
+FIFO lot accounting：买入手续费进入 lot 成本，卖出手续费从收入扣除，不同钱包不能互相平仓。
+孤立卖出、超卖和非完整历史会标记为 `orphan_sell`、`oversold` 或 `inventory_incomplete`，不会进入
+胜率、ROI 或“已验证”状态。未实现 PnL 只使用独立行情；缺失或过期时返回不可验证，不回退到
+最后成交价。API 请求只读取导入事务生成的物化画像，不同步全表重算。没有足够闭环、完整库存和
+新鲜独立行情时不会输出“已验证聪明钱”。分型策略仍只输出只读建议，不会签名或广播。
+
+性能与账本维护命令：
+
+```powershell
+python -m scripts.performance_benchmark --rows 100000
+python -m scripts.portfolio_maintenance reconcile --database data/portfolio.sqlite3  # 默认 dry-run
+python -m scripts.portfolio_maintenance reconcile --database data/portfolio.sqlite3 --apply
+```
+
+`reconcile --apply` 会先用 SQLite Backup API 创建在线备份，只把无法还原成交明细的旧事件降级为
+`legacy_observed`，不会凭空生成 fill 或 PnL。`check --paper-orders ...` 还会核对每个 accepted 模拟买入
+是否有买入 fill 或明确失败原因。
 
 WebSocket 收包后会在 Node 进程内立即执行本地极速门禁，绕过 Python 轮询，并把信号年龄、决策耗时和后置检查项写入 `data/shadow-executions.ndjson`。该阶段只做关注身份、主动买入类型、链、时效与目标金额检查；市值等资产分析移到后置阶段。当前仍为 Shadow/Paper，不读取钱包、不签名、不请求真实成交。
 

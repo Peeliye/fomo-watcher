@@ -256,6 +256,20 @@ class WalletManagementStore:
                 "watchWallets": watchlist["wallets"],
                 "chainNames": SUPPORTED_CHAINS,
                 "trackingStatus": "awaiting_rpc_stream_adapter",
+                "trackingCapability": {
+                    "mode": "configuration_only",
+                    "realtimeObservation": False,
+                    "producesAlerts": False,
+                    "producesPnl": False,
+                    "adapterContract": {
+                        "cursorCheckpoint": True,
+                        "chainReorgHandling": True,
+                        "idempotentEventId": True,
+                        "normalizes": ["buy", "sell", "transfer_in", "transfer_out"],
+                        "healthFreshness": True,
+                        "historicalFullScan": False,
+                    },
+                },
             }
 
     def _audit(self, action: str, entity: str, record: Mapping[str, Any]) -> None:

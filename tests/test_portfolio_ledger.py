@@ -113,6 +113,33 @@ class PortfolioLedgerTests(unittest.TestCase):
             ledger.close()
             self.assertEqual(portfolio_snapshot(Path(directory) / "portfolio.sqlite3")["costBasisUsd"], 10)
 
+    def test_reentry_separates_current_cycle_from_historical_realized_pnl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portfolio.sqlite3"
+            ledger = PortfolioLedger(path, "UTC")
+            first = Event(id="cycle-1-buy", kind="buy", handle="alice", user_id="kol-1",
+                          created_at="2026-09-20T00:00:00+00:00", network_id=1,
+                          ca="0x1111111111111111111111111111111111111111", symbol="MEME", price=1)
+            ledger.apply_event(first, {"status": "accepted", "paperBuyUsd": 10})
+            sell = Event(id="cycle-1-sell", kind="sell", handle="alice", user_id="kol-1",
+                         created_at="2026-09-20T01:00:00+00:00", network_id=1,
+                         ca=first.ca, symbol="MEME", price=.8)
+            ledger.apply_event(sell, None)
+            second = Event(id="cycle-2-buy", kind="buy", handle="alice", user_id="kol-1",
+                           created_at="2026-09-21T00:00:00+00:00", network_id=1,
+                           ca=first.ca, symbol="MEME", price=2)
+            ledger.apply_event(second, {"status": "accepted", "paperBuyUsd": 10})
+            ledger.close()
+            position = portfolio_snapshot(path)["positions"][0]
+
+        self.assertEqual(position["status"], "open")
+        self.assertEqual(position["cycleInvestedUsd"], 10)
+        self.assertEqual(position["cycleRecoveredUsd"], 0)
+        self.assertEqual(position["cycleRealizedPnlUsd"], 0)
+        self.assertEqual(position["historicalRealizedPnlUsd"], -2)
+        self.assertEqual(position["realizedPnlUsd"], -2)
+        self.assertEqual(position["initialCostUsd"], 10)
+
     def test_summary_is_not_truncated_by_detail_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "portfolio.sqlite3"
@@ -153,6 +180,26 @@ class PortfolioLedgerTests(unittest.TestCase):
             self.assertIsNone(ledger.maybe_daily_backup(root / "backups"))
             self.assertEqual(portfolio_snapshot(backup)["costBasisUsd"], 10)
             ledger.close()
+
+    def test_page_and_position_fill_queries_use_covering_order_indexes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PortfolioLedger(Path(directory) / "portfolio.sqlite3", "UTC")
+            try:
+                page_plan = " ".join(str(row[3]) for row in ledger.db.execute(
+                    """EXPLAIN QUERY PLAN SELECT * FROM portfolio_fills
+                    WHERE account_id=? ORDER BY executed_at DESC,fill_id DESC LIMIT 300""",
+                    ("paper-main",),
+                ))
+                position_plan = " ".join(str(row[3]) for row in ledger.db.execute(
+                    """EXPLAIN QUERY PLAN SELECT side,gross_usd_micros,realized_pnl_micros,executed_at
+                    FROM portfolio_fills WHERE account_id=? AND kol_id=? AND chain_id=?
+                    AND token_address=? ORDER BY executed_at""",
+                    ("paper-main", "k", 1, "0xabc"),
+                ))
+            finally:
+                ledger.close()
+        self.assertIn("idx_fills_account_page", page_plan)
+        self.assertIn("idx_fills_account_position_time", position_plan)
 
     def test_one_logical_wallet_reuses_one_evm_account(self):
         with tempfile.TemporaryDirectory() as directory:

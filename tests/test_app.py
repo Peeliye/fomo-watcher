@@ -112,6 +112,28 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(event.market_cap, 2_000_000)
         self.assertEqual(event.user_id, "followed")
 
+    def test_trade_type_wins_over_comment_text(self):
+        payload = [
+            {"id": "buy-comment", "type": "single_user_buy", "userId": "followed",
+             "body": {"comment": "buy annotation", "usdAmount": 10}},
+            {"id": "sell-comment", "type": "swap_sell", "userId": "followed",
+             "body": {"description": "sell annotation", "usdAmount": 12}},
+        ]
+        events = feed_events(payload, {"followed"})
+        self.assertEqual([event.kind for event in events], ["buy", "sell"])
+        self.assertEqual([event.original_text for event in events], ["buy annotation", "sell annotation"])
+
+    def test_unknown_feed_type_is_dynamic_thesis_but_still_fail_closed(self):
+        payload = [
+            {"id": "unknown", "type": "token_deploy", "userId": "followed", "body": {"text": "deployed"}},
+            {"id": "missing", "type": "token_deploy", "body": {"text": "missing actor"}},
+            {"id": "stranger", "type": "token_deploy", "userId": "stranger", "body": {"text": "drop"}},
+        ]
+        events = feed_events(payload, {"followed"})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "thesis")
+        self.assertEqual(events[0].original_text, "deployed")
+
     def test_buy_event_contains_delta_and_market_cap(self):
         old = {"CA:1399811149": {"ca": "CA", "network_id": 1399811149, "amount": 10, "price": 2, "market_cap": 100000, "symbol": "MEME"}}
         new = {"CA:1399811149": {"ca": "CA", "network_id": 1399811149, "amount": 25, "price": 2, "market_cap": 100000, "symbol": "MEME"}}

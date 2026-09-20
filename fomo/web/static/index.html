@@ -130,11 +130,11 @@
     .pager-actions button:disabled { opacity:.35; cursor:not-allowed; }
     .empty,.error { padding:54px 20px; text-align:center; color:var(--muted); }
     .error { color:var(--red); }
-    .identity-overview { display:grid; grid-template-columns:repeat(4,minmax(100px,150px)) minmax(320px,1fr); gap:0; border-bottom:1px solid var(--line); background:rgb(17 31 44 / 55%); }
+    .identity-overview { display:grid; grid-template-columns:repeat(4,minmax(100px,1fr)); gap:0; border-bottom:1px solid var(--line); background:rgb(17 31 44 / 55%); }
     .identity-stat { padding:12px 14px; border-right:1px solid var(--line); }
     .identity-stat span { display:block; color:var(--muted); font-size:11px; letter-spacing:.04em; }
     .identity-stat strong { display:block; margin-top:3px; font-size:18px; font-variant-numeric:tabular-nums; }
-    .identity-backlog { min-width:0; padding:9px 12px; }
+    .identity-backlog { min-width:0; padding:9px 12px; grid-column:1/-1; border-top:1px solid var(--line); }
     .identity-backlog-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:7px; color:var(--muted); font-size:11px; }
     .backlog-list { display:flex; flex-wrap:nowrap; gap:6px; width:100%; min-width:0; max-width:100%; overflow-x:auto; overflow-y:hidden; padding:0 0 5px; scrollbar-width:thin; scrollbar-color:#30495d transparent; scroll-snap-type:x proximity; }
     .backlog-item { display:flex; flex:0 0 320px; align-items:center; gap:9px; width:320px; max-width:320px; min-height:34px; padding:6px 8px; border:1px solid var(--line); border-radius:0; color:inherit; background:var(--surface); overflow:hidden; cursor:pointer; font:inherit; text-align:left; scroll-snap-align:start; }
@@ -529,8 +529,8 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>时间</th><th>结果</th><th>用户</th><th>代币 / 链</th><th class="num">目标金额</th><th class="num">拟买入</th><th class="num">信号年龄</th><th class="num">风控耗时</th><th>阶段</th><th>操作</th></tr></thead>
-            <tbody id="signal-rows"><tr><td colspan="10" class="empty">正在载入极速信号…</td></tr></tbody>
+            <thead><tr><th>时间</th><th>结果</th><th>用户</th><th>代币 / 链</th><th class="num">目标金额</th><th class="num">拟买入</th><th class="num" title="Fomo 事件创建至本机 WebSocket 收到">上游年龄</th><th class="num" title="WebSocket 收到至开始执行本地快速风控">本地排队</th><th class="num">风控耗时</th><th>阶段</th><th>操作</th></tr></thead>
+            <tbody id="signal-rows"><tr><td colspan="11" class="empty">正在载入极速信号…</td></tr></tbody>
           </table>
         </div>
         <div class="pagination"><span id="signal-page-info">—</span><div class="pager-actions"><button class="action" id="signal-prev" type="button">上一页</button><button class="action" id="signal-next" type="button">下一页</button></div></div>
@@ -548,10 +548,14 @@
 
       <section class="panel hidden" id="risk-view" role="tabpanel">
         <div class="identity-overview" aria-label="钱包身份登记概览">
-          <div class="identity-stat"><span>有效登记</span><strong id="identity-registered">—</strong></div>
-          <div class="identity-stat"><span>待登记 KOL / 链</span><strong id="identity-pending">—</strong></div>
-          <div class="identity-stat"><span>已过期 / 已撤销</span><strong id="identity-inactive">—</strong></div>
-          <div class="identity-stat"><span>登记表版本</span><strong id="identity-version">—</strong></div>
+          <div class="identity-stat"><span>当前关注 KOL · 人</span><strong id="identity-followed">—</strong></div>
+          <div class="identity-stat"><span>已形成画像 · 人</span><strong id="identity-profiled">—</strong></div>
+          <div class="identity-stat"><span>待登记独立 KOL · 人</span><strong id="identity-pending-kols">—</strong></div>
+          <div class="identity-stat"><span>待登记 KOL×链 · 组合</span><strong id="identity-pending-pairs">—</strong></div>
+          <div class="identity-stat"><span>有效钱包记录 · 条</span><strong id="identity-wallet-entries">—</strong></div>
+          <div class="identity-stat"><span>已登记独立 KOL · 人</span><strong id="identity-registered-kols">—</strong></div>
+          <div class="identity-stat"><span>过期钱包记录 · 条</span><strong id="identity-expired">—</strong></div>
+          <div class="identity-stat"><span>撤销钱包记录 · 条</span><strong id="identity-revoked">—</strong></div>
           <div class="identity-backlog"><div class="identity-backlog-head"><span>最新待登记对象</span><span>按最近出现排序</span></div><div class="backlog-list" id="identity-backlog"><span class="backlog-meta">正在载入…</span></div></div>
         </div>
         <div class="table-wrap">
@@ -590,8 +594,8 @@
           <div class="portfolio-metric"><span>成本</span><strong id="pnl-cost">—</strong></div>
           <div class="portfolio-metric"><span>当前价值</span><strong id="pnl-value">—</strong></div>
           <div class="portfolio-metric"><span>未实现盈亏</span><strong id="pnl-unrealized">—</strong></div>
-          <div class="portfolio-metric"><span>已实现盈亏</span><strong id="pnl-realized">—</strong></div>
-          <div class="portfolio-metric"><span>总盈亏</span><strong id="pnl-total">—</strong></div>
+          <div class="portfolio-metric"><span>账户累计已实现</span><strong id="pnl-realized">—</strong></div>
+          <div class="portfolio-metric"><span>账户累计总盈亏</span><strong id="pnl-total">—</strong></div>
         </div>
         <section class="panel">
           <div class="portfolio-section-head"><h2>自动退出策略</h2><span>仅模拟仓生效 · 修改后无需重启</span></div>
@@ -609,7 +613,7 @@
           <div class="readiness" id="execution-readiness"></div>
           <div class="portfolio-section-head"><h2>模拟持仓</h2><span>按 KOL 独立记账 · 行情过期会标记</span></div>
           <div class="table-wrap">
-            <table><thead><tr><th>购入时间</th><th>KOL</th><th>代币 / 链</th><th>状态</th><th class="num">数量</th><th class="num">成本</th><th class="num">当前价值</th><th class="num">未实现盈亏</th><th class="num">已实现盈亏</th><th>退出计划</th><th class="num">最新价</th><th>CA / 操作</th></tr></thead><tbody id="position-rows"><tr><td colspan="12" class="empty">正在载入持仓…</td></tr></tbody></table>
+            <table><thead><tr><th>本轮开始</th><th>KOL</th><th>代币 / 链</th><th>状态</th><th class="num">数量</th><th class="num">本轮投入</th><th class="num">当前价值 / 退出回收</th><th class="num" title="本轮已实现盈亏 + 当前浮动盈亏">本轮总收益</th><th class="num" title="不包含本轮的同 KOL、同链、同代币历史累计盈亏">此前累计</th><th>退出策略</th><th class="num">最新价</th><th>CA / 操作</th></tr></thead><tbody id="position-rows"><tr><td colspan="12" class="empty">正在载入持仓…</td></tr></tbody></table>
           </div>
         </section>
         <div class="daily-grid">
@@ -705,7 +709,7 @@
             <button class="action rank-mode active" data-rank-mode="participants" type="button">今日累计用户</button>
             <button class="action rank-mode" data-rank-mode="history" type="button">小时历史</button>
             <input id="rank-search" type="search" placeholder="搜索钱包、用户或昵称…">
-            <select id="rank-sort"><option value="rank">按排名</option><option value="pnl">按收益</option><option value="appear">按上榜次数</option></select>
+            <select id="rank-sort"><option value="rank">按当前 / 最后排名</option><option value="current_pnl">按当前 24h PnL</option><option value="last_observed">按最后观测 24h PnL</option><option value="change">按榜内 24h 指标变化</option><option value="appear">按上榜次数</option></select>
             <input id="rank-date" type="date"><select id="rank-hour"></select>
           </div>
           <div class="table-wrap"><table id="rank-table"><thead id="rank-head"></thead><tbody id="rank-rows"><tr><td class="empty">正在载入今日排行…</td></tr></tbody></table></div>
@@ -750,10 +754,11 @@
         <article class="panel analysis-card" style="grid-column:1/-1"><h2>RPC 节点实时状态</h2><div id="rpc-summary" class="sub">正在读取节点遥测…</div><div class="table-wrap"><table><thead><tr><th>链</th><th>供应商</th><th>角色</th><th>配置</th><th>状态</th><th class="num">成功率</th><th class="num">P95</th><th class="num">区块落后</th><th>最后采样</th></tr></thead><tbody id="rpc-rows"></tbody></table></div></article>
       </section>
     </section>
-    <footer><span>每 3 秒自动刷新 · 本机只读控制台</span><span id="updated">尚未更新</span></footer>
+    <footer><span>事件驱动刷新 · 每 5 分钟一致性校验 · 本机只读控制台</span><span id="updated">尚未更新</span></footer>
   </main>
 
-  <script>
+  <script type="module">
+    import {DashboardConsistency,lifecycleRefreshKeys} from '/assets/dashboard-consistency.mjs';
     const statusLabels={accepted:'成功买入',eligible:'可进入报价',not_following:'非关注用户',following_whitelist_unavailable:'关注白名单不可用',disabled:'已关闭',not_buy:'非买入事件',passive_asset_event:'转账/空投已忽略',missing_ca:'缺少代币地址',missing_transaction_reference:'缺少原交易引用',target_trade_too_small:'目标金额过小',stale_signal:'信号过期',unsupported_event_type:'事件类型未启用',unsupported_network:'链未启用（历史）',daily_limit_reached:'每日限额',per_kol_daily_limit_reached:'KOL 日限额',per_token_limit_reached:'单币限额',maximum_open_positions_reached:'持仓数上限',risk_limit_reached:'触发风控限额',market_cap_too_small:'市值过小',missing_market_cap:'缺少市值',needs_identity:'待身份登记',needs_data:'待风控数据',rejected:'已拒绝',approved_for_shadow:'影子准入'};
     const reasonLabels={missing_kol_id:'缺少用户标识',missing_chain_id:'缺少链信息',wallet_not_registered:'钱包未登记',ambiguous_wallet_mapping:'同链钱包映射不唯一',asset_snapshot_required:'缺少资产快照',independent_quotes_required:'缺少独立报价',exposure_snapshot_required:'缺少敞口快照',health_snapshot_required:'缺少系统健康快照',exit_plan_required:'缺少退出计划',transaction_simulation_required:'缺少交易模拟',transaction_scope_invalid:'交易范围不安全',route_not_allowlisted:'路由未加入白名单',minimum_output_required:'缺少最低到账保护',signal_too_old:'信号过期',wallet_mapping_expired:'钱包映射已过期',wallet_confidence_too_low:'钱包置信度过低'};
     const styleLabels={pvp_short_term:'PVP 短线',whale_momentum:'鲸鱼 / 趋势',narrative_momentum:'叙事趋势',early_alpha:'早期 Alpha',pvp_verified:'已验证 PVP',rebound_specialist:'反弹型',whale_confirmation:'鲸鱼增强信号',unclassified:'待分类'};
@@ -762,6 +767,8 @@
     const pageSize=30;
     const amountThresholds={small:100,large:5000,largePosition:1000};
     const state={view:'signals',signalPage:1,orderPage:1,riskPage:1,rankMode:'participants',rankExpandedUser:'',rankDetailDate:'',rankDetails:{},apiFailures:{},apiSuccess:{},rankOverview:{},rankCurrent:[],rankParticipants:[],rankHistory:{records:[]},status:{health:{},modes:{},alerts:[]},orders:{orders:[],chainNames:{},statuses:{},acceptedChains:{},total:0,accepted:0,acceptedUsd:0},shadow:{executions:[],statuses:{},eligible:0},risk:{decisions:[],outcomes:{},blockers:{},total:0},identity:{wallets:[],backlog:[],registered:0,pending:0,expired:0,revoked:0,registryVersion:1},management:{kolWallets:[],watchWallets:[],chainNames:{},trackingStatus:'awaiting_rpc_stream_adapter'},rpcManagement:{configured:0,total:0,reachable:0,healthy:0,endpoints:[],policy:{}},intelligence:{profiles:[],totalEvents:0,profiled:0,sufficientBehaviorSamples:0,performanceVerified:false},performance:{profiles:[],verifiedFills:0,marketObservations:0,profiled:0,verifiedProfiles:0,performanceVerified:false},portfolio:{positions:[],fills:[],daily:[],openPositions:0},readiness:{accounts:[],chains:[],blockers:[],stage:'wallet_addresses'},wallet:{balances:[]},journal:{total:0,states:{},control:{liveArmed:false,circuitBreakerTripped:true},intents:[]},route:{chains:[],mode:'shadow'},rpc:{configured:0,total:0,healthy:0,endpoints:[]}};
+    state.staleApis=new Set();
+    const consistency=new DashboardConsistency();let reloadScheduled=false;
     const $=id=>document.getElementById(id);
     const esc=value=>String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     const guidPattern=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -770,6 +777,10 @@
     const signedMoney=value=>`${Number(value||0)>0?'+':''}${money(value)}`;
     const pnlClass=value=>Number(value||0)>0?'pnl-positive':Number(value||0)<0?'pnl-negative':'';
     const price=value=>{const n=Number(value||0);return n===0?'$0':n<.01?'$'+n.toPrecision(6):money(n)};
+    const milliseconds=(value,digits=0)=>value==null||!Number.isFinite(Number(value))?'—':Number(value).toFixed(digits)+' ms';
+    const upstreamLatency=row=>Number(row.upstreamClockSkewMs||0)>0
+      ? `<span class="stale" title="上游 createdAt 晚于本机收到时间">时钟 +${esc(milliseconds(row.upstreamClockSkewMs))}</span>`
+      : esc(milliseconds(row.upstreamAgeMs??row.signalAgeMs));
     const compact=value=>new Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2}).format(Number(value||0));
     const dateTime=new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
     const time=value=>value?dateTime.format(new Date(value)):'—';
@@ -838,7 +849,7 @@
       const profiles=(state.intelligence?.profiles||[]).slice(0,5);
       stableHTML('kol-radar',profiles.length?profiles.map(row=>`<div class="radar-row"><b>@${esc(handleText(row.handle))}</b><span>${Number(row.buyEvents||0)} buys</span><span>${Number(row.distinctTokens||0)} tokens</span><strong>${(Number(row.lowCapBuyRate||0)*100).toFixed(0)}% alpha</strong></div>`).join(''):'<div class="empty">暂无可用于雷达的 KOL 画像</div>');
       stableHTML('alpha-stream',all.length?all.slice(0,5).map(row=>`<div class="alpha-row"><span class="alpha-time">${esc(time(row.recordedAt))}</span><span class="alpha-token">$${esc(row.symbol||'—')}</span><span class="alpha-meta">@${esc(handleText(row.handle))} · ${esc(chainName(row.networkId))} · ${amountMarkup(row.targetBuyUsd)}</span><span class="alpha-latency">${Number(row.decisionLatencyMs||0).toFixed(3)} ms</span></div>`).join(''):'<div class="empty">暂无实时 Alpha 信号</div>');
-      stableRows('signal-rows',paged.items,(row,index)=>row.executionId||row.eventId||`${row.recordedAt}|${row.handle}|${row.symbol}|${row.status}|${index}`,row=>`<tr><td>${esc(time(row.recordedAt))}</td><td><span class="badge ${row.status==='eligible'?'good':''}">${esc(statusLabels[row.status]||row.status)}</span></td><td>@${esc(handleText(row.handle))}</td><td><span class="token">${esc(row.symbol||'—')}<span class="chain">${esc(chainName(row.networkId))}</span></span></td><td class="num">${amountMarkup(row.targetBuyUsd)}</td><td class="num">${money(row.proposedBuyUsd)}</td><td class="num">${Number(row.signalAgeMs||0).toFixed(0)} ms</td><td class="num">${Number(row.decisionLatencyMs||0).toFixed(3)} ms</td><td>${esc(row.stage||'—')}</td><td>${actionMarkup(row)}</td></tr>`,'<tr><td colspan="10" class="empty">没有符合条件的极速信号</td></tr>');
+      stableRows('signal-rows',paged.items,(row,index)=>row.executionId||row.eventId||`${row.recordedAt}|${row.handle}|${row.symbol}|${row.status}|${index}`,row=>`<tr><td>${esc(time(row.recordedAt))}</td><td><span class="badge ${row.status==='eligible'?'good':''}">${esc(statusLabels[row.status]||row.status)}</span></td><td>@${esc(handleText(row.handle))}</td><td><span class="token">${esc(row.symbol||'—')}<span class="chain">${esc(chainName(row.networkId))}</span></span></td><td class="num">${amountMarkup(row.targetBuyUsd)}</td><td class="num">${money(row.proposedBuyUsd)}</td><td class="num">${upstreamLatency(row)}</td><td class="num">${esc(milliseconds(row.localQueueMs,3))}</td><td class="num">${esc(milliseconds(row.decisionLatencyMs,3))}</td><td>${esc(row.stage||'—')}</td><td>${actionMarkup(row)}</td></tr>`,'<tr><td colspan="11" class="empty">没有符合条件的极速信号</td></tr>');
       $('signal-page-info').textContent=`第 ${paged.page} / ${paged.totalPages} 页 · 共 ${all.length.toLocaleString()} 条`;
       $('signal-prev').disabled=paged.page<=1;$('signal-next').disabled=paged.page>=paged.totalPages;
       $('visible').textContent=`显示 ${paged.items.length} / ${all.length} 条`;
@@ -868,10 +879,14 @@
     }
     function renderIdentity(){
       const identity=state.identity;
-      $('identity-registered').textContent=Number(identity.registered||0).toLocaleString();
-      $('identity-pending').textContent=Number(identity.pending||0).toLocaleString();
-      $('identity-inactive').textContent=`${Number(identity.expired||0)} / ${Number(identity.revoked||0)}`;
-      $('identity-version').textContent='v'+Number(identity.registryVersion||1);
+      $('identity-followed').textContent=Number(identity.followedKols||0).toLocaleString();
+      $('identity-profiled').textContent=Number(identity.profiledKols||0).toLocaleString();
+      $('identity-pending-kols').textContent=Number(identity.pendingUniqueKols||0).toLocaleString();
+      $('identity-pending-pairs').textContent=Number(identity.pendingKolChainPairs||0).toLocaleString();
+      $('identity-wallet-entries').textContent=Number(identity.registeredWalletEntries||0).toLocaleString();
+      $('identity-registered-kols').textContent=Number(identity.registeredUniqueKols||0).toLocaleString();
+      $('identity-expired').textContent=Number(identity.expiredWalletEntries||0).toLocaleString();
+      $('identity-revoked').textContent=Number(identity.revokedWalletEntries||0).toLocaleString();
       $('identity-backlog').innerHTML=(identity.backlog||[]).length?identity.backlog.slice(0,12).map(item=>{const handle=handleText(item.handle,'未知用户'),meta=`${chainName(item.networkId)} · ${Number(item.events||0)} 次${item.symbols?.length?' · '+item.symbols.join('/'):''}`,tip=`@${handle} · ${meta} · 点击关联钱包`;return `<button class="backlog-item" type="button" data-associate-wallet data-handle="${esc(handle)}" data-kol-id="${esc(item.kolId||'')}" data-chain-ids="${esc(String(item.networkId||''))}" title="${esc(tip)}"><b title="${esc('@'+handle)}">@${esc(handle)}</b><span class="backlog-meta" title="${esc(meta)}">${esc(meta)}</span></button>`}).join(''):'<span class="backlog-meta">当前没有待登记对象</span>';
     }
     function renderIntelligence(){
@@ -891,16 +906,18 @@
         return `<tr><td><span class="kol-identity"><a class="kol-link" href="${esc(profileUrl)}" target="_blank" rel="noopener noreferrer" title="在 Fomo 打开 @${esc(visibleHandle)}">@${esc(visibleHandle)}<span class="outbound">↗</span></a>${walletMarkup}<span class="kol-chains">${esc(chains||'未知链')}</span></span></td><td><span class="badge ${row.evidenceStatus==='sufficient_behavior_sample'?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td>${esc(evidence)}</td><td class="num">${Number(row.buyEvents||0)} / ${Number(row.sellEvents||0)}</td><td class="num">${Number(row.distinctTokens||0)} / ${Number(row.activeDays||0)}</td><td class="num">${money(row.observedBuyUsd)}</td><td class="num">${money(row.averageBuyUsd)}</td><td class="num">${row.medianMarketCapUsd==null?'—':'$'+compact(row.medianMarketCapUsd)}</td><td class="num">${(Number(row.lowCapBuyRate||0)*100).toFixed(1)}%</td><td class="num">${Number(row.largeBuyEvents||0)}</td><td title="${esc(flags)}">${esc(flags||'无')}</td></tr>`;
       }).join('')||'<tr><td colspan="11" class="empty">暂无可画像的买入事件</td></tr>';
       const verifiedFillCount=Number(performance.verifiedFills||0),marketObservationCount=Number(performance.marketObservations||0);
-      $('performance-note').textContent=verifiedFillCount||marketObservationCount
-        ?`${verifiedFillCount.toLocaleString()} 笔链上成交 · ${marketObservationCount.toLocaleString()} 个行情观测`
-        :'功能已启用 · 尚未导入链上成交与行情观测';
+      const socialIdentityCount=Number(performance.socialIdentities||0);
+      $('performance-note').textContent=verifiedFillCount||marketObservationCount||socialIdentityCount
+        ?`${verifiedFillCount.toLocaleString()} 笔链上成交 · ${marketObservationCount.toLocaleString()} 个独立行情 · ${socialIdentityCount.toLocaleString()} 个社交身份`
+        :'尚未接入或尚无链上成交、独立行情与社交身份数据';
       $('performance-rows').innerHTML=(performance.profiles||[]).map(row=>{
         const wallet=String(row.wallet||'');
         const social=(row.socialIdentities||[]).map(item=>`${item.platform}: @${item.handle}`).join(' · ')||'未匹配';
-        const status=row.performanceVerified?'已验证':row.historicallyVerified?'数据过期':'闭环不足';
+        const performanceStatuses={verified:'链上验证',stale_verified_history:'历史闭环 · 行情不可验证',inventory_incomplete:'库存不完整',market_missing:'缺少独立行情',market_stale:'独立行情过期',insufficient_closed_round_trips:'闭环不足'};
+        const status=performanceStatuses[row.performanceStatus]||'尚未验证';
         const ci=row.winRateConfidence95?` · ${(Number(row.winRateConfidence95[0])*100).toFixed(0)}–${(Number(row.winRateConfidence95[1])*100).toFixed(0)}%` : '';
-        return `<tr><td><span class="token">@${esc(handleText(row.handle))}<span class="chain mono" title="${esc(wallet)}">${esc(wallet?wallet.slice(0,6)+'…'+wallet.slice(-4):'未登记')}</span></span></td><td><span class="badge ${row.performanceVerified?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td class="num">${row.winRate==null?'—':(Number(row.winRate)*100).toFixed(1)+'%'+ci}</td><td class="num ${pnlClass(row.roi)}">${row.roi==null?'—':(Number(row.roi)*100).toFixed(2)+'%'}</td><td class="num negative">${money(row.maxDrawdownUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${signedMoney(row.realizedPnlUsd)}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${signedMoney(row.unrealizedPnlUsd)}</td><td class="num">${Number(row.verifiedFills||0)} / ${Number(row.tokens||0)}</td><td class="num">${(Number(row.earlyEntryRate||0)*100).toFixed(1)}%</td><td class="num">${(Number(row.reboundEntryRate||0)*100).toFixed(1)}%</td><td>${esc(social)}</td><td><span class="badge ${row.performanceVerified?'good':''}">${status}</span><span class="chain">${esc(row.sampleConfidence||'low')} confidence</span></td></tr>`;
-      }).join('')||'<tr><td colspan="12" class="empty">功能已启用，但尚未导入标准化链上成交、历史行情与社交身份数据</td></tr>';
+        return `<tr><td><span class="token">@${esc(handleText(row.handle))}<span class="chain mono" title="${esc(wallet)}">${esc(wallet?wallet.slice(0,6)+'…'+wallet.slice(-4):'未登记')}</span></span></td><td><span class="badge ${row.performanceVerified?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td class="num">${row.winRate==null?'—':(Number(row.winRate)*100).toFixed(1)+'%'+ci}</td><td class="num ${pnlClass(row.roi)}">${row.roi==null?'—':(Number(row.roi)*100).toFixed(2)+'%'}</td><td class="num negative">${row.maxDrawdownUsd==null?'—':money(row.maxDrawdownUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${row.realizedPnlUsd==null?'—':signedMoney(row.realizedPnlUsd)}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${row.unrealizedPnlUsd==null?'不可验证':signedMoney(row.unrealizedPnlUsd)}</td><td class="num">${Number(row.verifiedFills||0)} / ${Number(row.tokens||0)}</td><td class="num">${(Number(row.earlyEntryRate||0)*100).toFixed(1)}%</td><td class="num">${(Number(row.reboundEntryRate||0)*100).toFixed(1)}%</td><td>${esc(social)}</td><td><span class="badge ${row.performanceVerified?'good':''}">${status}</span><span class="chain">行情 ${esc(row.markStatus||'missing')} · 库存 ${esc(row.inventoryStatus||'unknown')}</span></td></tr>`;
+      }).join('')||'<tr><td colspan="12" class="empty">尚未接入或尚无标准化链上成交、独立行情与社交身份数据；当前不能称为“已验证”</td></tr>';
       bindCopy();
       $('visible').textContent=`${Number(intel.profiled||0)} 个观察画像 · ${Number(performance.verifiedProfiles||0)} 个真实业绩已验证`;
     }
@@ -930,9 +947,9 @@
       renderBars('status-bars',state.orders.statuses,key=>statusLabels[key]||key,'accepted');
       renderBars('chain-bars',state.orders.acceptedChains,key=>chainName(key),'');
       const latencies=state.shadow.executions.map(x=>Number(x.decisionLatencyMs)).filter(Number.isFinite);
-      const ages=state.shadow.executions.map(x=>Number(x.signalAgeMs)).filter(Number.isFinite);
+      const ages=state.shadow.executions.map(x=>Number(x.upstreamAgeMs??x.signalAgeMs)).filter(Number.isFinite);
       const avg=latencies.length?latencies.reduce((a,b)=>a+b,0)/latencies.length:null;
-      stableHTML('latency-stats',`<div class="latency-stat"><span>平均风控耗时</span><strong>${avg==null?'—':avg.toFixed(3)+' ms'}</strong></div><div class="latency-stat"><span>P95 风控耗时</span><strong>${percentile(latencies,.95)==null?'—':percentile(latencies,.95).toFixed(3)+' ms'}</strong></div><div class="latency-stat"><span>P95 信号年龄</span><strong>${percentile(ages,.95)==null?'—':percentile(ages,.95).toFixed(0)+' ms'}</strong></div><div class="latency-stat"><span>样本数</span><strong>${latencies.length}</strong></div>`);
+      stableHTML('latency-stats',`<div class="latency-stat"><span>平均风控耗时</span><strong>${avg==null?'—':avg.toFixed(3)+' ms'}</strong></div><div class="latency-stat"><span>P95 风控耗时</span><strong>${percentile(latencies,.95)==null?'—':percentile(latencies,.95).toFixed(3)+' ms'}</strong></div><div class="latency-stat"><span>P95 上游年龄</span><strong>${percentile(ages,.95)==null?'—':percentile(ages,.95).toFixed(0)+' ms'}</strong></div><div class="latency-stat"><span>样本数</span><strong>${latencies.length}</strong></div>`);
       const rpc=state.rpc||{},rpcStatus={healthy:'健康',slow:'延迟过高',degraded:'降级',stale:'遥测过期',untested:'未测试',unconfigured:'未配置'};
       $('rpc-summary').textContent=`可达 ${Number(rpc.reachable||0)} · 已配置 ${Number(rpc.configured||0)}/${Number(rpc.total||0)} · 交易级 ${Number(rpc.healthy||0)}`;
       stableRows('rpc-rows',rpc.endpoints||[],row=>`${row.chainId}|${row.provider}|${row.role}`,row=>`<tr><td>${esc(chainName(row.chainId))}</td><td>${esc(row.provider)}</td><td>${esc(row.role)}</td><td>${row.httpConfigured?'已配置':'未配置'}</td><td><span class="badge ${row.status==='healthy'?'good':''}">${esc(rpcStatus[row.status]||row.status)}</span></td><td class="num">${row.successRate==null?'—':(Number(row.successRate)*100).toFixed(1)+'%'}</td><td class="num">${row.p95LatencyMs==null?'—':Number(row.p95LatencyMs).toFixed(0)+' ms'}</td><td class="num">${row.blockLag==null?'—':row.blockLag}</td><td>${esc(time(row.lastSampleAt))}</td></tr>`,'<tr><td colspan="9" class="empty">暂无 RPC 配置</td></tr>');
@@ -956,11 +973,22 @@
       const funds=(state.wallet.balances||[]).map(x=>x.available?`${chainName(x.chainId)} ${Number(x.balance).toLocaleString(undefined,{maximumSignificantDigits:8})} ${x.symbol}`:`${chainName(x.chainId)} 查询失败`).join(' · ')||'待登记地址';
       stableHTML('execution-readiness',readyItem('执行阶段',stageLabels[r.stage]||r.stage||'—')+readyItem('RPC 节点池',`可达 ${pool.reachable||0} · 已配置 ${pool.configured||0}/${pool.total||0} · ${pool.healthy||0} 交易级`,rpcTitle)+readyItem('极速路由',`${routeChains.length} 链 · Key ${routeKeys}/${keyProviders.length}`,`双路竞速；价差保护 ${state.route.maximumOutputSacrificeBps||0} bps`)+readyItem('执行锁',control.circuitBreakerTripped?`锁定 · ${blocked} 阻断`:'待命',control.breakerReason||''));
       stableHTML('position-rows',(p.positions||[]).length?p.positions.map(row=>{
-        const pct=Number(row.costBasisUsd)>0?Number(row.unrealizedPnlUsd)/Number(row.costBasisUsd)*100:0;
         const status=row.status==='open'?(row.markStale?'行情过期':'持仓中'):'已平仓';
         const stage=row.status!=='open'?'已结束':row.exitStage==='principal_recovered'?'已出本 · 跟踪回撤':'止损 / 等待出本';
-        const recovered=Number(row.recoveredPrincipalUsd||0)>0?`已收回 ${money(row.recoveredPrincipalUsd)}`:`本金 ${money(row.initialCostUsd||row.costBasisUsd)}`;
-        return `<tr><td>${esc(time(row.firstBoughtAt))}</td><td>@${esc(handleText(row.handle))}</td><td><span class="token">${esc(row.symbol||'—')}<span class="chain">${esc(chainName(row.networkId))}</span></span></td><td><span class="badge ${row.status==='open'&&!row.markStale?'good':''} ${row.markStale?'stale':''}">${status}</span></td><td class="num mono">${esc(compact(row.quantity))}</td><td class="num">${amountMarkup(row.costBasisUsd,{position:true})}</td><td class="num">${amountMarkup(row.marketValueUsd,{position:true})}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${signedMoney(row.unrealizedPnlUsd)} · ${pct>0?'+':''}${pct.toFixed(2)}%</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${signedMoney(row.realizedPnlUsd)}</td><td><span class="exit-stage">${esc(stage)}<small>${esc(recovered)}</small></span></td><td class="num">${price(row.lastPriceUsd)}${row.markStale?'<br><span class="stale">'+Math.floor(Number(row.markAgeSeconds)/60)+'m 前</span>':''}</td><td>${actionMarkup(row)}</td></tr>`;
+        const invested=Number(row.cycleInvestedUsd??row.initialCostUsd??row.costBasisUsd);
+        const recovered=Number(row.cycleRecoveredUsd||0);
+        const cycleRealized=Number(row.cycleRealizedPnlUsd??row.realizedPnlUsd);
+        const historicalRealized=Number(row.historicalRealizedPnlUsd||0);
+        const cycleReturn=cycleRealized+Number(row.unrealizedPnlUsd||0);
+        const cycleRoi=invested>0?cycleReturn/invested*100:0;
+        const costMarkup=`<span class="token">${money(invested)}${row.status==='open'&&invested!==Number(row.costBasisUsd)?`<small class="chain">剩余成本 ${money(row.costBasisUsd)}</small>`:''}</span>`;
+        const valueMarkup=row.status==='open'
+          ? `<span class="token">${money(row.marketValueUsd)}<small class="chain">持仓市值</small></span>`
+          : `<span class="token">${money(recovered)}<small class="chain">退出回收</small></span>`;
+        const cycleReturnMarkup=`<span class="token ${pnlClass(cycleReturn)}">${signedMoney(cycleReturn)}<small class="chain">${cycleRoi>0?'+':''}${cycleRoi.toFixed(2)}%${row.status==='open'?' · 含浮动':' · 已落袋'}</small></span>`;
+        const historyMarkup=historicalRealized===0?'—':`<span class="token ${pnlClass(historicalRealized)}">${signedMoney(historicalRealized)}<small class="chain">过往轮次</small></span>`;
+        const planDetail=row.status==='open'?(Number(row.recoveredPrincipalUsd||0)>0?`已收回 ${money(row.recoveredPrincipalUsd)}`:`本轮投入 ${money(invested)}`):`回收 ${money(recovered)} · ${cycleRoi>0?'+':''}${cycleRoi.toFixed(2)}%`;
+        return `<tr><td>${esc(time(row.firstBoughtAt))}</td><td>@${esc(handleText(row.handle))}</td><td><span class="token">${esc(row.symbol||'—')}<span class="chain">${esc(chainName(row.networkId))}</span></span></td><td><span class="badge ${row.status==='open'&&!row.markStale?'good':''} ${row.markStale?'stale':''}">${status}</span></td><td class="num mono">${esc(compact(row.quantity))}</td><td class="num">${costMarkup}</td><td class="num">${valueMarkup}</td><td class="num">${cycleReturnMarkup}</td><td class="num">${historyMarkup}</td><td><span class="exit-stage">${esc(stage)}<small>${esc(planDetail)}</small></span></td><td class="num">${price(row.lastPriceUsd)}${row.markStale?'<br><span class="stale">'+Math.floor(Number(row.markAgeSeconds)/60)+'m 前</span>':''}</td><td>${actionMarkup(row)}</td></tr>`;
       }).join(''):'<tr><td colspan="12" class="empty">暂无模拟持仓</td></tr>');
       stableHTML('daily-rows',(p.daily||[]).length?p.daily.map(row=>`<tr><td>${esc(row.day)}</td><td class="num">${money(row.buyUsd)}</td><td class="num">${money(row.sellUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${signedMoney(row.realizedPnlUsd)}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${signedMoney(row.unrealizedPnlUsd)}</td><td class="num ${pnlClass(row.totalPnlUsd)}">${signedMoney(row.totalPnlUsd)}</td><td class="num">${money(row.marketValueUsd)}</td><td class="num">${Number(row.trades||0)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">暂无日统计</td></tr>');
       const days=(p.daily||[]).slice(0,14).reverse(),maxPnl=Math.max(1,...days.map(x=>Math.abs(Number(x.totalPnlUsd||0))));
@@ -1014,9 +1042,9 @@
         const events=Object.entries(x.notifications||{}).filter(([,enabled])=>enabled).map(([key])=>eventNames[key]||key).join(' / ')||'不推送';
         const f=x.filters||{},caps=f.maxMarketCapUsd?`${money(f.minMarketCapUsd)}–${money(f.maxMarketCapUsd)}`:`≥ ${money(f.minMarketCapUsd)}`;
         const family=String(x.chainIds?.[0])==='1399811149'?'Solana':'EVM';
-        return `<tr><td><b>${esc(x.name)}</b><div class="address-line mono" title="${esc(x.address)}">${esc(x.address)}</div></td><td>${family}</td><td><div class="tag-list">${(x.tags||[]).map(tag=>`<span class="tag">${esc(tag)}</span>`).join('')||'<span class="tag">无标签</span>'}</div><small>${x.linkedHandle?'@'+esc(x.linkedHandle):'独立钱包'}</small></td><td>${esc(events)}</td><td>金额 ≥ ${money(f.minAmountUsd)}<br><small>市值 ${caps}</small></td><td><span class="badge ${x.status==='active'?'good':''}">${x.status==='active'?'启用':'暂停'}</span></td><td><div class="actions"><button class="action" data-watch-action="edit" data-id="${esc(x.id)}">编辑</button><button class="action" data-watch-action="status" data-status="${x.status==='active'?'paused':'active'}" data-id="${esc(x.id)}">${x.status==='active'?'暂停':'启用'}</button><button class="action danger-action" data-watch-action="delete" data-id="${esc(x.id)}">删除</button><button class="action" data-copy-address="${esc(x.address)}">复制</button></div></td></tr>`;
+        return `<tr><td><b>${esc(x.name)}</b><div class="address-line mono" title="${esc(x.address)}">${esc(x.address)}</div></td><td>${family}</td><td><div class="tag-list">${(x.tags||[]).map(tag=>`<span class="tag">${esc(tag)}</span>`).join('')||'<span class="tag">无标签</span>'}</div><small>${x.linkedHandle?'@'+esc(x.linkedHandle):'独立钱包'}</small></td><td>${esc(events)}</td><td>金额 ≥ ${money(f.minAmountUsd)}<br><small>市值 ${caps}</small></td><td><span class="badge">${x.status==='active'?'规则已保存':'规则已暂停'}</span><br><small>未实时观察</small></td><td><div class="actions"><button class="action" data-watch-action="edit" data-id="${esc(x.id)}">编辑</button><button class="action" data-watch-action="status" data-status="${x.status==='active'?'paused':'active'}" data-id="${esc(x.id)}">${x.status==='active'?'暂停':'启用'}</button><button class="action danger-action" data-watch-action="delete" data-id="${esc(x.id)}">删除</button><button class="action" data-copy-address="${esc(x.address)}">复制</button></div></td></tr>`;
       },'<tr><td colspan="7" class="empty">尚未添加自定义观察钱包</td></tr>');
-      $('watch-tracking-note').textContent=data.trackingStatus==='awaiting_rpc_stream_adapter'?'地址与规则已持久化；等待 RPC 实时订阅适配器接入。':'RPC 实时订阅已接入。';
+      $('watch-tracking-note').textContent=data.trackingStatus==='awaiting_rpc_stream_adapter'?'仅保存地址与规则；尚未开始实时观察，不会产生提醒或 PnL。':'RPC 实时订阅已接入。';
       $('visible').textContent=`${kolWallets.length} 个 KOL 关联 · ${watchWallets.length} 个观察钱包`;
     }
     function editKol(entry){
@@ -1042,28 +1070,28 @@
     function renderRank50(){
       const o=state.rankOverview||{};$('rank-cycle').textContent=`${o.cycleDate||'—'} / UTC+8`;$('rank-progress').textContent=o.progress||'0/24';$('rank-success').textContent=o.successfulSnapshots??0;$('rank-current-count').textContent=o.currentRanked??0;$('rank-participant-count').textContent=o.uniqueParticipants??0;$('rank-last').textContent=o.lastSnapshot?time(o.lastSnapshot):'—';
       const q=$('rank-search').value.trim().toLowerCase(),sort=$('rank-sort').value,mode=state.rankMode;let rows=mode==='participants'?[...(state.rankParticipants||[])]:mode==='history'?[...(state.rankHistory.records||[])]:[...(state.rankCurrent||[])];
-      if(mode==='participants')rows=rows.sort((a,b)=>Number(b.pnlChange??-Infinity)-Number(a.pnlChange??-Infinity)||String(a.userId||'').localeCompare(String(b.userId||''))).map((x,index)=>({...x,todayRank:index+1}));
+      if(mode==='participants')rows=rows.sort((a,b)=>Number(b.currentValueAvailable)-Number(a.currentValueAvailable)||Number(b.currentPnl24hUsd??-Infinity)-Number(a.currentPnl24hUsd??-Infinity)||String(b.lastObservedAt||'').localeCompare(String(a.lastObservedAt||'')));
       rows=rows.filter(x=>!q||[x.userId,x.userHandle,x.address,x.evmAddress].some(v=>String(v||'').toLowerCase().includes(q)));
-      rows.sort((a,b)=>sort==='pnl'?(mode==='participants'?Number(b.pnlChange??-Infinity)-Number(a.pnlChange??-Infinity):Number(b.pnlUsd)-Number(a.pnlUsd)):sort==='appear'?Number(b.appearCount||0)-Number(a.appearCount||0):mode==='participants'?Number(a.todayRank)-Number(b.todayRank):Number(a.latestRank??a.rank)-Number(b.latestRank??b.rank));
+      rows.sort((a,b)=>sort==='current_pnl'?(mode==='participants'?Number(b.currentPnl24hUsd??-Infinity)-Number(a.currentPnl24hUsd??-Infinity):Number(b.pnl24hUsd??b.pnlUsd)-Number(a.pnl24hUsd??a.pnlUsd)):sort==='last_observed'?Number(b.latestRankedPnl24hUsd??b.pnl24hUsd??b.pnlUsd??-Infinity)-Number(a.latestRankedPnl24hUsd??a.pnl24hUsd??a.pnlUsd??-Infinity):sort==='change'?Number(b.rankedPnl24hChangeUsd??-Infinity)-Number(a.rankedPnl24hChangeUsd??-Infinity):sort==='appear'?Number(b.appearCount||0)-Number(a.appearCount||0):Number(a.latestRank??a.rank)-Number(b.latestRank??b.rank));
       $('rank-table').classList.toggle('participant-table',mode==='participants');
-      $('rank-head').innerHTML=mode==='participants'?'<tr><th class="num">今日排名</th><th>用户 / 钱包</th><th class="num">最佳排名</th><th class="num">最近排名</th><th class="num">上榜次数</th><th class="num">首次收益</th><th class="num">最近上榜收益</th><th class="num">今日 PNL</th><th>最新状态</th></tr>':'<tr><th class="num">排名</th><th>用户 / 钱包</th><th class="num">当时收益</th><th class="num">关注者</th><th class="num">交易数</th></tr>';
+      $('rank-head').innerHTML=mode==='participants'?'<tr><th class="num">当前 / 最后排名</th><th>用户 / 钱包</th><th class="num">最佳排名</th><th class="num">上榜次数</th><th class="num">当前 24h PnL</th><th class="num">最后观测 24h PnL</th><th class="num">榜内 24h 指标变化</th><th>状态 / 最后观测</th></tr>':'<tr><th class="num">排名</th><th>用户 / 钱包</th><th class="num">当时滚动 24h PnL</th><th class="num">关注者</th><th class="num">交易数</th></tr>';
       $('rank-rows').innerHTML=rows.length?rows.map(x=>{
         const user=String(x.userId||x.userHandle||''),handle=handleText(x.userHandle,'未知用户'),name=`@${esc(handle)}`,expanded=state.rankExpandedUser===user;
         const profileLink=handle?`<a class="rank-profile-link" href="https://fomo.family/profile/${encodeURIComponent(handle)}" target="_blank" rel="noopener noreferrer" title="在 Fomo 打开 ${name}">${name}</a>`:`<span class="rank-profile-link">${name}</span>`;
         const identity=`<span class="rank-name-cell"><button class="rank-expand" type="button" data-rank-expand="${esc(user)}" aria-expanded="${expanded}" aria-label="${expanded?'折叠':'展开'} ${name} 的上榜时间线"></button>${profileLink}</span>`;
-        const main=mode==='participants'?`<tr class="rank-user" data-user="${esc(user)}"><td class="num">#${x.todayRank}</td><td>${identity}</td><td class="num">${x.bestRank}</td><td class="num">${x.latestRank}</td><td class="num">${x.appearCount}</td><td class="num">${money(x.firstPnl)}</td><td class="num">${money(x.latestRankedPnl)}</td><td class="num ${pnlClass(x.pnlChange)}">${signedMoney(x.pnlChange)}</td><td>${x.isCurrentRanked?'● 仍在榜':'已掉榜'}</td></tr>`:`<tr class="rank-user" data-user="${esc(user)}"><td class="num">#${x.rank}</td><td>${identity}</td><td class="num ${pnlClass(x.pnlUsd)}">${money(x.pnlUsd)}</td><td class="num">${compact(x.followers)}</td><td class="num">${compact(x.numTrades)}</td></tr>`;
-        return main+`<tr class="rank-detail-row${expanded?' open':''}" data-rank-detail="${esc(user)}"><td colspan="${mode==='participants'?9:5}"><div class="rank-detail-panel"><div class="rank-detail-inner"><div class="rank-detail-content">${rankDetailMarkup(user)}</div></div></div></td></tr>`;
-      }).join(''):`<tr><td colspan="${mode==='participants'?9:5}" class="empty">该时段没有成功快照</td></tr>`;
+        const main=mode==='participants'?`<tr class="rank-user" data-user="${esc(user)}"><td class="num">#${x.latestRank}</td><td>${identity}</td><td class="num">${x.bestRank}</td><td class="num">${x.appearCount}</td><td class="num ${pnlClass(x.currentPnl24hUsd)}">${x.currentPnl24hUsd==null?'不可用':signedMoney(x.currentPnl24hUsd)}</td><td class="num ${pnlClass(x.latestRankedPnl24hUsd)}">${signedMoney(x.latestRankedPnl24hUsd)}</td><td class="num ${pnlClass(x.rankedPnl24hChangeUsd)}">${signedMoney(x.rankedPnl24hChangeUsd)}</td><td>${x.isCurrentRanked?'● 仍在榜':'已掉榜 · 当前值不可用'}<span class="chain">${esc(time(x.lastObservedAt))}</span></td></tr>`:`<tr class="rank-user" data-user="${esc(user)}"><td class="num">#${x.rank}</td><td>${identity}</td><td class="num ${pnlClass(x.pnl24hUsd??x.pnlUsd)}">${money(x.pnl24hUsd??x.pnlUsd)}</td><td class="num">${compact(x.followers)}</td><td class="num">${compact(x.numTrades)}</td></tr>`;
+        return main+`<tr class="rank-detail-row${expanded?' open':''}" data-rank-detail="${esc(user)}"><td colspan="${mode==='participants'?8:5}"><div class="rank-detail-panel"><div class="rank-detail-inner"><div class="rank-detail-content">${rankDetailMarkup(user)}</div></div></div></td></tr>`;
+      }).join(''):`<tr><td colspan="${mode==='participants'?8:5}" class="empty">该时段没有成功快照</td></tr>`;
       document.querySelectorAll('[data-rank-expand]').forEach(button=>button.onclick=()=>toggleRankDetail(button.dataset.rankExpand));
       document.querySelectorAll('.rank-mode').forEach(b=>b.classList.toggle('active',b.dataset.rankMode===mode));
     }
     async function readApi(url){
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),7000);
-      try{const response=await fetch(url,{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);return await response.json()}finally{clearTimeout(timer)}
+      try{const response=await fetch(url,{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);const payload=await response.json();return {payload,meta:{serviceInstanceId:response.headers.get('X-Fomo-Service-Instance')||payload?.serviceInstanceId,generatedAt:response.headers.get('X-Fomo-Generated-At')||payload?.generatedAt,dataRevision:response.headers.get('X-Fomo-Data-Revision')||payload?.dataRevision}}}finally{clearTimeout(timer)}
     }
     function acceptApiResult(key,result,assign){
-      if(result.status==='fulfilled'){state.apiFailures[key]=0;state.apiSuccess[key]=true;assign(result.value);return true}
-      state.apiFailures[key]=(state.apiFailures[key]||0)+1;console.warn(`[${key}] API 第 ${state.apiFailures[key]} 次连续失败`,result.reason);return false;
+      if(result.status==='fulfilled'){const envelope=result.value,check=consistency.observe(key,envelope.meta,envelope.payload);state.apiFailures[key]=0;state.apiSuccess[key]=true;if(check.stale)state.staleApis.add(key);else state.staleApis.delete(key);if(check.reload&&!reloadScheduled){reloadScheduled=true;location.reload()}assign(envelope.payload);return true}
+      state.apiFailures[key]=(state.apiFailures[key]||0)+1;state.staleApis.add(key);console.warn(`[${key}] API 第 ${state.apiFailures[key]} 次连续失败`,result.reason);return false;
     }
     function apiUnavailable(key){return (state.apiFailures[key]||0)>=3}
     function showConfirmedApiError(view){
@@ -1080,7 +1108,7 @@
       const detail=state.rankDetails[user];
       if(!detail)return '<div class="rank-detail-label">正在读取上榜时间线…</div>';
       const history=Array.isArray(detail.history)?detail.history:[];
-      return `<div class="rank-detail-label">UTC+8 当日逐小时排名与历史收益 · 未上榜时不补写收益</div><div class="rank-timeline">${history.map(x=>{const ranked=x.status==='ranked';return `<div class="rank-hour${ranked?'':' not-ranked'}"><b><span>${String(x.hourIndex).padStart(2,'0')}:00</span><span>${ranked?'#'+x.rank:'未上榜'}</span></b><span>${x.pnlUsd==null?'—':money(x.pnlUsd)}</span></div>`}).join('')||'<div class="empty">暂无历史记录</div>'}</div>`;
+      return `<div class="rank-detail-label">UTC+8 当日逐小时排名与 Fomo 滚动 24h PnL · 未上榜时当前值不可用</div><div class="rank-timeline">${history.map(x=>{const ranked=x.status==='ranked';return `<div class="rank-hour${ranked?'':' not-ranked'}"><b><span>${String(x.hourIndex).padStart(2,'0')}:00</span><span>${ranked?'#'+x.rank:'未上榜'}</span></b><span>${x.pnl24hUsd==null?'—':money(x.pnl24hUsd)}</span></div>`}).join('')||'<div class="empty">暂无历史记录</div>'}</div>`;
     }
     async function toggleRankDetail(user){
       const previous=state.rankExpandedUser;
@@ -1088,7 +1116,7 @@
       if(previous){document.querySelector(`[data-rank-expand="${CSS.escape(previous)}"]`)?.setAttribute('aria-expanded','false');document.querySelector(`[data-rank-detail="${CSS.escape(previous)}"]`)?.classList.remove('open')}
       state.rankExpandedUser=user;const button=document.querySelector(`[data-rank-expand="${CSS.escape(user)}"]`),row=document.querySelector(`[data-rank-detail="${CSS.escape(user)}"]`);button?.setAttribute('aria-expanded','true');requestAnimationFrame(()=>row?.classList.add('open'));
       if(state.rankDetails[user])return;
-      try{const date=$('rank-date').value;const detail=await fetch(`/api/50rank/participant?date=${date}&user_id=${encodeURIComponent(user)}`).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json()});state.rankDetails[user]=detail;const content=row?.querySelector('.rank-detail-content');if(content)content.innerHTML=rankDetailMarkup(user)}catch(error){const content=row?.querySelector('.rank-detail-content');if(content)content.innerHTML=`<div class="empty">时间线读取失败：${esc(error.message)}</div>`}
+      try{const date=$('rank-date').value;const detail=(await readApi(`/api/50rank/participant?date=${date}&user_id=${encodeURIComponent(user)}`)).payload;state.rankDetails[user]=detail;const content=row?.querySelector('.rank-detail-content');if(content)content.innerHTML=rankDetailMarkup(user)}catch(error){const content=row?.querySelector('.rank-detail-content');if(content)content.innerHTML=`<div class="empty">时间线读取失败：${esc(error.message)}</div>`}
     }
     async function mutateRpc(payload){
       const response=await fetch('/api/rpc-management',{method:'POST',headers:{'Content-Type':'application/json','X-Fomo-CSRF':'1'},body:JSON.stringify(payload)});
@@ -1145,7 +1173,7 @@
       document.querySelectorAll('.side-link').forEach(link=>link.classList.toggle('active',link.dataset.target===state.view));
       ['signals','orders','risk','intelligence','portfolio','rank50','wallets','rpcmanager','analysis'].forEach(name=>$(name+'-view').classList.toggle('hidden',name!==state.view));
       $('toolbar').classList.toggle('hidden',['analysis','intelligence','portfolio','rank50','wallets','rpcmanager'].includes(state.view));
-      $('view-note').textContent=state.view==='signals'?'WebSocket 收包后直接判断，不签名、不广播':state.view==='orders'?'仅展示模拟执行，不会发起真实交易':state.view==='risk'?'钱包身份 + 统一信号 + 只读风控；无签名与广播':state.view==='intelligence'?'观察行为画像；真实胜率与 PnL 等待链上闭环验证':state.view==='portfolio'?'精确到美分以下的持久化模拟账本；下一步接入只读 RPC':state.view==='rank50'?'UTC+8 自然日 · 最新榜单与周期参与者同时保留':state.view==='wallets'?'公开地址、通知规则与证据管理；绝不保存私钥':state.view==='rpcmanager'?'主备 RPC 配置、单节点探测与交易级健康判定':'决策结果、链分布与延迟分位数';
+      $('view-note').textContent=state.view==='signals'?'WebSocket 收包后直接判断，不签名、不广播':state.view==='orders'?'仅展示模拟执行，不会发起真实交易':state.view==='risk'?'钱包身份 + 统一信号 + 只读风控；无签名与广播':state.view==='intelligence'?'观察行为画像；真实胜率与 PnL 等待链上闭环验证':state.view==='portfolio'?'精确到美分以下的持久化模拟账本；下一步接入只读 RPC':state.view==='rank50'?'UTC+8 按日归档 Fomo 滚动 24h 指标；不等同自然日 PnL':state.view==='wallets'?'公开地址、通知规则与证据管理；绝不保存私钥':state.view==='rpcmanager'?'主备 RPC 配置、单节点探测与交易级健康判定':'决策结果、链分布与延迟分位数';
       statusOptions();
       if(push){const url=new URL(location.href);url.searchParams.set('view',state.view);history.replaceState(null,'',url)}
       state.signalPage=1;state.orderPage=1;state.riskPage=1;if(state.view==='rank50')loadRankData();else renderCurrent();requestAnimationFrame(updateTabIndicator);
@@ -1171,19 +1199,20 @@
         if(applied.has('status')){const statusDown=apiUnavailable('status'),ws=!statusDown&&Boolean(status.health?.realtime?.connected&&status.health?.realtime?.fresh),privy=!statusDown&&Boolean(status.health?.privy?.connected&&status.health?.privy?.fresh);$('ws-dot').classList.toggle('ok',ws);$('privy-dot').classList.toggle('ok',privy);$('ws-text').textContent=statusDown?'连接中断':ws?'在线':'异常';$('privy-text').textContent=statusDown?'连接中断':privy?'在线':'异常';const modes=status.modes||{};$('paper-mode').classList.toggle('on',Boolean(modes.paper?.enabled));$('paper-mode').textContent=`PAPER · ${modes.paper?.enabled?'运行中':'关闭'}`;$('shadow-mode').classList.toggle('on',Boolean(modes.shadow?.enabled));$('shadow-mode').textContent=`SHADOW · ${modes.shadow?.enabled?'路由中':'关闭'}`}
         if(applied.has('readiness')||applied.has('journal')){const executionReady=Boolean(readiness.ready&&!journal.control?.circuitBreakerTripped);$('execution-dot').classList.toggle('ok',executionReady);$('execution-dot').classList.toggle('locked',!executionReady);$('execution-text').textContent=executionReady?'就绪':'安全锁定';$('live-mode').classList.toggle('on',executionReady);$('live-mode').classList.toggle('locked',!executionReady);$('live-mode').textContent=`LIVE · ${executionReady?'就绪':'锁定'}`}
         if(['status','rpc','identity','portfolio'].some(key=>applied.has(key))){const alerts=[...(status.alerts||[])];if(Number(rpc.configured||0)>0&&Number(rpc.healthy||0)===0)alerts.push({message:'RPC 已配置，但当前没有交易级健康节点'});if(Number(identity.expired||0)>0)alerts.push({message:`${identity.expired} 个钱包证据已过期`});const stalePositions=(portfolio.positions||[]).filter(x=>x.status==='open'&&x.markStale).length;if(stalePositions)alerts.push({message:`${stalePositions} 个持仓行情已过期`});const alertBox=$('system-alerts'),message=alerts.map(x=>x.message).join(' · ');if(alertBox.textContent!==message)alertBox.textContent=message;alertBox.classList.toggle('hidden',alerts.length===0)}
-        if(applied.size){const updated='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});$('updated').textContent=updated;$('updated-top').textContent=updated}
+        if(applied.size){const updated=state.staleApis.size?'数据可能过期 · 正在重试':'更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});$('updated').textContent=updated;$('updated-top').textContent=updated}
       }catch(error){console.error('面板刷新渲染失败，保留上一份成功数据',error)}finally{refreshInFlight=false;if(pendingRefresh.size)queueRefresh([])}
     }
     function connectDashboardPush(){
       const protocol=location.protocol==='https:'?'wss:':'ws:';pushSocket=new WebSocket(`${protocol}//${location.host}/ws/dashboard`);
-      pushSocket.addEventListener('open',()=>{pushRetryMs=1000});
-      pushSocket.addEventListener('message',event=>{try{const message=JSON.parse(event.data);if(message.type==='invalidate')queueRefresh(message.keys)}catch(error){console.warn('忽略无法解析的面板推送',error)}});
+      pushSocket.addEventListener('open',()=>{pushRetryMs=1000;queueRefresh(lifecycleRefreshKeys(state.view,'websocket_open'))});
+      pushSocket.addEventListener('message',event=>{try{const message=JSON.parse(event.data);if(message.type==='ready'){const check=consistency.observe('websocket',message,{});if(check.reload&&!reloadScheduled){reloadScheduled=true;location.reload()}}if(message.type==='invalidate')queueRefresh(message.keys)}catch(error){console.warn('忽略无法解析的面板推送',error)}});
       pushSocket.addEventListener('close',()=>{setTimeout(connectDashboardPush,pushRetryMs);pushRetryMs=Math.min(30000,pushRetryMs*2)});
       pushSocket.addEventListener('error',()=>pushSocket.close());
     }
     document.querySelectorAll('[role="tab"]').forEach(tab=>tab.addEventListener('click',()=>setView(tab.dataset.view)));
     document.querySelectorAll('.side-link').forEach(link=>link.addEventListener('click',()=>setView(link.dataset.target)));
     window.addEventListener('resize',updateTabIndicator);
+    document.addEventListener('visibilitychange',()=>{const keys=lifecycleRefreshKeys(state.view,'visibilitychange',document.visibilityState);if(keys.length)queueRefresh(keys)});
     ['status','chain'].forEach(id=>$(id).addEventListener('change',()=>{state.signalPage=1;state.orderPage=1;state.riskPage=1;renderCurrent()}));
     $('search').addEventListener('input',()=>{state.signalPage=1;state.orderPage=1;state.riskPage=1;renderCurrent()});
     $('signal-prev').addEventListener('click',()=>{state.signalPage--;renderSignals()});$('signal-next').addEventListener('click',()=>{state.signalPage++;renderSignals()});
