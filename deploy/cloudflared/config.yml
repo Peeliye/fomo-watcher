@@ -1,0 +1,9 @@
+tunnel: 5126ac4b-638e-4095-8a93-af60b25fa4a6
+credentials-file: /home/ubuntu/.cloudflared/5126ac4b-638e-4095-8a93-af60b25fa4a6.json
+
+ingress:
+  - hostname: www.obot.trade
+    service: http://127.0.0.1:8765
+    originRequest:
+      connectTimeout: 10s
+  - service: http_status:404
