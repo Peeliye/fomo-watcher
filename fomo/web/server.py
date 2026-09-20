@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 from ..execution.journal import execution_snapshot, reconciliation_snapshot
 from ..execution.networks import apply_network_settings, network_settings_path
-from ..execution.readiness import execution_readiness, wallet_balance_snapshot
+from ..execution.readiness import execution_readiness
 from ..execution.rpc_pool import rpc_health_snapshot
 from ..execution.routing import route_readiness
 from ..intelligence.profile import intelligence_snapshot
@@ -44,6 +44,18 @@ CHAIN_NAMES = {
     8453: "Base",
     1399811149: "Solana",
 }
+
+
+def public_execution_readiness(project_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return operational readiness without exposing execution-wallet metadata."""
+    payload = execution_readiness(project_dir, cfg)
+    payload.pop("walletId", None)
+    payload.pop("accounts", None)
+    for chain in payload.get("chains", []):
+        chain.pop("accountId", None)
+        chain.pop("address", None)
+    payload["note"] = "Execution-wallet identifiers, addresses, and balances are hidden from the dashboard."
+    return payload
 
 
 def _websocket_text_frame(payload: dict[str, Any]) -> bytes:
@@ -694,10 +706,7 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 self._send_json(exit_policy_store.read())
                 return
             if parsed.path == "/api/execution-readiness":
-                self._send_json(execution_readiness(project_dir, cfg))
-                return
-            if parsed.path == "/api/wallet-balances":
-                self._send_json(wallet_balance_snapshot(project_dir, cfg))
+                self._send_json(public_execution_readiness(project_dir, cfg))
                 return
             if parsed.path == "/api/execution-intents":
                 query = parse_qs(parsed.query)
