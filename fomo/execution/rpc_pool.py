@@ -20,6 +20,8 @@ from typing import Any
 
 from curl_cffi import requests as cf
 
+from .networks import enabled_chain_ids
+
 
 @dataclass(frozen=True)
 class RpcEndpoint:
@@ -125,7 +127,28 @@ def probe_rpc_endpoint(endpoint: RpcEndpoint, timeout_seconds: float = 2.0) -> d
 
 
 def run_rpc_probe_cycle(project_dir: Path, cfg: dict[str, Any], samples: int = 3, timeout_seconds: float = 2.0) -> dict[str, Any]:
-    endpoints = [endpoint for endpoint in load_rpc_endpoints(cfg) if endpoint.http_configured]
+    return run_rpc_probe_endpoints(project_dir, cfg, None, samples, timeout_seconds)
+
+
+def run_rpc_probe_endpoints(
+    project_dir: Path,
+    cfg: dict[str, Any],
+    endpoint_ids: set[str] | None = None,
+    samples: int = 3,
+    timeout_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Probe selected logical endpoints and persist results without exposing URLs."""
+    enabled = set(enabled_chain_ids(cfg))
+    endpoints = [
+        endpoint for endpoint in load_rpc_endpoints(cfg)
+        if endpoint.http_configured and endpoint.chain_id in enabled
+        and (endpoint_ids is None or endpoint.endpoint_id in endpoint_ids)
+    ]
+    if endpoint_ids is not None:
+        known = {endpoint.endpoint_id for endpoint in load_rpc_endpoints(cfg)}
+        missing = endpoint_ids - known
+        if missing:
+            raise ValueError("unknown RPC endpoint: " + ", ".join(sorted(missing)))
     settings = cfg.get("rpc_pool", {})
     database = Path(str(settings.get("database", "data/rpc-health.sqlite3")))
     if not database.is_absolute():
@@ -170,6 +193,7 @@ class RpcHealthStore:
                 ON rpc_samples(endpoint_id, sampled_at DESC);
         """)
         self.connection.commit()
+        self._records_since_prune = 0
 
     def close(self) -> None:
         self.connection.close()
@@ -195,6 +219,15 @@ class RpcHealthStore:
              timestamp, method, latency_ms, int(success), block_height, error_code),
         )
         self.connection.commit()
+        self._records_since_prune += 1
+        if self._records_since_prune >= 100:
+            self.connection.execute(
+                """DELETE FROM rpc_samples WHERE endpoint_id=? AND id NOT IN
+                   (SELECT id FROM rpc_samples WHERE endpoint_id=? ORDER BY id DESC LIMIT 5000)""",
+                (endpoint.endpoint_id, endpoint.endpoint_id),
+            )
+            self.connection.commit()
+            self._records_since_prune = 0
 
     def snapshot(self, cfg: dict[str, Any]) -> dict[str, Any]:
         pool_cfg = cfg.get("rpc_pool", {}) if isinstance(cfg.get("rpc_pool", {}), dict) else {}
@@ -231,6 +264,7 @@ class RpcHealthStore:
             if heights:
                 latest_heights[endpoint.chain_id] = max(latest_heights.get(endpoint.chain_id, 0), heights[0])
 
+        enabled_chains = set(enabled_chain_ids(cfg))
         public: list[dict[str, Any]] = []
         for endpoint in endpoints:
             rows = rows_by_endpoint[endpoint.endpoint_id]
@@ -254,7 +288,9 @@ class RpcHealthStore:
             current = bool(lag is None or lag <= max_lag)
             fast = bool(latencies and latencies[p95_index] <= max_p95)
             healthy = bool(reachable and reliable and current and fast)
+            chain_enabled = endpoint.chain_id in enabled_chains
             status = (
+                "disabled" if not chain_enabled else
                 "unconfigured" if not endpoint.http_configured else
                 "stale" if rows and not telemetry_current else
                 "healthy" if healthy else
@@ -273,6 +309,7 @@ class RpcHealthStore:
                 "lastSampleAt": last_sample_at,
                 "sampleAgeSeconds": round(sample_age, 1) if sample_age is not None else None,
                 "telemetryCurrent": telemetry_current,
+                "chainEnabled": chain_enabled,
             })
             public.append(item)
 
@@ -284,7 +321,7 @@ class RpcHealthStore:
                 selected[chain_id] = str(best["endpointId"])
         return {
             **rpc_pool_readiness(cfg),
-            "reachable": sum(1 for item in public if item["httpConfigured"] and item["telemetryCurrent"] and item["successRate"] is not None and item["successRate"] > 0),
+            "reachable": sum(1 for item in public if item["chainEnabled"] and item["httpConfigured"] and item["telemetryCurrent"] and item["successRate"] is not None and item["successRate"] > 0),
             "healthy": sum(1 for item in public if item["status"] == "healthy"),
             "selected": selected,
             "endpoints": public,

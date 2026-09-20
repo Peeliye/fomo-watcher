@@ -42,3 +42,27 @@ test("stale whitelist fails closed", () => {
   }, "2026-09-10T00:00:01Z", config, stale, now);
   assert.equal(record.status, "following_whitelist_unavailable");
 });
+
+test("passive transfer is never eligible even when configured", () => {
+  const record = evaluateShadow({
+    id: "4", type: "large_transfer_in", createdAt: "2026-09-10T00:00:00Z",
+    userId: "followed", networkId: 4663, tokenAddress: "0xabc",
+    usdAmount: 500, marketCap: 1000000,
+  }, "2026-09-10T00:00:01Z", {
+    ...config,
+    eventTypes: [...config.eventTypes, "large_transfer_in"],
+    activeBuyEventTypes: [...config.eventTypes, "large_transfer_in"],
+  }, whitelist, now);
+  assert.equal(record.status, "passive_asset_event");
+  assert.equal(record.proposedBuyUsd, 0);
+});
+
+test("missing asset metadata is deferred after the fast path", () => {
+  const record = evaluateShadow({
+    id: "5", type: "swap_buy", createdAt: "2026-09-10T00:00:00Z",
+    userId: "followed", networkId: 4663, tokenAddress: "0xabc", usdAmount: 500,
+  }, "2026-09-10T00:00:01Z", { ...config, deferAssetChecks: true }, whitelist, now);
+  assert.equal(record.status, "eligible");
+  assert.deepEqual(record.deferredChecks, ["missing_market_cap"]);
+  assert.equal(record.stage, "fast_path_ready");
+});

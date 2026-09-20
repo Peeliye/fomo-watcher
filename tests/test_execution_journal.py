@@ -41,6 +41,20 @@ class ExecutionJournalTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["actualUsd"], 99.5)
             self.assertEqual(execution_snapshot(path)["states"], {"confirmed": 1})
 
+    def test_post_trade_advisory_is_observed_not_a_pretrade_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "execution.sqlite3"
+            journal = ExecutionJournal(path)
+            event = SimpleNamespace(id="post-1", user_id="kol-1", handle="alice", network_id=1,
+                                    ca="0x1111111111111111111111111111111111111111",
+                                    symbol="MEME", kind="buy", amount_usd=100)
+            journal.record_risk_decision(event, {
+                "signalId": "fomo:post-1", "phase": "post_trade", "outcome": "rejected",
+                "blockers": ["sell_simulation_failed"],
+            })
+            journal.close()
+            self.assertEqual(execution_snapshot(path)["states"], {"post_trade_observed": 1})
+
     def test_receipt_chain_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = ExecutionJournal(Path(directory) / "execution.sqlite3")

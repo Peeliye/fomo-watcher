@@ -7,6 +7,8 @@ SQLite WAL mode keeps watcher writes and dashboard reads independent.
 from __future__ import annotations
 
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -94,6 +96,10 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
   last_price_usd TEXT NOT NULL,
   last_mark_at TEXT NOT NULL,
   status TEXT NOT NULL,
+  initial_cost_usd_micros INTEGER NOT NULL DEFAULT 0,
+  recovered_principal_usd_micros INTEGER NOT NULL DEFAULT 0,
+  peak_price_usd TEXT NOT NULL DEFAULT '0',
+  exit_stage TEXT NOT NULL DEFAULT 'armed',
   PRIMARY KEY(account_id, kol_id, chain_id, token_address)
 );
 CREATE TABLE IF NOT EXISTS portfolio_daily (
@@ -111,10 +117,16 @@ CREATE TABLE IF NOT EXISTS portfolio_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_fills_executed_at ON portfolio_fills(executed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fills_token ON portfolio_fills(chain_id, token_address, executed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fills_account_time ON portfolio_fills(account_id, executed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fills_account_page ON portfolio_fills(account_id, executed_at DESC, fill_id DESC);
+CREATE INDEX IF NOT EXISTS idx_fills_account_kol_side_time ON portfolio_fills(account_id, kol_id, side, executed_at);
 CREATE INDEX IF NOT EXISTS idx_positions_status ON portfolio_positions(account_id, status, last_trade_at DESC);
+CREATE INDEX IF NOT EXISTS idx_positions_open_tokens
+  ON portfolio_positions(account_id, status, chain_id, token_address, symbol);
 CREATE INDEX IF NOT EXISTS idx_daily_day ON portfolio_daily(account_id, local_day DESC);
-PRAGMA user_version=1;
 """
+
+SCHEMA_VERSION = 4
 
 
 class PortfolioLedger:
@@ -123,24 +135,83 @@ class PortfolioLedger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.timezone = ZoneInfo(timezone_name)
         self.account_id = account_id
-        self.db = sqlite3.connect(self.path, timeout=5)
+        existed = self.path.exists() and self.path.stat().st_size > 0
+        self.db = sqlite3.connect(self.path, timeout=5, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
+        self._write_lock = threading.RLock()
+        current_version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
+        if current_version < SCHEMA_VERSION and existed:
+            self._backup_before_migration(current_version)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        self.db.executescript(SCHEMA)
-        self.db.commit()
+        if current_version < SCHEMA_VERSION:
+            with self._write_lock:
+                self.db.executescript(SCHEMA)
+                self._migrate()
+                self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._last_backup_day: str | None = None
 
+    def _backup_before_migration(self, version: int) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        directory = self.path.parent / "backups"
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / f"{self.path.stem}.pre-v{SCHEMA_VERSION}.from-v{version}.{stamp}.sqlite3"
+        target = sqlite3.connect(destination)
+        try:
+            self.db.backup(target)
+        finally:
+            target.close()
+
+    @contextmanager
+    def _transaction(self):
+        with self._write_lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except Exception:
+                self.db.rollback()
+                raise
+            else:
+                self.db.commit()
+
+    def _migrate(self) -> None:
+        columns = {str(row[1]) for row in self.db.execute("PRAGMA table_info(portfolio_positions)")}
+        additions = {
+            "initial_cost_usd_micros": "INTEGER NOT NULL DEFAULT 0",
+            "recovered_principal_usd_micros": "INTEGER NOT NULL DEFAULT 0",
+            "peak_price_usd": "TEXT NOT NULL DEFAULT '0'",
+            "exit_stage": "TEXT NOT NULL DEFAULT 'armed'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE portfolio_positions ADD COLUMN {name} {definition}")
+        self.db.execute(
+            """UPDATE portfolio_positions SET initial_cost_usd_micros=cost_basis_usd_micros
+               WHERE initial_cost_usd_micros=0 AND cost_basis_usd_micros>0"""
+        )
+        self.db.execute(
+            """UPDATE portfolio_positions SET peak_price_usd=last_price_usd
+               WHERE CAST(peak_price_usd AS REAL)<=0 AND CAST(last_price_usd AS REAL)>0"""
+        )
+
     def close(self) -> None:
-        self.db.close()
+        with self._write_lock:
+            self.db.close()
+
+    def has_event(self, event_id: str) -> bool:
+        with self._write_lock:
+            return self.db.execute(
+                "SELECT 1 FROM portfolio_events WHERE event_id=?", (str(event_id),)
+            ).fetchone() is not None
 
     def open_position_tokens(self) -> list[dict[str, Any]]:
-        rows = self.db.execute(
-            "SELECT DISTINCT chain_id,token_address,symbol FROM portfolio_positions WHERE account_id=? AND status='open'",
-            (self.account_id,),
-        ).fetchall()
+        with self._write_lock:
+            rows = self.db.execute(
+                "SELECT DISTINCT chain_id,token_address,symbol FROM portfolio_positions WHERE account_id=? AND status='open'",
+                (self.account_id,),
+            ).fetchall()
         return [{"chainId": int(row["chain_id"]), "tokenAddress": str(row["token_address"]),
                  "symbol": str(row["symbol"])} for row in rows]
 
@@ -148,22 +219,127 @@ class PortfolioLedger:
         """Apply independently sourced prices to every matching open position."""
         updated = 0
         now = datetime.now(timezone.utc)
-        for mark in marks:
-            price = _decimal(mark.get("priceUsd"))
-            if price <= 0:
-                continue
-            captured = _event_time(str(mark.get("capturedAt") or now.isoformat()))
-            cursor = self.db.execute(
-                """UPDATE portfolio_positions SET last_price_usd=?,last_mark_at=?
-                   WHERE account_id=? AND chain_id=? AND lower(token_address)=lower(?) AND status='open'""",
-                (str(price), captured.isoformat(), self.account_id, int(mark.get("chainId") or 0),
-                 str(mark.get("tokenAddress") or "")),
-            )
-            updated += cursor.rowcount
-        if updated:
-            self._refresh_daily_snapshot(self._day(now), now)
-            self.db.commit()
+        with self._transaction():
+            for mark in marks:
+                price = _decimal(mark.get("priceUsd"))
+                if price <= 0:
+                    continue
+                captured = _event_time(str(mark.get("capturedAt") or now.isoformat()))
+                cursor = self.db.execute(
+                    """UPDATE portfolio_positions SET last_price_usd=?,last_mark_at=?,
+                         peak_price_usd=CASE WHEN CAST(peak_price_usd AS REAL)<? THEN ? ELSE peak_price_usd END
+                       WHERE account_id=? AND chain_id=? AND lower(token_address)=lower(?) AND status='open'""",
+                    (str(price), captured.isoformat(), float(price), str(price), self.account_id, int(mark.get("chainId") or 0),
+                     str(mark.get("tokenAddress") or "")),
+                )
+                updated += cursor.rowcount
+            if updated:
+                self._refresh_daily_snapshot(self._day(now), now)
         return updated
+
+    def evaluate_exit_rules(self, policy: dict[str, Any], max_mark_age_seconds: int = 300) -> list[dict[str, Any]]:
+        with self._transaction():
+            return self._evaluate_exit_rules_locked(policy, max_mark_age_seconds)
+
+    def _evaluate_exit_rules_locked(self, policy: dict[str, Any], max_mark_age_seconds: int = 300) -> list[dict[str, Any]]:
+        """Apply automatic exits to paper positions using the latest independent mark."""
+        if not policy.get("enabled", True):
+            return []
+        now = datetime.now(timezone.utc)
+        rows = self.db.execute(
+            "SELECT * FROM portfolio_positions WHERE account_id=? AND status='open'",
+            (self.account_id,),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        stop_loss = _decimal(policy.get("stopLossPct", 25)) / Decimal("100")
+        recovery_multiple = _decimal(policy.get("principalRecoveryMultiple", 2))
+        trailing_stop = _decimal(policy.get("trailingStopPct", 25)) / Decimal("100")
+        max_hours = _decimal(policy.get("maxHoldingHours", 168))
+        for row in rows:
+            quantity = _decimal(row["quantity"])
+            price = _decimal(row["last_price_usd"])
+            cost = int(row["cost_basis_usd_micros"])
+            initial_cost = int(row["initial_cost_usd_micros"] or cost)
+            recovered = int(row["recovered_principal_usd_micros"] or 0)
+            peak = max(price, _decimal(row["peak_price_usd"]))
+            mark_age = max(0.0, (now - _event_time(row["last_mark_at"])).total_seconds())
+            if quantity <= 0 or price <= 0 or cost <= 0 or mark_age > max(1, int(max_mark_age_seconds)):
+                continue
+            average_cost = Decimal(cost) / MICROS / quantity
+            age_hours = Decimal(str(max(0.0, (now - _event_time(row["first_bought_at"])).total_seconds()))) / Decimal("3600")
+            reason = ""
+            sell_quantity = Decimal("0")
+            stage = str(row["exit_stage"] or "armed")
+            if price <= average_cost * (Decimal("1") - stop_loss):
+                reason, sell_quantity = "stop_loss", quantity
+            elif stage != "principal_recovered" and price >= average_cost * recovery_multiple:
+                remaining_principal = max(0, initial_cost - recovered)
+                sell_quantity = min(quantity, Decimal(remaining_principal) / MICROS / price)
+                reason = "principal_recovery"
+            elif stage == "principal_recovered" and peak > 0 and price <= peak * (Decimal("1") - trailing_stop):
+                reason, sell_quantity = "trailing_stop", quantity
+            elif age_hours >= max_hours:
+                reason, sell_quantity = "max_holding_time", quantity
+            if reason and sell_quantity > 0:
+                results.append(self._paper_exit(row, sell_quantity, price, reason, now))
+        if results:
+            self._refresh_daily_snapshot(self._day(now), now)
+        return results
+
+    def _paper_exit(self, row: sqlite3.Row, sell_quantity: Decimal, price: Decimal,
+                    reason: str, executed_at: datetime) -> dict[str, Any]:
+        quantity = _decimal(row["quantity"])
+        sell_quantity = min(quantity, max(Decimal("0"), sell_quantity))
+        cost = int(row["cost_basis_usd_micros"])
+        cost_sold = int((Decimal(cost) * sell_quantity / quantity).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        gross = _micros(sell_quantity * price)
+        pnl = gross - cost_sold
+        remaining_quantity = quantity - sell_quantity
+        remaining_cost = max(0, cost - cost_sold)
+        realized_total = int(row["realized_pnl_micros"]) + pnl
+        recovered = int(row["recovered_principal_usd_micros"] or 0)
+        exit_stage = str(row["exit_stage"] or "armed")
+        if reason == "principal_recovery":
+            recovered += gross
+            exit_stage = "principal_recovered"
+        status = "closed" if remaining_quantity <= Decimal("0.000000000000000001") else "open"
+        if status == "closed":
+            remaining_quantity, remaining_cost = Decimal("0"), 0
+            exit_stage = reason
+        # last_trade_at is the position generation. A retry of the same rule is
+        # idempotent, while a later buy creates a new generation that must be
+        # evaluated from its freshly read quantity and cost.
+        generation = str(row["last_trade_at"])
+        event_id = f"paper-exit:{row['account_id']}:{row['kol_id']}:{row['chain_id']}:{row['token_address']}:{reason}:{generation}"
+        inserted = self.db.execute(
+            """INSERT OR IGNORE INTO portfolio_events(event_id,received_at,event_time,kol_id,handle,chain_id,token_address,symbol,kind,status,reason)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (event_id, executed_at.isoformat(), executed_at.isoformat(), row["kol_id"], row["handle"], row["chain_id"],
+             row["token_address"], row["symbol"], "sell", "filled", reason),
+        )
+        if inserted.rowcount == 0:
+            return {"status": "duplicate", "side": "sell", "reason": reason, "quantity": "0",
+                    "grossUsd": 0.0, "realizedPnlUsd": 0.0}
+        changed = self.db.execute(
+            """UPDATE portfolio_positions SET quantity=?,cost_basis_usd_micros=?,realized_pnl_micros=?,
+               recovered_principal_usd_micros=?,last_trade_at=?,last_price_usd=?,last_mark_at=?,status=?,exit_stage=?
+               WHERE account_id=? AND kol_id=? AND chain_id=? AND token_address=?
+                 AND quantity=? AND cost_basis_usd_micros=? AND last_trade_at=?""",
+            (str(remaining_quantity), remaining_cost, realized_total, recovered, executed_at.isoformat(), str(price),
+             executed_at.isoformat(), status, exit_stage, row["account_id"], row["kol_id"], row["chain_id"], row["token_address"],
+             row["quantity"], row["cost_basis_usd_micros"], row["last_trade_at"]),
+        )
+        if changed.rowcount != 1:
+            raise sqlite3.OperationalError("portfolio_position_changed_during_exit")
+        self.db.execute(
+            "INSERT INTO portfolio_fills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"{event_id}:sell", event_id, row["account_id"], row["kol_id"], row["handle"], row["chain_id"],
+             row["token_address"], row["symbol"], "sell", str(sell_quantity), str(price), gross, cost_sold, pnl, 0,
+             executed_at.isoformat(), "paper-exit"),
+        )
+        self._daily_delta(self._day(executed_at), sell=gross, pnl=pnl, trades=1)
+        return {"status": "filled", "side": "sell", "reason": reason, "quantity": str(sell_quantity),
+                "grossUsd": _usd(gross), "realizedPnlUsd": _usd(pnl)}
 
     def maybe_daily_backup(self, directory: str | Path) -> Path | None:
         day = datetime.now(self.timezone).strftime("%Y%m%d")
@@ -174,13 +350,18 @@ class PortfolioLedger:
         if not destination.exists():
             target = sqlite3.connect(destination)
             try:
-                self.db.backup(target)
+                with self._write_lock:
+                    self.db.backup(target)
             finally:
                 target.close()
         self._last_backup_day = day
         return destination
 
     def exposure_snapshot(self, event: Any) -> ExposureSnapshot:
+        with self._write_lock:
+            return self._exposure_snapshot_locked(event)
+
+    def _exposure_snapshot_locked(self, event: Any) -> ExposureSnapshot:
         """Build authoritative pre-trade exposure from the durable ledger.
 
         Native gas reserve stays zero until an RPC-backed balance provider is
@@ -272,6 +453,10 @@ class PortfolioLedger:
         )
 
     def apply_event(self, event: Any, paper_decision: dict[str, Any] | None) -> dict[str, Any] | None:
+        with self._transaction():
+            return self._apply_event_locked(event, paper_decision)
+
+    def _apply_event_locked(self, event: Any, paper_decision: dict[str, Any] | None) -> dict[str, Any] | None:
         if event.kind not in {"buy", "sell", "clear"} or not event.ca or not event.network_id:
             return None
         now = datetime.now(timezone.utc)
@@ -305,22 +490,31 @@ class PortfolioLedger:
                 gross = _micros(paper_decision.get("paperBuyUsd"))
                 quantity = (Decimal(gross) / MICROS) / price
                 row = self.db.execute(
-                    "SELECT quantity,cost_basis_usd_micros,realized_pnl_micros,first_bought_at FROM portfolio_positions WHERE account_id=? AND kol_id=? AND chain_id=? AND token_address=?",
+                    "SELECT quantity,cost_basis_usd_micros,realized_pnl_micros,first_bought_at,initial_cost_usd_micros,recovered_principal_usd_micros,peak_price_usd,exit_stage FROM portfolio_positions WHERE account_id=? AND kol_id=? AND chain_id=? AND token_address=?",
                     key,
                 ).fetchone()
                 old_quantity = _decimal(row["quantity"]) if row else Decimal("0")
                 old_cost = int(row["cost_basis_usd_micros"]) if row else 0
                 realized = int(row["realized_pnl_micros"]) if row else 0
+                initial_cost = int(row["initial_cost_usd_micros"]) if row else 0
+                recovered = int(row["recovered_principal_usd_micros"]) if row else 0
+                peak = max(price, _decimal(row["peak_price_usd"])) if row else price
+                new_initial_cost = initial_cost + gross
+                exit_stage = str(row["exit_stage"] or "armed") if row else "armed"
+                if recovered < new_initial_cost:
+                    exit_stage, peak = "armed", price
                 first_bought = row["first_bought_at"] if row and old_quantity > 0 else executed_at.isoformat()
                 self.db.execute(
-                    """INSERT INTO portfolio_positions(account_id,kol_id,handle,chain_id,token_address,symbol,quantity,cost_basis_usd_micros,realized_pnl_micros,first_bought_at,last_trade_at,last_price_usd,last_mark_at,status)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """INSERT INTO portfolio_positions(account_id,kol_id,handle,chain_id,token_address,symbol,quantity,cost_basis_usd_micros,realized_pnl_micros,first_bought_at,last_trade_at,last_price_usd,last_mark_at,status,initial_cost_usd_micros,recovered_principal_usd_micros,peak_price_usd,exit_stage)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(account_id,kol_id,chain_id,token_address) DO UPDATE SET
                          handle=excluded.handle,symbol=excluded.symbol,quantity=excluded.quantity,
                          cost_basis_usd_micros=excluded.cost_basis_usd_micros,first_bought_at=excluded.first_bought_at,
                          last_trade_at=excluded.last_trade_at,last_price_usd=excluded.last_price_usd,
-                         last_mark_at=excluded.last_mark_at,status='open'""",
-                    (*key[:2], event.handle, *key[2:], event.symbol, str(old_quantity + quantity), old_cost + gross, realized, first_bought, executed_at.isoformat(), str(price), executed_at.isoformat(), "open"),
+                         last_mark_at=excluded.last_mark_at,status='open',initial_cost_usd_micros=excluded.initial_cost_usd_micros,
+                         recovered_principal_usd_micros=excluded.recovered_principal_usd_micros,
+                         peak_price_usd=excluded.peak_price_usd,exit_stage=excluded.exit_stage""",
+                    (*key[:2], event.handle, *key[2:], event.symbol, str(old_quantity + quantity), old_cost + gross, realized, first_bought, executed_at.isoformat(), str(price), executed_at.isoformat(), "open", new_initial_cost, recovered, str(peak), exit_stage),
                 )
                 self.db.execute(
                     "INSERT INTO portfolio_fills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -361,7 +555,6 @@ class PortfolioLedger:
             (result["status"], str(result.get("reason") or result.get("side") or "recorded"), event.id),
         )
         self._refresh_daily_snapshot(self._day(executed_at), now)
-        self.db.commit()
         return result
 
 
@@ -389,13 +582,19 @@ def portfolio_snapshot(
             (account_id, max(1, min(int(limit), 1000))),
         ).fetchall()
         fills = db.execute(
-            "SELECT * FROM portfolio_fills WHERE account_id=? ORDER BY executed_at DESC,rowid DESC LIMIT ?",
+            "SELECT * FROM portfolio_fills WHERE account_id=? ORDER BY executed_at DESC,fill_id DESC LIMIT ?",
             (account_id, max(1, min(int(limit), 1000))),
         ).fetchall()
         daily = db.execute(
             "SELECT * FROM portfolio_daily WHERE account_id=? ORDER BY local_day DESC LIMIT 90",
             (account_id,),
         ).fetchall()
+        event_ids = [str(row["event_id"]) for row in fills]
+        placeholders = ",".join("?" for _ in event_ids)
+        reason_by_event = {row["event_id"]: row["reason"] for row in db.execute(
+            f"SELECT event_id,reason FROM portfolio_events WHERE event_id IN ({placeholders})",
+            event_ids,
+        ).fetchall()} if event_ids else {}
     except sqlite3.OperationalError:
         db.close()
         return empty
@@ -429,6 +628,9 @@ def portfolio_snapshot(
             "realizedPnlUsd": _usd(realized), "firstBoughtAt": row["first_bought_at"],
             "lastTradeAt": row["last_trade_at"], "lastPriceUsd": float(_decimal(row["last_price_usd"])),
             "lastMarkAt": row["last_mark_at"], "status": row["status"],
+            "initialCostUsd": _usd(row["initial_cost_usd_micros"]),
+            "recoveredPrincipalUsd": _usd(row["recovered_principal_usd_micros"]),
+            "peakPriceUsd": float(_decimal(row["peak_price_usd"])), "exitStage": row["exit_stage"],
             "markAgeSeconds": round(mark_age, 3),
             "markStale": row["status"] == "open" and mark_age > max(1, int(mark_stale_seconds)),
         })
@@ -438,7 +640,7 @@ def portfolio_snapshot(
         "side": row["side"], "quantity": row["quantity"], "priceUsd": float(_decimal(row["price_usd"])),
         "grossUsd": _usd(row["gross_usd_micros"]), "costUsd": _usd(row["cost_usd_micros"]),
         "realizedPnlUsd": _usd(row["realized_pnl_micros"]), "feeUsd": _usd(row["fee_usd_micros"]),
-        "executedAt": row["executed_at"], "mode": row["mode"],
+        "executedAt": row["executed_at"], "mode": row["mode"], "reason": reason_by_event.get(row["event_id"], ""),
     } for row in fills]
     output_daily = [{
         "day": row["local_day"], "buyUsd": _usd(row["buy_usd_micros"]), "sellUsd": _usd(row["sell_usd_micros"]),

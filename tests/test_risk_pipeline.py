@@ -37,6 +37,8 @@ class RiskPipelineTests(unittest.TestCase):
             self.assertEqual(record["blockers"], ["wallet_not_registered"])
             self.assertIsNone(record["wallet"])
             self.assertTrue(record["readOnly"])
+            self.assertEqual(record["phase"], "post_trade")
+            self.assertTrue(record["advisoryOnly"])
 
     def test_registered_wallet_produces_unified_signal_and_needs_data(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -61,6 +63,25 @@ class RiskPipelineTests(unittest.TestCase):
             self.assertEqual(record["signal"]["kolId"], "fomo-user-2")
             self.assertIn("asset_snapshot_required", record["blockers"])
             self.assertTrue(record["readOnly"])
+            self.assertEqual(record["phase"], "post_trade")
+
+    def test_verified_exact_handle_alias_resolves_to_real_kol_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = datetime.now(timezone.utc)
+            pipeline = self._pipeline(directory, [{
+                "kolId": "platform-uuid-1", "handle": "Alice", "chainIds": ["1"],
+                "address": "0x2222222222222222222222222222222222222222", "confidence": 0.95,
+                "evidence": [{"type": "platform-profile", "reference": "audit:123", "recordedAt": now.isoformat()}],
+                "verifiedAt": (now - timedelta(days=1)).isoformat(),
+                "expiresAt": (now + timedelta(days=30)).isoformat(), "status": "shadow-only",
+            }])
+            item = Event(id="alias-1", kind="buy", handle="alice", user_id="", created_at=now.isoformat(),
+                         network_id=1, ca="0x3333333333333333333333333333333333333333",
+                         amount_usd=500, source_type="swap_buy")
+            record = pipeline.evaluate_event(item)
+            self.assertEqual(record["kolId"], "platform-uuid-1")
+            self.assertEqual(record["identityResolution"], "verified_exact_handle_alias")
+            self.assertNotEqual(record["outcome"], "needs_identity")
 
     def test_dashboard_risk_payload_aggregates_outcomes_and_blockers(self):
         with tempfile.TemporaryDirectory() as directory:

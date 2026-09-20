@@ -1,16 +1,26 @@
 poll_seconds: 30
 timezone: Asia/Shanghai
 state_db: data/state.sqlite3
+state_sent_ttl_days: 14
+inbox_retention_days: 30
 
 dashboard:
   enabled: true
   host: 127.0.0.1
   port: 8765
+  maximum_websocket_clients: 32
+  # 远程绑定时必须同时配置这两个环境变量并设置 allowed_origins。
+  admin_token_env: FOMO_DASHBOARD_ADMIN_TOKEN
+  csrf_token_env: FOMO_DASHBOARD_CSRF_TOKEN
 
 wallet_management:
   watchlist_path: watch-wallets.json
   audit_log_path: data/wallet-management-audit.ndjson
   maximum_import_rows: 500
+
+rpc_management:
+  audit_log_path: data/rpc-management-audit.ndjson
+  network_settings_path: data/network-settings.json
 
 targets:
   - handle: DumbCrayonEater
@@ -29,6 +39,9 @@ copy_trading:
   mode: paper
   network_ids: [1, 56, 4663, 8453, 1399811149]
   event_types: [swap_buy, single_user_buy]
+  active_buy_event_types: [swap_buy, single_user_buy]
+  defer_asset_checks: true
+  require_trade_id_in_live: true
   fixed_usd: 10
   min_target_buy_usd: 100
   max_signal_age_seconds: 5
@@ -40,6 +53,7 @@ copy_trading:
   daily_limit_usd: 100
   max_open_positions: 5
   log_path: data/paper-orders.ndjson
+  audit_retention_days: 30
 
 # 只读风控流水线：钱包未登记时只记录 needs_identity，不猜测归属。
 read_only_risk:
@@ -47,6 +61,7 @@ read_only_risk:
   policy_path: risk-policy.example.json
   registry_path: wallet-registry.json
   log_path: data/risk-decisions.ndjson
+  audit_retention_days: 30
 
 smart_money:
   enabled: true
@@ -106,6 +121,11 @@ execution_journal:
   enabled: true
   database: data/execution.sqlite3
 
+post_trade:
+  enabled: true
+  max_retries: 20
+  retry_base_seconds: 1
+
 routing:
   enabled: true
   mode: shadow
@@ -114,7 +134,12 @@ routing:
   maximum_quote_age_ms: 500
   maximum_price_impact_bps: 100
   maximum_output_sacrifice_bps: 30
-  minimum_independent_routes: 2
+  # 极速买入只等待一条可执行主路由；第二路报价在买后分析阶段完成。
+  minimum_independent_routes: 1
+  require_simulation: false
+  require_allowlisted_route: true
+  require_scope_validation: true
+  require_minimum_output: true
   providers:
     "1": [{name: 0x_v2, kind: aggregator, api_key_env: ZEROX_API_KEY, adapter_env: ROUTE_0X_ENABLED}, {name: chain_direct_pool, kind: direct, requires_rpc: true, adapter_env: ROUTE_DIRECT_POOL_ENABLED}]
     "56": [{name: 0x_v2, kind: aggregator, api_key_env: ZEROX_API_KEY, adapter_env: ROUTE_0X_ENABLED}, {name: chain_direct_pool, kind: direct, requires_rpc: true, adapter_env: ROUTE_DIRECT_POOL_ENABLED}]
@@ -129,8 +154,8 @@ links:
   debot: "https://debot.ai/token/{chain}/{ca}"
 
 notifications:
+  max_retries: 8
+  retry_base_seconds: 2
   telegram: false
   feishu: false
-  wechat_work: false
-  qq_onebot: false
   generic_webhook: false

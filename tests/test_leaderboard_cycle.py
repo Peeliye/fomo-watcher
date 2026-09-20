@@ -12,6 +12,20 @@ def member(user_id: str, handle: str, pnl: float = 1) -> dict:
 
 
 class LeaderboardCycleTests(unittest.TestCase):
+    def test_readonly_get_queries_do_not_modify_database_or_wal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); path = root / "rank.sqlite3"
+            archive = LeaderboardArchive(path, root / "leaderboard")
+            archive.capture([member("u1", "alpha")])
+            archive.close()
+            watched = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
+            before = {str(item): (item.stat().st_mtime_ns, item.stat().st_size) for item in watched if item.exists()}
+            readonly = LeaderboardArchive(path, root / "leaderboard", readonly=True)
+            readonly.overview(); readonly.current_ranking(); readonly.history(datetime.now().strftime("%Y-%m-%d"), 0)
+            readonly.participants(); readonly.participant_detail(datetime.now().strftime("%Y-%m-%d"), "u1")
+            readonly.close()
+            after = {str(item): (item.stat().st_mtime_ns, item.stat().st_size) for item in watched if item.exists()}
+            self.assertEqual(before, after)
     def test_hourly_compare_and_daily_merge_keep_removed_members(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

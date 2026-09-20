@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import ipaddress
 import json
 import logging
+import os
+import sqlite3
+import struct
 import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 
 from ..execution.journal import execution_snapshot, reconciliation_snapshot
+from ..execution.networks import apply_network_settings, network_settings_path
 from ..execution.readiness import execution_readiness, wallet_balance_snapshot
 from ..execution.rpc_pool import rpc_health_snapshot
 from ..execution.routing import route_readiness
@@ -21,7 +29,10 @@ from ..intelligence.profile import intelligence_snapshot
 from ..intelligence.performance import performance_snapshot
 from ..intelligence.leaderboard import LeaderboardArchive
 from ..portfolio.ledger import portfolio_snapshot
+from ..portfolio.exit_policy import ExitPolicyError, ExitPolicyStore
 from .wallet_management import WalletManagementError, WalletManagementStore
+from .rpc_management import RpcManagementError, RpcManagementStore
+from .audit_index import AuditLogIndex
 
 
 CHAIN_NAMES = {
@@ -33,6 +44,86 @@ CHAIN_NAMES = {
     8453: "Base",
     1399811149: "Solana",
 }
+
+
+def _websocket_text_frame(payload: dict[str, Any]) -> bytes:
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    length = len(data)
+    if length < 126:
+        header = bytes((0x81, length))
+    elif length <= 65_535:
+        header = bytes((0x81, 126)) + struct.pack("!H", length)
+    else:
+        header = bytes((0x81, 127)) + struct.pack("!Q", length)
+    return header + data
+
+
+def _paths_signature(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
+    signature: list[tuple[str, int, int]] = []
+    for path in paths:
+        candidates = [path]
+        if path.suffix in {".sqlite", ".sqlite3", ".db"}:
+            candidates.extend((Path(str(path) + "-wal"), Path(str(path) + "-shm")))
+        for candidate in candidates:
+            try:
+                stat = candidate.stat()
+                signature.append((str(candidate), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                signature.append((str(candidate), 0, 0))
+    return tuple(signature)
+
+
+class DashboardChangeBus:
+    """One file watcher shared by every dashboard WebSocket client."""
+
+    def __init__(self, sources: dict[str, list[Path]], interval: float = 0.75, maximum_clients: int = 32):
+        self.sources = sources
+        self.interval = max(0.2, interval)
+        self.maximum_clients = max(1, maximum_clients)
+        self.condition = threading.Condition()
+        self.revision = 0
+        self.changed: list[str] = []
+        self.clients = 0
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="dashboard-file-watcher", daemon=True)
+        self.thread.start()
+
+    def register(self) -> bool:
+        with self.condition:
+            if self.clients >= self.maximum_clients:
+                return False
+            self.clients += 1
+            return True
+
+    def unregister(self) -> None:
+        with self.condition:
+            self.clients = max(0, self.clients - 1)
+
+    def wait(self, after: int, timeout: float = 15.0) -> tuple[int, list[str]]:
+        with self.condition:
+            self.condition.wait_for(lambda: self.revision > after or self.stop_event.is_set(), timeout)
+            return self.revision, list(self.changed) if self.revision > after else []
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        self.thread.join(timeout=5)
+
+    def _run(self) -> None:
+        signatures = {name: _paths_signature(paths) for name, paths in self.sources.items()}
+        while not self.stop_event.wait(self.interval):
+            changed = []
+            for name, paths in self.sources.items():
+                current = _paths_signature(paths)
+                if current != signatures[name]:
+                    signatures[name] = current
+                    changed.append(name)
+            if changed:
+                with self.condition:
+                    self.changed = changed
+                    self.revision += 1
+                    self.condition.notify_all()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -113,82 +204,60 @@ def build_status_payload(data_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_dashboard_payload(log_path: Path, limit: int = 500) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    if log_path.exists():
-        with log_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, dict):
-                        rows.append(value)
-                except json.JSONDecodeError:
-                    continue
-
-    statuses = Counter(str(row.get("status") or "unknown") for row in rows)
-    accepted = [row for row in rows if row.get("status") == "accepted"]
-    accepted_chains = Counter(str(row.get("networkId") or "unknown") for row in accepted)
-    recent = list(reversed(rows[-max(1, min(limit, 2000)) :]))
-
+    index=AuditLogIndex(log_path);db=index.sync()
+    try:
+        metrics=index.metrics(db)
+        total=int(metrics.get("total",(0,None))[0]);accepted=int(metrics.get("accepted",(0,None))[0]);accepted_usd=metrics.get("accepted_usd",(0,None))[0]
+        statuses={key.removeprefix("status:"):int(value[0]) for key,value in metrics.items() if key.startswith("status:")}
+        accepted_chains={key.removeprefix("accepted_chain:"):int(value[0]) for key,value in metrics.items() if key.startswith("accepted_chain:")}
+        recent=index.recent(db,limit)
+        latest_at=metrics.get("latest_at",(0,None))[1]
+    finally:index.close(db)
     return {
-        "total": len(rows),
-        "accepted": len(accepted),
-        "acceptedUsd": round(sum(float(row.get("paperBuyUsd") or 0) for row in accepted), 6),
-        "statuses": dict(statuses),
-        "acceptedChains": dict(accepted_chains),
+        "total": int(total),
+        "accepted": int(accepted or 0),
+        "acceptedUsd": round(float(accepted_usd), 6),
+        "statuses": statuses,
+        "acceptedChains": accepted_chains,
         "chainNames": {str(key): value for key, value in CHAIN_NAMES.items()},
-        "latestAt": rows[-1].get("recordedAt") if rows else None,
+        "latestAt": latest_at,
         "orders": recent,
     }
 
 
 def build_shadow_payload(log_path: Path, limit: int = 200) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    if log_path.exists():
-        with log_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, dict):
-                        rows.append(value)
-                except json.JSONDecodeError:
-                    continue
-    eligible = [row for row in rows if row.get("status") == "eligible"]
-    latencies = sorted(float(row.get("decisionLatencyMs") or 0) for row in rows)
-    p95_index = max(0, min(len(latencies) - 1, int(len(latencies) * 0.95))) if latencies else 0
+    index=AuditLogIndex(log_path);db=index.sync()
+    try:
+        metrics=index.metrics(db);total=int(metrics.get("total",(0,None))[0]);eligible=int(metrics.get("eligible",(0,None))[0]);latency_count=metrics.get("latency_count",(0,None))[0]
+        average=metrics.get("latency_sum",(0,None))[0]/latency_count if latency_count else None
+        statuses={key.removeprefix("status:"):int(value[0]) for key,value in metrics.items() if key.startswith("status:")}
+        p95_row=db.execute("SELECT latency FROM audit_rows ORDER BY latency LIMIT 1 OFFSET ?",
+                           (max(0,int(int(total)*0.95)-1),)).fetchone() if total else None
+        recent=index.recent(db,limit)
+    finally:index.close(db)
     return {
-        "total": len(rows),
-        "eligible": len(eligible),
-        "averageDecisionLatencyMs": round(sum(latencies) / len(latencies), 3) if latencies else None,
-        "p95DecisionLatencyMs": round(latencies[p95_index], 3) if latencies else None,
-        "statuses": dict(Counter(str(row.get("status") or "unknown") for row in rows)),
-        "executions": list(reversed(rows[-max(1, min(limit, 1000)) :])),
+        "total": int(total),
+        "eligible": int(eligible or 0),
+        "averageDecisionLatencyMs": round(float(average), 3) if average is not None else None,
+        "p95DecisionLatencyMs": round(float(p95_row[0]), 3) if p95_row else None,
+        "statuses": statuses,
+        "executions": recent,
     }
 
 
 def build_risk_payload(log_path: Path, limit: int = 500) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    if log_path.exists():
-        with log_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, dict):
-                        rows.append(value)
-                except json.JSONDecodeError:
-                    continue
-    outcomes = Counter(str(row.get("outcome") or "unknown") for row in rows)
-    blockers = Counter(
-        str(reason)
-        for row in rows
-        for reason in (row.get("blockers") or [])
-        if reason
-    )
-    recent = list(reversed(rows[-max(1, min(limit, 2000)) :]))
+    index=AuditLogIndex(log_path);db=index.sync()
+    try:
+        metrics=index.metrics(db);total=int(metrics.get("total",(0,None))[0])
+        outcomes={key.removeprefix("outcome:"):int(value[0]) for key,value in metrics.items() if key.startswith("outcome:")}
+        blockers={key.removeprefix("blocker:"):int(value[0]) for key,value in metrics.items() if key.startswith("blocker:")}
+        recent=index.recent(db,limit);latest=metrics.get("latest_at",(0,None))[1]
+    finally:index.close(db)
     return {
-        "total": len(rows),
-        "outcomes": dict(outcomes),
-        "blockers": dict(blockers),
-        "latestAt": rows[-1].get("recordedAt") if rows else None,
+        "total": int(total),
+        "outcomes": outcomes,
+        "blockers": blockers,
+        "latestAt": latest,
         "decisions": recent,
     }
 
@@ -223,40 +292,22 @@ def build_identity_payload(registry_path: Path, risk_log_path: Path) -> dict[str
             "evidenceCount": evidence_count,
         })
 
-    backlog: dict[tuple[str, str], dict[str, Any]] = {}
-    if risk_log_path.exists():
-        with risk_log_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(row, dict) or row.get("outcome") != "needs_identity":
-                    continue
-                kol_id = str(row.get("kolId") or "")
-                chain_id = str(row.get("networkId") or "")
-                key = (kol_id, chain_id)
-                if candidate_counts[key] == 1:
-                    continue
-                item = backlog.setdefault(key, {
-                    "kolId": kol_id,
-                    "networkId": int(chain_id) if chain_id.isdigit() else chain_id,
-                    "handle": str(row.get("handle") or "unknown"),
-                    "events": 0,
-                    "latestAt": row.get("recordedAt"),
-                    "symbols": set(),
-                    "reason": "ambiguous_wallet_mapping" if candidate_counts[key] > 1 else (row.get("blockers") or ["wallet_not_registered"])[0],
-                })
-                item["events"] += 1
-                if str(row.get("recordedAt") or "") > str(item.get("latestAt") or ""):
-                    item["latestAt"] = row.get("recordedAt")
-                    item["handle"] = str(row.get("handle") or item["handle"])
-                symbol = str(row.get("symbol") or "")
-                if symbol and symbol != "UNKNOWN":
-                    item["symbols"].add(symbol)
-    backlog_rows = sorted(backlog.values(), key=lambda item: str(item.get("latestAt") or ""), reverse=True)
-    for item in backlog_rows:
-        item["symbols"] = sorted(item["symbols"])[:6]
+    backlog_rows=[]
+    index=AuditLogIndex(risk_log_path);db=index.sync()
+    try:
+        grouped=db.execute("""SELECT COALESCE(json_extract(payload_json,'$.kolId'),''),network_id,
+          COUNT(*),MAX(recorded_at),MAX(json_extract(payload_json,'$.handle')),
+          GROUP_CONCAT(DISTINCT json_extract(payload_json,'$.symbol'))
+          FROM audit_rows WHERE outcome='needs_identity' GROUP BY 1,2""").fetchall()
+    finally:index.close(db)
+    for kol_id,chain_id,events,latest,handle,symbols in grouped:
+        key=(str(kol_id),str(chain_id))
+        if candidate_counts[key]==1:continue
+        backlog_rows.append({"kolId":str(kol_id),"networkId":int(chain_id) if str(chain_id).isdigit() else chain_id,
+          "handle":str(handle or "unknown"),"events":int(events),"latestAt":latest,
+          "symbols":sorted({x for x in str(symbols or "").split(",") if x and x!="UNKNOWN"})[:6],
+          "reason":"ambiguous_wallet_mapping" if candidate_counts[key]>1 else "wallet_not_registered"})
+    backlog_rows.sort(key=lambda item:str(item.get("latestAt") or ""),reverse=True)
     return {
         "registryVersion": int(registry.get("version", 1)),
         "registered": sum(1 for item in public_wallets if item["trusted"]),
@@ -306,17 +357,28 @@ def build_intelligence_payload(
     return payload
 
 
-def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServer | None:
+def start_dashboard(project_dir: Path, cfg: dict[str, Any],
+                    on_network_change: Callable[[], None] | None = None) -> ThreadingHTTPServer | None:
     # The dashboard is also used as a standalone diagnostic entry point. Load
     # project-local configuration here so it reports the same RPC readiness as
     # the main application instead of silently treating every endpoint as empty.
     load_dotenv(project_dir / ".env", override=False)
+    apply_network_settings(project_dir, cfg)
     settings = cfg.get("dashboard", {})
     if not settings.get("enabled", True):
         return None
 
     host = str(settings.get("host", "127.0.0.1"))
     port = int(settings.get("port", 8765))
+    try:
+        loopback_bind = host.casefold() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback_bind = False
+    admin_token = os.getenv(str(settings.get("admin_token_env", "FOMO_DASHBOARD_ADMIN_TOKEN")), "")
+    csrf_token = os.getenv(str(settings.get("csrf_token_env", "FOMO_DASHBOARD_CSRF_TOKEN")), "")
+    if not loopback_bind and (not admin_token or not csrf_token):
+        logging.error("Dashboard 拒绝远程绑定：必须配置管理认证和 CSRF 环境变量")
+        return None
     html_path = Path(__file__).with_name("static") / "index.html"
     logo_path = html_path.parent / "assets" / "fomo-exec-logo-v1.png"
     copy_settings = cfg.get("copy_trading", {})
@@ -332,6 +394,9 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
     portfolio_db = configured_portfolio_db if configured_portfolio_db.is_absolute() else project_dir / configured_portfolio_db
     portfolio_account = str(portfolio_settings.get("account_id", "paper-main"))
     portfolio_mark_stale = int(portfolio_settings.get("mark_stale_seconds", 300))
+    configured_exit_policy = Path(str(portfolio_settings.get("exit_policy_path", "data/exit-policy.json")))
+    exit_policy_path = configured_exit_policy if configured_exit_policy.is_absolute() else project_dir / configured_exit_policy
+    exit_policy_store = ExitPolicyStore(exit_policy_path, portfolio_settings.get("exit_strategy"))
     execution_settings = cfg.get("execution_journal", {})
     configured_execution_db = Path(str(execution_settings.get("database", "data/execution.sqlite3")))
     execution_db = configured_execution_db if configured_execution_db.is_absolute() else project_dir / configured_execution_db
@@ -356,14 +421,49 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
         int(wallet_management_settings.get("maximum_import_rows", 500)),
     )
     data_dir = project_dir / "data"
+    rpc_management_settings = cfg.get("rpc_management", {})
+    configured_rpc_audit = Path(str(rpc_management_settings.get("audit_log_path", "data/rpc-management-audit.ndjson")))
+    rpc_audit_path = configured_rpc_audit if configured_rpc_audit.is_absolute() else project_dir / configured_rpc_audit
+    rpc_store = RpcManagementStore(project_dir, cfg, rpc_audit_path, on_network_change)
     leaderboard_settings = cfg.get("leaderboard_monitor", {})
     configured_leaderboard_db = Path(str(leaderboard_settings.get("database", "data/leaderboard.sqlite3")))
     leaderboard_db = configured_leaderboard_db if configured_leaderboard_db.is_absolute() else project_dir / configured_leaderboard_db
     configured_leaderboard_archive = Path(str(leaderboard_settings.get("archive_dir", "data/leaderboard")))
     leaderboard_archive = configured_leaderboard_archive if configured_leaderboard_archive.is_absolute() else project_dir / configured_leaderboard_archive
+    rpc_health_setting = Path(str(cfg.get("rpc_pool", {}).get("database", "data/rpc-health.sqlite3")))
+    rpc_health_db = rpc_health_setting if rpc_health_setting.is_absolute() else project_dir / rpc_health_setting
+    wallet_profile_setting = Path(str(cfg.get("execution", {}).get("wallet_profile", "execution-wallet.json")))
+    wallet_profile_path = wallet_profile_setting if wallet_profile_setting.is_absolute() else project_dir / wallet_profile_setting
+    env_path = project_dir / ".env"
+    config_path = project_dir / "config.yaml"
+    network_state_path = network_settings_path(project_dir, cfg)
+    change_sources: dict[str, list[Path]] = {
+        "orders": [log_path],
+        "status": [data_dir / "realtime-status.json", data_dir / "privy-status.json"],
+        "shadow": [data_dir / "shadow-executions.ndjson"],
+        "risk": [risk_log_path],
+        "identity": [registry_path, risk_log_path],
+        "management": [registry_path, watchlist_path, wallet_audit_path],
+        "rpcManagement": [env_path, rpc_health_db, rpc_audit_path, network_state_path],
+        "intelligence": [intelligence_db],
+        "performance": [performance_db],
+        "portfolio": [portfolio_db, exit_policy_path],
+        "readiness": [env_path, wallet_profile_path, rpc_health_db, config_path],
+        "wallet": [env_path, wallet_profile_path, rpc_health_db],
+        "journal": [execution_db],
+        "route": [env_path, config_path, rpc_health_db],
+        "rpc": [env_path, rpc_health_db],
+        "rank50": [leaderboard_db],
+    }
+    change_bus = DashboardChangeBus(
+        change_sources,
+        float(settings.get("watch_interval_seconds", 0.75)),
+        int(settings.get("maximum_websocket_clients", 32)),
+    )
 
     def leaderboard_payload(action: str, query: dict[str, list[str]]) -> dict[str, Any] | list[dict[str, Any]]:
-        store = LeaderboardArchive(leaderboard_db, leaderboard_archive, str(cfg.get("timezone", "Asia/Shanghai")))
+        store = LeaderboardArchive(leaderboard_db, leaderboard_archive,
+                                   str(cfg.get("timezone", "Asia/Shanghai")), readonly=True)
         try:
             day = query.get("date", [None])[0]
             if action == "overview": return store.overview(day)
@@ -376,6 +476,8 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
             store.close()
 
     class DashboardHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def _send_json(self, payload: Any, status: int = 200) -> None:
             content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -389,7 +491,18 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
             origin = str(self.headers.get("Origin") or "").rstrip("/")
             if not origin:
                 return True
-            return origin in {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+            allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+            allowed.update(str(value).rstrip("/") for value in settings.get("allowed_origins", []))
+            return origin in allowed
+
+        def _admin_authorized(self) -> bool:
+            supplied_csrf = str(self.headers.get("X-Fomo-CSRF") or "")
+            if loopback_bind:
+                return self._same_origin() and hmac.compare_digest(supplied_csrf, "1")
+            authorization = str(self.headers.get("Authorization") or "")
+            supplied_token = authorization[7:] if authorization.startswith("Bearer ") else ""
+            return (self._same_origin() and hmac.compare_digest(supplied_token, admin_token)
+                    and hmac.compare_digest(supplied_csrf, csrf_token))
 
         def _read_json_body(self) -> dict[str, Any]:
             try:
@@ -410,6 +523,38 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/ws/dashboard":
+                if not self._same_origin():
+                    self._send_json({"error": "forbidden_origin"}, 403)
+                    return
+                key = str(self.headers.get("Sec-WebSocket-Key") or "")
+                if str(self.headers.get("Upgrade") or "").casefold() != "websocket" or not key:
+                    self._send_json({"error": "websocket_upgrade_required"}, 426)
+                    return
+                if not change_bus.register():
+                    self._send_json({"error": "websocket_capacity_reached"}, 503)
+                    return
+                accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+                self.send_response(101, "Switching Protocols")
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", accept)
+                self.end_headers()
+                try:
+                    self.connection.sendall(_websocket_text_frame({"type": "ready", "keys": list(change_sources)}))
+                    revision = change_bus.revision
+                    while True:
+                        next_revision, changed = change_bus.wait(revision, 15)
+                        if changed:
+                            self.connection.sendall(_websocket_text_frame({"type": "invalidate", "keys": changed}))
+                            revision = next_revision
+                        else:
+                            self.connection.sendall(_websocket_text_frame({"type": "heartbeat"}))
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                finally:
+                    change_bus.unregister()
+                return
             if parsed.path in {"/assets/fomo-exec-logo-v1.png", "/favicon.ico"}:
                 try:
                     content = logo_path.read_bytes()
@@ -479,6 +624,12 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
                 except WalletManagementError as exc:
                     self._send_json({"error": str(exc)}, 500)
                 return
+            if parsed.path == "/api/rpc-management":
+                try:
+                    self._send_json(rpc_store.snapshot())
+                except (RpcManagementError, OSError, sqlite3.Error) as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
             if parsed.path == "/api/wallet-intelligence":
                 query = parse_qs(parsed.query)
                 try:
@@ -516,7 +667,12 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
                     limit = int(query.get("limit", ["200"])[0])
                 except ValueError:
                     limit = 200
-                self._send_json(portfolio_snapshot(portfolio_db, portfolio_account, limit, portfolio_mark_stale))
+                payload = portfolio_snapshot(portfolio_db, portfolio_account, limit, portfolio_mark_stale)
+                payload["exitPolicy"] = exit_policy_store.read()
+                self._send_json(payload)
+                return
+            if parsed.path == "/api/portfolio-exit-policy":
+                self._send_json(exit_policy_store.read())
                 return
             if parsed.path == "/api/execution-readiness":
                 self._send_json(execution_readiness(project_dir, cfg))
@@ -553,11 +709,11 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path != "/api/wallet-management":
+            if parsed.path not in {"/api/wallet-management", "/api/rpc-management", "/api/portfolio-exit-policy"}:
                 self._send_json({"error": "not_found"}, 404)
                 return
-            if not self._same_origin():
-                self._send_json({"error": "forbidden_origin"}, 403)
+            if not self._admin_authorized():
+                self._send_json({"error": "admin_authentication_required"}, 403)
                 return
             content_type = str(self.headers.get("Content-Type") or "").lower()
             if "application/json" not in content_type:
@@ -565,24 +721,42 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any]) -> ThreadingHTTPServ
                 return
             try:
                 payload = self._read_json_body()
-                self._send_json(wallet_store.mutate(payload))
+                if parsed.path == "/api/wallet-management":
+                    result = wallet_store.mutate(payload)
+                elif parsed.path == "/api/rpc-management":
+                    result = rpc_store.mutate(payload)
+                else:
+                    result = exit_policy_store.write(payload)
+                self._send_json(result)
             except OverflowError as exc:
                 self._send_json({"error": str(exc)}, 413)
             except WalletManagementError as exc:
                 self._send_json({"error": str(exc)}, 400)
+            except RpcManagementError as exc:
+                self._send_json({"error": str(exc)}, 400)
+            except ExitPolicyError as exc:
+                self._send_json({"error": str(exc)}, 400)
             except OSError:
-                logging.exception("钱包管理写入失败")
-                self._send_json({"error": "钱包数据写入失败"}, 500)
+                logging.exception("本地管理配置写入失败")
+                self._send_json({"error": "本地配置写入失败"}, 500)
 
         def log_message(self, format: str, *args: Any) -> None:
             return
 
     try:
         server = ThreadingHTTPServer((host, port), DashboardHandler)
+        server.daemon_threads = True
     except OSError:
+        change_bus.stop()
         logging.exception("可视化面板启动失败：http://%s:%d", host, port)
         return None
     thread = threading.Thread(target=server.serve_forever, name="fomo-dashboard", daemon=True)
+    original_server_close = server.server_close
+    def close_with_watcher() -> None:
+        change_bus.stop()
+        original_server_close()
+    server.server_close = close_with_watcher  # type: ignore[method-assign]
+    server.change_bus = change_bus  # type: ignore[attr-defined]
     thread.start()
     logging.info("可视化面板已启动：http://%s:%d", host, port)
     return server

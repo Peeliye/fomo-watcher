@@ -41,6 +41,18 @@ class WalletManagementTests(unittest.TestCase):
         self.assertTrue(saved["wallets"][0]["entryId"].startswith("kol_"))
         self.assertEqual(len(self.audit.read_text(encoding="utf-8").splitlines()), 1)
 
+    def test_kol_wallet_requires_real_platform_id(self) -> None:
+        with self.assertRaisesRegex(WalletManagementError, "kolId"):
+            self.store.mutate({
+                "action": "upsert_kol",
+                "entry": {
+                    "handle": "Alpha", "address": EVM_ADDRESS, "chainIds": ["1"],
+                    "evidenceType": "public-profile", "evidenceReference": "https://example.test/alpha",
+                    "expiresAt": "2030-01-01T00:00:00Z",
+                },
+            })
+
+
     def test_mixed_chain_families_are_rejected(self) -> None:
         with self.assertRaisesRegex(WalletManagementError, "不能混合"):
             self.store.mutate({

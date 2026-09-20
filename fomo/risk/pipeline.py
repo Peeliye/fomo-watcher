@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..audit import append_ndjson
 from .engine import ReadOnlyRiskEngine, RiskContext, Side, UnifiedSignal
 
 
@@ -67,9 +68,7 @@ class RiskPipeline:
         return value if value.is_absolute() else self.project_dir / value
 
     def _append(self, record: dict[str, Any]) -> dict[str, Any]:
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        append_ndjson(self.log_path, record, int(self.settings.get("audit_retention_days", 30)))
         return record
 
     def _mtimes(self) -> tuple[int, int]:
@@ -100,6 +99,8 @@ class RiskPipeline:
             "signalId": f"fomo:{event.id}",
             "source": "fomo",
             "readOnly": True,
+            "phase": "post_trade",
+            "advisoryOnly": True,
             "handle": str(event.handle),
             "kolId": str(getattr(event, "user_id", "") or ""),
             "networkId": int(event.network_id or 0),
@@ -118,7 +119,18 @@ class RiskPipeline:
         record = self._base(event, now)
         kol_id = record["kolId"]
         chain_id = str(record["networkId"])
-        candidates = self.engine.registry.wallets_for_kol(chain_id, kol_id) if kol_id and chain_id != "0" else ()
+        candidates: tuple[Any, ...] = (
+            self.engine.registry.wallets_for_kol(chain_id, kol_id) if kol_id and chain_id != "0" else ()
+        )
+        alias_resolved = False
+        if not kol_id and chain_id != "0":
+            aliases = self.engine.registry.wallets_for_verified_handle(chain_id, str(event.handle))
+            alias_ids = {entry.kol_id for entry in aliases}
+            if len(alias_ids) == 1:
+                kol_id = next(iter(alias_ids))
+                record["kolId"] = kol_id
+                candidates = tuple(entry for entry in aliases if entry.kol_id == kol_id)
+                alias_resolved = True
         if not kol_id:
             reason = "missing_kol_id"
         elif chain_id == "0":
@@ -139,7 +151,7 @@ class RiskPipeline:
             })
             return self._append(record)
 
-        entry = candidates[0]
+        entry = next(iter(candidates))
         safe_payload = {
             "eventId": event.id,
             "kind": event.kind,
@@ -179,6 +191,7 @@ class RiskPipeline:
             "policyVersion": decision["policyVersion"],
             "registryVersion": decision["registryVersion"],
             "checks": decision["checks"],
+            "identityResolution": "verified_exact_handle_alias" if alias_resolved else "platform_kol_id",
             "blockers": blockers,
             "signal": _signal_dict(signal),
             "latencyMs": round((time.perf_counter() - started) * 1000, 3),

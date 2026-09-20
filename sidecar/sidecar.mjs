@@ -2,6 +2,7 @@ import { chromium } from "playwright-core";
 import dotenv from "dotenv";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { appendNdjson } from "./fast-shadow.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 dotenv.config({ path: resolve(root, ".env"), quiet: true });
@@ -165,7 +166,7 @@ page.on("websocket", ws => {
     try {
       const msg = JSON.parse(frame.payload);
       if (msg?.type !== "data" || msg?.topicType !== "trading_activity" || !msg?.payload) return;
-      appendFileSync(eventFile, JSON.stringify({ receivedAt: new Date().toISOString(), payload: msg.payload }) + "\n");
+      appendNdjson(eventFile, { receivedAt: new Date().toISOString(), payload: msg.payload });
       frames += 1;
       lastFrameAt = new Date().toISOString();
       status({ wsUrl: ws.url() });

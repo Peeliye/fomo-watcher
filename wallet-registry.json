@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "wallets": [
     {
       "entryId": "kol_7ffc755d9329cde4",
@@ -64,6 +64,26 @@
       "expiresAt": "2026-10-10T18:47:38.355264+00:00",
       "status": "shadow-only",
       "entryId": "kol_4478437f2b162619"
+    },
+    {
+      "entryId": "kol_d2737d19c0bb4e1fb5eb4f1658d1cb49",
+      "kolId": "6d8c0bf3-5d42-506c-a0ea-9e1e75ff38af",
+      "handle": "pointfarmcap",
+      "chainIds": [
+        "1399811149"
+      ],
+      "address": "FwF5ddHTvMKBiWHVNjPjwGaxU55c96HeQ7TuQ9BnThXV",
+      "confidence": 1.0,
+      "evidence": [
+        {
+          "type": "user-attestation",
+          "reference": "fomo页面和浏览器进行过持仓交叉验证",
+          "recordedAt": "2026-09-20T12:36:48.799811+00:00"
+        }
+      ],
+      "verifiedAt": "2026-09-20T12:36:48.799811+00:00",
+      "expiresAt": "2026-10-20T11:10:00+00:00",
+      "status": "active"
     }
   ]
 }

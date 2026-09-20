@@ -155,7 +155,6 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIn("duplicate_signal", {c.reason for c in second.checks})
 
     def test_quote_divergence_is_rejected(self):
-        context = complete_context()
         bad = RiskContext.from_dict(
             {
                 "asset": {

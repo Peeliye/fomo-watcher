@@ -120,10 +120,12 @@ def _iso_time(value: Any, field: str, *, required: bool = True) -> str:
 
 def _normalize_kol(raw: Mapping[str, Any], existing_id: str = "") -> dict[str, Any]:
     chain_ids = _chain_ids(raw.get("chainIds"))
-    kol_id = str(raw.get("kolId") or "").strip()
     handle = str(raw.get("handle") or "").strip().lstrip("@")
-    if not kol_id or not handle:
-        raise WalletManagementError("KOL ID 和 Fomo 用户名都不能为空")
+    if not handle:
+        raise WalletManagementError("Fomo 用户名不能为空")
+    kol_id = str(raw.get("kolId") or "").strip()
+    if not kol_id or kol_id.startswith("handle:"):
+        raise WalletManagementError("必须提供 Fomo 平台返回的真实 kolId；用户名不能单独授权交易")
     try:
         address = normalize_wallet(chain_ids[0], str(raw.get("address") or ""))
     except ValueError as exc:
@@ -188,8 +190,11 @@ def _normalize_watch(raw: Mapping[str, Any], existing: Mapping[str, Any] | None 
     tags_value = raw.get("tags") or []
     tags = tags_value if isinstance(tags_value, list) else str(tags_value).replace("|", ",").split(",")
     tags = list(dict.fromkeys(str(item).strip() for item in tags if str(item).strip()))[:20]
-    notifications = raw.get("notifications") if isinstance(raw.get("notifications"), Mapping) else {}
-    filters = raw.get("filters") if isinstance(raw.get("filters"), Mapping) else {}
+    raw_notifications = raw.get("notifications")
+    notifications: Mapping[str, Any] = raw_notifications if isinstance(raw_notifications, Mapping) else {}
+    raw_filters = raw.get("filters")
+    filters: Mapping[str, Any] = raw_filters if isinstance(raw_filters, Mapping) else {}
+    existing_record: Mapping[str, Any] = existing or {}
     minimum = _number(filters.get("minAmountUsd", raw.get("minAmountUsd", 0)), "最低金额")
     min_cap = _number(filters.get("minMarketCapUsd", raw.get("minMarketCapUsd", 0)), "最低市值")
     max_cap = _number(filters.get("maxMarketCapUsd", raw.get("maxMarketCapUsd", 0)), "最高市值")
@@ -197,7 +202,7 @@ def _normalize_watch(raw: Mapping[str, Any], existing: Mapping[str, Any] | None 
         raise WalletManagementError("最高市值不能低于最低市值")
     now = _now()
     return {
-        "id": str((existing or {}).get("id") or raw.get("id") or "watch_" + uuid.uuid4().hex),
+        "id": str(existing_record.get("id") or raw.get("id") or "watch_" + uuid.uuid4().hex),
         "name": name,
         "address": address,
         "chainIds": chain_ids,
@@ -212,7 +217,7 @@ def _normalize_watch(raw: Mapping[str, Any], existing: Mapping[str, Any] | None 
             "largeTrade": _boolean(notifications.get("largeTrade", raw.get("notifyLargeTrade")), True),
         },
         "filters": {"minAmountUsd": minimum, "minMarketCapUsd": min_cap, "maxMarketCapUsd": max_cap},
-        "createdAt": str((existing or {}).get("createdAt") or raw.get("createdAt") or now),
+        "createdAt": str(existing_record.get("createdAt") or raw.get("createdAt") or now),
         "updatedAt": now,
     }
 

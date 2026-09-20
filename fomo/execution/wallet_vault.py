@@ -12,7 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Protocol, cast
 
 import keyring
 from bip_utils import Bip32Slip10Ed25519, Bip39SeedGenerator, Bip44, Bip44Changes, Bip44Coins, SolAddrEncoder
@@ -64,8 +64,8 @@ def normalize_mnemonic(mnemonic: str) -> str:
 
 
 class WalletVault:
-    def __init__(self, backend: CredentialBackend = keyring, service: str = SERVICE_NAME):
-        self.backend = backend
+    def __init__(self, backend: CredentialBackend | None = None, service: str = SERVICE_NAME):
+        self.backend = backend or cast(CredentialBackend, keyring)
         self.service = service
 
     def exists(self, name: str) -> bool:

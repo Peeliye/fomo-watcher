@@ -8,9 +8,66 @@ from unittest.mock import patch
 from fomo.app import Event
 from fomo.execution.readiness import execution_readiness
 from fomo.portfolio.ledger import PortfolioLedger, portfolio_snapshot
+from fomo.portfolio.exit_policy import ExitPolicyError, ExitPolicyStore
 
 
 class PortfolioLedgerTests(unittest.TestCase):
+    def test_stop_loss_closes_position_and_records_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portfolio.sqlite3"
+            ledger = PortfolioLedger(path, "UTC")
+            event = Event(id="stop-buy", kind="buy", handle="alice", user_id="kol-1",
+                          created_at=datetime.now(timezone.utc).isoformat(), network_id=1,
+                          ca="0x1111111111111111111111111111111111111111", symbol="MEME", price=1)
+            ledger.apply_event(event, {"status": "accepted", "paperBuyUsd": 10})
+            ledger.update_market_marks([{"chainId": 1, "tokenAddress": event.ca, "priceUsd": .7}])
+            exits = ledger.evaluate_exit_rules({"enabled": True, "stopLossPct": 25,
+                                                "principalRecoveryMultiple": 2,
+                                                "trailingStopPct": 25, "maxHoldingHours": 168})
+            ledger.close()
+            snapshot = portfolio_snapshot(path)
+        self.assertEqual(exits[0]["reason"], "stop_loss")
+        self.assertEqual(snapshot["openPositions"], 0)
+        self.assertEqual(snapshot["fills"][0]["reason"], "stop_loss")
+        self.assertEqual(snapshot["realizedPnlUsd"], -3)
+
+    def test_principal_recovery_sells_only_cost_then_trails_remainder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portfolio.sqlite3"
+            ledger = PortfolioLedger(path, "UTC")
+            event = Event(id="recover-buy", kind="buy", handle="alice", user_id="kol-1",
+                          created_at=datetime.now(timezone.utc).isoformat(), network_id=1,
+                          ca="0x1111111111111111111111111111111111111111", symbol="MEME", price=1)
+            policy = {"enabled": True, "stopLossPct": 25, "principalRecoveryMultiple": 2,
+                      "trailingStopPct": 25, "maxHoldingHours": 168}
+            ledger.apply_event(event, {"status": "accepted", "paperBuyUsd": 10})
+            ledger.update_market_marks([{"chainId": 1, "tokenAddress": event.ca, "priceUsd": 2}])
+            first = ledger.evaluate_exit_rules(policy)
+            position = ledger.db.execute("SELECT quantity,cost_basis_usd_micros,exit_stage FROM portfolio_positions").fetchone()
+            self.assertEqual(first[0]["reason"], "principal_recovery")
+            self.assertEqual(position[0], "5")
+            self.assertEqual(position[1], 5_000_000)
+            self.assertEqual(position[2], "principal_recovered")
+            ledger.update_market_marks([{"chainId": 1, "tokenAddress": event.ca, "priceUsd": 3}])
+            self.assertEqual(ledger.evaluate_exit_rules(policy), [])
+            ledger.update_market_marks([{"chainId": 1, "tokenAddress": event.ca, "priceUsd": 2.2}])
+            second = ledger.evaluate_exit_rules(policy)
+            ledger.close()
+            snapshot = portfolio_snapshot(path)
+        self.assertEqual(second[0]["reason"], "trailing_stop")
+        self.assertEqual(snapshot["openPositions"], 0)
+        self.assertEqual(snapshot["realizedPnlUsd"], 11)
+
+    def test_exit_policy_store_validates_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ExitPolicyStore(Path(directory) / "exit-policy.json")
+            result = store.write({"enabled": True, "stopLossPct": 20,
+                                  "principalRecoveryMultiple": 1.8,
+                                  "trailingStopPct": 18, "maxHoldingHours": 72})
+            self.assertEqual(store.read(), result)
+            with self.assertRaises(ExitPolicyError):
+                store.write({"stopLossPct": 100})
+
     def test_independent_market_marks_refresh_open_position(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = PortfolioLedger(Path(directory) / "portfolio.sqlite3", "UTC")

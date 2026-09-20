@@ -12,6 +12,7 @@ from curl_cffi import requests as cf
 
 from .execution.rpc_pool import run_rpc_probe_cycle
 from .portfolio.ledger import PortfolioLedger
+from .portfolio.exit_policy import ExitPolicyStore
 
 
 DEX_CHAIN_IDS = {
@@ -51,8 +52,10 @@ def fetch_dexscreener_marks(tokens: list[dict[str, Any]], timeout_seconds: float
 
 class BackgroundMonitors:
     def __init__(self, project_dir: Path, cfg: dict[str, Any],
+                 portfolio: PortfolioLedger | None = None,
                  market_fetcher: Callable[[list[dict[str, Any]], float], list[dict[str, Any]]] = fetch_dexscreener_marks):
         self.project_dir, self.cfg, self.market_fetcher = project_dir, cfg, market_fetcher
+        self.portfolio = portfolio
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
 
@@ -67,6 +70,9 @@ class BackgroundMonitors:
 
     def stop(self) -> None:
         self.stop_event.set()
+        for thread in self.threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=5)
 
     def _spawn(self, name: str, target: Callable[[], None]) -> None:
         thread = threading.Thread(name=name, target=target, daemon=True)
@@ -91,21 +97,22 @@ class BackgroundMonitors:
         interval = max(15, int(settings.get("refresh_seconds", 60)))
         timeout = max(1.0, float(settings.get("timeout_seconds", 8)))
         portfolio = self.cfg.get("portfolio", {})
-        path = Path(str(portfolio.get("database", "data/portfolio.sqlite3")))
-        if not path.is_absolute():
-            path = self.project_dir / path
+        configured_policy = Path(str(portfolio.get("exit_policy_path", "data/exit-policy.json")))
+        policy_path = configured_policy if configured_policy.is_absolute() else self.project_dir / configured_policy
+        policy_store = ExitPolicyStore(policy_path, portfolio.get("exit_strategy"))
         while not self.stop_event.is_set():
-            ledger: PortfolioLedger | None = None
             try:
-                ledger = PortfolioLedger(path, str(self.cfg.get("timezone", "UTC")),
-                                         str(portfolio.get("account_id", "paper-main")))
+                ledger = self.portfolio
+                if ledger is None:
+                    self.stop_event.wait(interval)
+                    continue
                 tokens = ledger.open_position_tokens()
                 marks = self.market_fetcher(tokens, timeout) if tokens else []
                 updated = ledger.update_market_marks(marks)
-                logging.info("持仓行情刷新完成：%d/%d 个代币已更新", updated, len(tokens))
+                exits = ledger.evaluate_exit_rules(
+                    policy_store.read(), int(portfolio.get("mark_stale_seconds", 300))
+                )
+                logging.info("持仓行情刷新完成：%d/%d 个代币已更新，自动退出 %d 笔", updated, len(tokens), len(exits))
             except Exception:
                 logging.exception("持仓行情刷新失败")
-            finally:
-                if ledger is not None:
-                    ledger.close()
             self.stop_event.wait(interval)

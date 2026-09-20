@@ -41,8 +41,12 @@ CREATE INDEX IF NOT EXISTS idx_intelligence_kol_time
   ON intelligence_events(kol_id, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_intelligence_token_time
   ON intelligence_events(chain_id, token_address, event_time DESC);
-PRAGMA user_version=1;
+CREATE TABLE IF NOT EXISTS intelligence_cache (
+  cache_key TEXT PRIMARY KEY,event_revision INTEGER NOT NULL,
+  generated_at TEXT NOT NULL,payload_json TEXT NOT NULL
+);
 """
+SCHEMA_VERSION = 2
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -112,13 +116,27 @@ class WalletIntelligenceStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.settings = {**DEFAULT_SETTINGS, **(settings or {})}
+        existed = self.path.exists() and self.path.stat().st_size > 0
         self.db = sqlite3.connect(self.path, timeout=5)
         self.db.row_factory = sqlite3.Row
+        version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
+        if version < SCHEMA_VERSION:
+            if existed:
+                backup_dir = self.path.parent / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                target = sqlite3.connect(backup_dir / f"{self.path.stem}.pre-v{SCHEMA_VERSION}.{stamp}.sqlite3")
+                try:
+                    self.db.backup(target)
+                finally:
+                    target.close()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=5000")
-        self.db.executescript(SCHEMA)
-        self.db.commit()
+        if version < SCHEMA_VERSION:
+            self.db.executescript(SCHEMA)
+            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -206,6 +224,23 @@ class WalletIntelligenceStore:
         return inserted
 
     def snapshot(self, limit: int = 200) -> dict[str, Any]:
+        requested = max(1, min(int(limit), 1000))
+        revision = int(self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM intelligence_events").fetchone()[0])
+        cached = self.db.execute("SELECT * FROM intelligence_cache WHERE cache_key='profiles-v1'").fetchone()
+        if cached and int(cached["event_revision"]) == revision:
+            payload = json.loads(str(cached["payload_json"]))
+            payload["profiles"] = payload.get("profiles", [])[:requested]
+            return payload
+        payload = self._compute_snapshot(1000)
+        self.db.execute(
+            "INSERT OR REPLACE INTO intelligence_cache VALUES('profiles-v1',?,?,?)",
+            (revision, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
+        )
+        self.db.commit()
+        payload["profiles"] = payload["profiles"][:requested]
+        return payload
+
+    def _compute_snapshot(self, limit: int = 1000) -> dict[str, Any]:
         rows = self.db.execute(
             "SELECT * FROM intelligence_events ORDER BY event_time ASC"
         ).fetchall()

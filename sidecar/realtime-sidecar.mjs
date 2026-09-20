@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { appendShadow, evaluateShadow, fileMtime, loadJson } from "./fast-shadow.mjs";
+import { appendNdjson, appendShadow, evaluateShadow, fileMtime, loadJson } from "./fast-shadow.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const envFile = resolve(root, ".env");
@@ -144,7 +144,7 @@ function connect() {
       const shadow = evaluateShadow(message.payload, receivedAt, fastConfig, following);
       shadow.decisionLatencyMs = Math.round(Number(process.hrtime.bigint() - ingressStarted) / 1000) / 1000;
       appendShadow(shadowFile, shadow);
-      appendFileSync(eventFile, JSON.stringify({ receivedAt, payload: message.payload }) + "\n");
+      appendNdjson(eventFile, { receivedAt, payload: message.payload });
       frames += 1;
       lastFrameAt = new Date().toISOString();
     } else if (message.type === "error") {

@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -16,9 +17,10 @@ from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-import yaml
 import keyring
+import yaml
 from dotenv import dotenv_values, load_dotenv
+from keyring.errors import PasswordDeleteError
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DOTENV_PATH = PROJECT_DIR / ".env"
@@ -27,6 +29,9 @@ load_dotenv(DOTENV_PATH)
 load_dotenv(SESSION_ENV_PATH, override=True)
 from curl_cffi import requests as cf
 from fomo.execution.journal import ExecutionJournal
+from fomo.execution.fast_path import evaluate_copy_buy
+from fomo.execution.networks import apply_network_settings
+from fomo.audit import append_ndjson
 from fomo.intelligence.profile import WalletIntelligenceStore
 from fomo.intelligence.leaderboard_scheduler import LeaderboardScheduler
 from fomo.monitoring import BackgroundMonitors
@@ -63,10 +68,13 @@ def publish_fast_executor_config(cfg: dict[str, Any]) -> None:
         "enabled": bool(settings.get("enabled", False) and settings.get("mode") == "paper"),
         "networkIds": [int(value) for value in settings.get("network_ids", [])],
         "eventTypes": list(settings.get("event_types", [])),
+        "activeBuyEventTypes": list(settings.get("active_buy_event_types", ["swap_buy", "single_user_buy"])),
         "fixedUsd": float(settings.get("fixed_usd", 0)),
         "minTargetBuyUsd": float(settings.get("min_target_buy_usd", 0)),
         "maxSignalAgeSeconds": float(settings.get("max_signal_age_seconds", 5)),
         "minMarketCapUsd": float(settings.get("min_market_cap_usd", 0)),
+        "deferAssetChecks": bool(settings.get("defer_asset_checks", True)),
+        "requireTradeIdInLive": bool(settings.get("require_trade_id_in_live", True)),
         "whitelistMaxAgeSeconds": int(settings.get("whitelist_max_age_seconds", 600)),
         "mode": "shadow",
         "updatedAt": time.time() * 1000,
@@ -154,7 +162,7 @@ class FomoClient:
                 pass
         raise RuntimeError("等待无窗口 Privy 客户端刷新 access token")
 
-    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def get(self, path: str, params: Any = None) -> Any:
         self._ensure_token()
         headers = {
             "Authorization": f"Bearer {self.access}", "X-Supported-Chains": CHAINS,
@@ -172,9 +180,80 @@ class State:
     def __init__(self, path: str) -> None:
         db_path = Path(path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(db_path)
+        existed = db_path.exists() and db_path.stat().st_size > 0
+        self.path = db_path
+        self.db = sqlite3.connect(db_path, timeout=5)
+        self.db.row_factory = sqlite3.Row
+        version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
+        if existed and version < 3:
+            backup_dir = db_path.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            target = sqlite3.connect(backup_dir / f"{db_path.stem}.pre-v3.from-v{version}.{stamp}.sqlite3")
+            try:
+                self.db.backup(target)
+            finally:
+                target.close()
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS sent (id TEXT PRIMARY KEY, at INTEGER NOT NULL)")
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS event_inbox (
+          event_id TEXT PRIMARY KEY,
+          source TEXT NOT NULL,
+          source_path TEXT,
+          start_offset INTEGER,
+          end_offset INTEGER,
+          event_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at REAL NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at REAL NOT NULL,
+          completed_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_event_inbox_pending
+          ON event_inbox(status,next_attempt_at,created_at);
+        CREATE INDEX IF NOT EXISTS idx_event_inbox_offsets
+          ON event_inbox(source_path,start_offset,end_offset);
+        CREATE TABLE IF NOT EXISTS sidecar_records (
+          source_path TEXT NOT NULL,
+          start_offset INTEGER NOT NULL,
+          end_offset INTEGER NOT NULL,
+          event_id TEXT,
+          status TEXT NOT NULL,
+          PRIMARY KEY(source_path,start_offset)
+        );
+        CREATE TABLE IF NOT EXISTS notification_outbox (
+          event_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          event_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at REAL NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at REAL NOT NULL,
+          sent_at REAL,
+          PRIMARY KEY(event_id,channel)
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_outbox_pending
+          ON notification_outbox(status,next_attempt_at,created_at);
+        CREATE TABLE IF NOT EXISTS post_trade_outbox (
+          event_id TEXT PRIMARY KEY,
+          event_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at REAL NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at REAL NOT NULL,
+          completed_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_post_trade_outbox_pending
+          ON post_trade_outbox(status,next_attempt_at,created_at);
+        """)
+        self.db.execute("PRAGMA user_version=3")
         self.db.commit()
 
     def load(self, key: str, default: Any) -> Any:
@@ -199,6 +278,156 @@ class State:
     def mark_sent(self, event_id: str) -> None:
         self.db.execute("INSERT OR IGNORE INTO sent(id,at) VALUES(?,?)", (event_id, int(time.time())))
         self.db.commit()
+
+    def enqueue_event(
+        self,
+        event: "Event",
+        *,
+        source: str,
+        source_path: str | None = None,
+        start_offset: int | None = None,
+        end_offset: int | None = None,
+    ) -> bool:
+        payload = json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
+        with self.db:
+            cursor = self.db.execute(
+                """INSERT OR IGNORE INTO event_inbox
+                   (event_id,source,source_path,start_offset,end_offset,event_json,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (event.id, source, source_path, start_offset, end_offset, payload, time.time()),
+            )
+        return cursor.rowcount == 1
+
+    def enqueue_sidecar_line(self, path: str, start: int, end: int, events: list["Event"]) -> None:
+        now = time.time()
+        with self.db:
+            if not events:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO sidecar_records VALUES(?,?,?,?, 'done')",
+                    (path, start, end, None),
+                )
+            for event in events:
+                payload = json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
+                self.db.execute(
+                    """INSERT OR IGNORE INTO event_inbox
+                       (event_id,source,source_path,start_offset,end_offset,event_json,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (event.id, "sidecar", path, start, end, payload, now),
+                )
+                existing = self.db.execute(
+                    "SELECT status FROM event_inbox WHERE event_id=?", (event.id,)
+                ).fetchone()
+                line_status = "done" if existing and existing[0] == "done" else "pending"
+                self.db.execute(
+                    "INSERT OR IGNORE INTO sidecar_records VALUES(?,?,?,?,?)",
+                    (path, start, end, event.id, line_status),
+                )
+            self.db.execute(
+                "INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)",
+                (f"sidecar_scan_offset:{path}", json.dumps(end)),
+            )
+        self._advance_sidecar_offset(path)
+
+    def _advance_sidecar_offset(self, path: str) -> None:
+        committed = int(self.load(f"sidecar_offset:{path}", 0))
+        while True:
+            row = self.db.execute(
+                """SELECT end_offset,status FROM sidecar_records
+                   WHERE source_path=? AND start_offset=?""",
+                (path, committed),
+            ).fetchone()
+            if not row or row[1] != "done":
+                break
+            committed = int(row[0])
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)",
+                (f"sidecar_offset:{path}", json.dumps(committed)),
+            )
+            self.db.execute(
+                "INSERT OR REPLACE INTO kv(k,v) VALUES('sidecar_offset',?)", (json.dumps(committed),)
+            )
+
+    def pending_events(self, limit: int = 100) -> list[sqlite3.Row]:
+        return self.db.execute(
+            """SELECT * FROM event_inbox
+               WHERE status IN ('pending','retry') AND next_attempt_at<=?
+               ORDER BY created_at,event_id LIMIT ?""",
+            (time.time(), max(1, min(int(limit), 1000))),
+        ).fetchall()
+
+    def complete_event(self, event_id: str) -> None:
+        now = time.time()
+        with self.db:
+            self.db.execute(
+                "UPDATE event_inbox SET status='done',completed_at=?,last_error=NULL WHERE event_id=?",
+                (now, event_id),
+            )
+            row = self.db.execute(
+                "SELECT source_path FROM event_inbox WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if row and row[0]:
+                path = str(row[0])
+                self.db.execute(
+                    "UPDATE sidecar_records SET status='done' WHERE source_path=? AND event_id=?",
+                    (path, event_id),
+                )
+        if row and row[0]:
+            self._advance_sidecar_offset(str(row[0]))
+
+    def fail_event(self, event_id: str, error: BaseException, max_retries: int = 20) -> None:
+        row = self.db.execute("SELECT attempts FROM event_inbox WHERE event_id=?", (event_id,)).fetchone()
+        attempts = int(row[0] if row else 0) + 1
+        status = "dead" if attempts >= max_retries else "retry"
+        delay = min(300.0, 2.0 ** min(attempts, 8))
+        # Exception strings from HTTP/SDK layers can embed credential-bearing
+        # URLs. Persist the class only; detailed traceback stays out of logs.
+        message = type(error).__name__[:120]
+        with self.db:
+            self.db.execute(
+                """UPDATE event_inbox SET status=?,attempts=?,next_attempt_at=?,last_error=?
+                   WHERE event_id=?""",
+                (status, attempts, time.time() + delay, message, event_id),
+            )
+
+    def enqueue_notifications(self, event: "Event", cfg: dict[str, Any]) -> None:
+        channels = notification_channels(cfg)
+        payload = json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
+        now = time.time()
+        with self.db:
+            self.db.executemany(
+                """INSERT OR IGNORE INTO notification_outbox
+                   (event_id,channel,event_json,created_at) VALUES(?,?,?,?)""",
+                [(event.id, channel, payload, now) for channel in channels],
+            )
+
+    def enqueue_post_trade(self, event: "Event") -> None:
+        payload = json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO post_trade_outbox(event_id,event_json,created_at) VALUES(?,?,?)",
+                (event.id, payload, time.time()),
+            )
+
+    def complete_post_trade(self, event_id: str) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE post_trade_outbox SET status='done',completed_at=?,last_error=NULL WHERE event_id=?",
+                (time.time(), event_id),
+            )
+
+    def prune(self, sent_ttl_days: int = 14, completed_ttl_days: int = 30) -> None:
+        now = time.time()
+        with self.db:
+            self.db.execute("DELETE FROM sent WHERE at<?", (int(now - max(1, sent_ttl_days) * 86400),))
+            self.db.execute(
+                "DELETE FROM event_inbox WHERE status='done' AND completed_at<?",
+                (now - max(1, completed_ttl_days) * 86400,),
+            )
+            self.db.execute(
+                "DELETE FROM post_trade_outbox WHERE status='done' AND completed_at<?",
+                (now - max(1, completed_ttl_days) * 86400,),
+            )
 
 
 @dataclass
@@ -286,7 +515,7 @@ def position_events(handle: str, old: dict[str, Any], new: dict[str, Any], min_t
         if abs(delta) < min_tokens or usd < min_usd:
             continue
         kind = "buy" if delta > 0 else ("clear" if new_amount == 0 else "sell")
-        ts = meta.get("holding_since") if kind == "buy" else ""
+        ts = str(meta.get("holding_since") or "") if kind == "buy" else ""
         identity = f"position:{handle}:{key}:{old_amount:.12g}:{new_amount:.12g}"
         events.append(Event(
             id=identity, kind=kind, handle=handle, created_at=ts,
@@ -342,7 +571,7 @@ def thesis_events(handle: str, spotlight: Any) -> list[Event]:
             id=f"thesis:{comment['id']}", kind="thesis", handle=handle,
             created_at=comment.get("createdAt", ""), ca=comment.get("tokenAddress", ""),
             network_id=int(comment.get("networkId") or 0), original_text=text,
-            translated_text=translate(text) if is_probably_english(text) else "",
+            translated_text="",
         ))
     return output
 
@@ -363,7 +592,8 @@ def feed_events(feed_data: Any, allowed_user_ids: set[str] | None = None) -> lis
         comment_value = body.get("comment")
         comment = comment_value if isinstance(comment_value, dict) else {}
         trade_comment = item.get("tradeComment") if isinstance(item.get("tradeComment"), dict) else {}
-        segments = body.get("shortCommentSegments") if isinstance(body.get("shortCommentSegments"), list) else []
+        raw_segments = body.get("shortCommentSegments")
+        segments: list[Any] = raw_segments if isinstance(raw_segments, list) else []
         segment_text = "\n".join(
             str(segment.get("text") or "").strip()
             for segment in segments if isinstance(segment, dict) and segment.get("text")
@@ -412,7 +642,7 @@ def feed_events(feed_data: Any, allowed_user_ids: set[str] | None = None) -> lis
             market_cap=_num(item.get("marketCap") or item.get("fdv") or body.get("marketCap") or body.get("fdv")),
             price=price,
             current_position_usd=_num(item.get("currentSizeUsd") or body.get("currentSizeUsd") or body.get("positionNotionalUsd")), original_text=str(text),
-            translated_text=translate(str(text)) if text and is_probably_english(str(text)) else "",
+            translated_text="",
             trade_id=str(item.get("tradeId") or trade.get("id") or body.get("tradeId") or ""),
             source_type=kind_raw,
             user_id=str(actor_id or ""),
@@ -520,34 +750,203 @@ def _post(url: str, **kwargs: Any) -> None:
     response.raise_for_status()
 
 
-def notify(text: str, event: Event, cfg: dict[str, Any]) -> None:
+def notification_channels(cfg: dict[str, Any]) -> list[str]:
     enabled = cfg.get("notifications", {})
-    if enabled.get("telegram"):
+    channels = [name for name in ("telegram", "feishu", "generic_webhook")
+                if enabled.get(name)]
+    return channels or ["console"]
+
+
+def notify_channel(channel: str, text: str, event: Event, cfg: dict[str, Any]) -> None:
+    if channel == "telegram":
         token, chat_id = os.environ["TG_BOT_TOKEN"], os.environ["TG_CHAT_ID"]
         _post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-    if enabled.get("feishu"):
+    elif channel == "feishu":
         _post(os.environ["FEISHU_WEBHOOK_URL"], json=feishu_card(event, cfg))
-    if enabled.get("wechat_work"):
-        _post(os.environ["WECHAT_WORK_WEBHOOK_URL"], json={"msgtype": "text", "text": {"content": text}})
-    if enabled.get("qq_onebot"):
-        base = os.environ["ONEBOT_API_BASE"].rstrip("/")
-        target_type = os.getenv("ONEBOT_TARGET_TYPE", "group")
-        target_id = int(os.environ["ONEBOT_TARGET_ID"])
-        headers = {"Authorization": f"Bearer {os.getenv('ONEBOT_ACCESS_TOKEN', '')}"}
-        payload = {f"{target_type}_id": target_id, "message": text}
-        _post(f"{base}/send_{target_type}_msg", headers=headers, json=payload)
-    if enabled.get("generic_webhook"):
+    elif channel == "generic_webhook":
         _post(os.environ["GENERIC_WEBHOOK_URL"], json={"text": text, "event": asdict(event)})
-    if not any(enabled.values()):
+    elif channel == "console":
         print("\n" + text + "\n")
 
 
+def notify(text: str, event: Event, cfg: dict[str, Any]) -> None:
+    """Compatibility helper; durable delivery uses NotificationWorker."""
+    for channel in notification_channels(cfg):
+        notify_channel(channel, text, event, cfg)
+
+
 def notify_once(state: State, event: Event, cfg: dict[str, Any]) -> None:
-    """Record deduplication only after every enabled delivery succeeds."""
-    if state.was_sent(event.id):
-        return
-    notify(render(event, cfg), event, cfg)
-    state.mark_sent(event.id)
+    """Atomically enqueue one independently retryable record per channel."""
+    state.enqueue_notifications(event, cfg)
+
+
+class NotificationWorker:
+    """Deliver the persistent outbox without blocking risk or accounting."""
+
+    def __init__(self, state_path: Path, cfg: dict[str, Any]):
+        self.state_path = state_path
+        self.cfg = cfg
+        settings = cfg.get("notifications", {})
+        self.max_retries = max(1, int(settings.get("max_retries", 8)))
+        self.base_backoff = max(0.1, float(settings.get("retry_base_seconds", 2)))
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> "NotificationWorker":
+        self.thread = threading.Thread(target=self._run, name="notification-outbox", daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=5)
+
+    def _run(self) -> None:
+        db = sqlite3.connect(self.state_path, timeout=5)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=5000")
+        try:
+            while not self.stop_event.is_set():
+                worked = self._drain(db)
+                self.stop_event.wait(0.1 if worked else 1.0)
+        finally:
+            db.close()
+
+    def _drain(self, db: sqlite3.Connection, limit: int = 20) -> int:
+        rows = db.execute(
+            """SELECT * FROM notification_outbox
+               WHERE status IN ('pending','retry') AND next_attempt_at<=?
+               ORDER BY created_at LIMIT ?""",
+            (time.time(), limit),
+        ).fetchall()
+        for row in rows:
+            event = Event(**json.loads(row["event_json"]))
+            try:
+                if event.original_text and not event.translated_text and is_probably_english(event.original_text):
+                    event.translated_text = translate(event.original_text)
+                notify_channel(str(row["channel"]), render(event, self.cfg), event, self.cfg)
+            except Exception as exc:
+                attempts = int(row["attempts"]) + 1
+                status = "dead" if attempts >= self.max_retries else "retry"
+                delay = self.base_backoff * (2 ** min(attempts - 1, 8))
+                # Never persist exception strings: HTTP clients often embed credential-bearing URLs.
+                error = type(exc).__name__[:120]
+                with db:
+                    db.execute(
+                        """UPDATE notification_outbox SET status=?,attempts=?,next_attempt_at=?,last_error=?
+                           WHERE event_id=? AND channel=?""",
+                        (status, attempts, time.time() + delay, error, row["event_id"], row["channel"]),
+                    )
+                logging.warning("通知发送失败，将按退避策略重试：event=%s channel=%s error=%s",
+                                row["event_id"], row["channel"], error)
+            else:
+                with db:
+                    db.execute(
+                        """UPDATE notification_outbox SET status='sent',attempts=attempts+1,
+                           sent_at=?,last_error=NULL WHERE event_id=? AND channel=?""",
+                        (time.time(), row["event_id"], row["channel"]),
+                    )
+        return len(rows)
+
+
+class PostTradeWorker:
+    """Drain durable analytical work on its own connections and thread."""
+
+    def __init__(self, project_dir: Path, state_path: Path, cfg: dict[str, Any]):
+        self.project_dir = project_dir
+        self.state_path = state_path
+        self.cfg = cfg
+        settings = cfg.get("post_trade", {})
+        self.max_retries = max(1, int(settings.get("max_retries", 20)))
+        self.base_backoff = max(0.1, float(settings.get("retry_base_seconds", 1)))
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> "PostTradeWorker":
+        self.thread = threading.Thread(target=self._run, name="post-trade-analysis", daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=5)
+
+    def _run(self) -> None:
+        state = State(str(self.state_path))
+        portfolio_settings = self.cfg.get("portfolio", {})
+        portfolio_path = Path(str(portfolio_settings.get("database", "data/portfolio.sqlite3")))
+        if not portfolio_path.is_absolute():
+            portfolio_path = self.project_dir / portfolio_path
+        portfolio = PortfolioLedger(
+            portfolio_path,
+            self.cfg["timezone"],
+            str(portfolio_settings.get("account_id", "paper-main")),
+        ) if portfolio_settings.get("enabled", True) else None
+        risk_pipeline = RiskPipeline(self.project_dir, self.cfg.get("read_only_risk", {}))
+        execution_settings = self.cfg.get("execution_journal", {})
+        execution_path = Path(str(execution_settings.get("database", "data/execution.sqlite3")))
+        if not execution_path.is_absolute():
+            execution_path = self.project_dir / execution_path
+        execution_journal = ExecutionJournal(
+            execution_path, str(portfolio_settings.get("account_id", "paper-main"))
+        ) if execution_settings.get("enabled", True) else None
+        intelligence_settings = self.cfg.get("smart_money", {})
+        intelligence_path = Path(str(intelligence_settings.get("database", "data/wallet-intelligence.sqlite3")))
+        if not intelligence_path.is_absolute():
+            intelligence_path = self.project_dir / intelligence_path
+        intelligence = WalletIntelligenceStore(
+            intelligence_path, intelligence_settings
+        ) if intelligence_settings.get("enabled", True) else None
+        try:
+            while not self.stop_event.is_set():
+                worked = self._drain(state, risk_pipeline, portfolio, execution_journal, intelligence)
+                self.stop_event.wait(0.05 if worked else 0.5)
+        finally:
+            if intelligence is not None:
+                intelligence.close()
+            if execution_journal is not None:
+                execution_journal.close()
+            if portfolio is not None:
+                portfolio.close()
+            state.db.close()
+
+    def _drain(
+        self,
+        state: State,
+        risk_pipeline: RiskPipeline | None,
+        portfolio: PortfolioLedger | None,
+        execution_journal: ExecutionJournal | None,
+        intelligence: WalletIntelligenceStore | None,
+        limit: int = 50,
+    ) -> int:
+        rows = state.db.execute(
+            """SELECT * FROM post_trade_outbox
+               WHERE status IN ('pending','retry') AND next_attempt_at<=?
+               ORDER BY created_at,event_id LIMIT ?""",
+            (time.time(), limit),
+        ).fetchall()
+        for row in rows:
+            event = Event(**json.loads(row["event_json"]))
+            try:
+                process_post_trade_event(
+                    state, event, risk_pipeline, portfolio, execution_journal, intelligence
+                )
+            except Exception as exc:
+                attempts = int(row["attempts"]) + 1
+                status = "dead" if attempts >= self.max_retries else "retry"
+                delay = self.base_backoff * (2 ** min(attempts - 1, 8))
+                with state.db:
+                    state.db.execute(
+                        """UPDATE post_trade_outbox SET status=?,attempts=?,next_attempt_at=?,last_error=?
+                           WHERE event_id=?""",
+                        (status, attempts, time.time() + delay, type(exc).__name__[:120], row["event_id"]),
+                    )
+                logging.warning("买后分析失败，将异步重试：event=%s error=%s", row["event_id"], type(exc).__name__)
+            else:
+                state.complete_post_trade(str(row["event_id"]))
+        return len(rows)
 
 
 def paper_copy_trade(state: State, event: Event, cfg: dict[str, Any], portfolio: PortfolioLedger | None = None) -> dict[str, Any] | None:
@@ -555,33 +954,20 @@ def paper_copy_trade(state: State, event: Event, cfg: dict[str, Any], portfolio:
     if not settings.get("enabled") or settings.get("mode") != "paper" or event.kind != "buy":
         return None
     decision_id = f"paper:{event.id}"
-    if state.was_sent(decision_id):
+    if state.was_sent(decision_id) or (portfolio is not None and portfolio.has_event(event.id)):
         return None
 
-    allowed_networks = {int(value) for value in settings.get("network_ids", [1, 56, 4663, 5042, 8453, 1399811149])}
-    allowed_event_types = set(settings.get("event_types", ["swap_buy", "single_user_buy"]))
-    age = _event_age_seconds(event.created_at)
-    reason = "accepted"
-    if event.source_type not in allowed_event_types:
-        reason = "unsupported_event_type"
-    elif not event.ca:
-        reason = "missing_ca"
-    elif event.network_id not in allowed_networks:
-        reason = "unsupported_network"
-    elif age > float(settings.get("max_signal_age_seconds", 5)):
-        reason = "stale_signal"
-    elif event.amount_usd < float(settings.get("min_target_buy_usd", 100)):
-        reason = "target_trade_too_small"
-    elif not event.market_cap:
-        reason = "missing_market_cap"
-    elif event.market_cap < float(settings.get("min_market_cap_usd", 100_000)):
-        reason = "market_cap_too_small"
+    gate = evaluate_copy_buy(event, settings)
+    age = gate.signal_age_seconds
+    reason = gate.status
 
     local_day = datetime.now(ZoneInfo(cfg["timezone"])).strftime("%Y-%m-%d")
     daily_key = f"paper_spend:{local_day}"
     token_key = f"paper_exposure:{event.network_id}:{event.ca.lower()}"
-    daily_spend = float(state.load(daily_key, 0))
-    token_exposure = float(state.load(token_key, 0))
+    # The portfolio is authoritative in normal operation. Legacy state counters
+    # are only used when the ledger is explicitly disabled.
+    daily_spend = float(state.load(daily_key, 0)) if portfolio is None else 0.0
+    token_exposure = float(state.load(token_key, 0)) if portfolio is None else 0.0
     fixed_usd = float(settings.get("fixed_usd", 10))
     daily_remaining = max(0.0, float(settings.get("daily_limit_usd", 100)) - daily_spend)
     token_remaining = max(0.0, float(settings.get("per_token_limit_usd", 20)) - token_exposure)
@@ -612,28 +998,47 @@ def paper_copy_trade(state: State, event: Event, cfg: dict[str, Any], portfolio:
         "priceUsd": event.price or None,
         "userId": event.user_id or None,
         "maxSlippageBps": int(settings.get("max_slippage_bps", 200)),
+        "stage": "fast_path_reserved" if reason == "accepted" else "fast_path_blocked",
+        "deferredChecks": list(gate.deferred_checks),
+        "decisionLatencyMs": gate.decision_latency_ms,
     }
     log_path = PROJECT_DIR / settings.get("log_path", "data/paper-orders.ndjson")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-    if reason == "accepted":
+    append_ndjson(log_path, record, int(settings.get("audit_retention_days", 30)))
+    if reason == "accepted" and portfolio is None:
         state.save(daily_key, daily_spend + order_usd)
         state.save(token_key, token_exposure + order_usd)
+    if reason == "accepted":
         event.copy_note = f"🧪 模拟买入 {compact_money(order_usd)} · 滑点≤{record['maxSlippageBps'] / 100:g}%"
-    state.mark_sent(decision_id)
     return record
 
 
-def process_event(
+def process_fast_event(
     state: State,
     event: Event,
     cfg: dict[str, Any],
+    portfolio: PortfolioLedger | None = None,
+) -> dict[str, Any] | None:
+    """Run the latency-sensitive copy decision before analytical work."""
+    paper_decision = paper_copy_trade(state, event, cfg, portfolio)
+    portfolio_result = None
+    if portfolio is not None:
+        portfolio_result = portfolio.apply_event(event, paper_decision)
+    if paper_decision is not None:
+        state.mark_sent(f"paper:{event.id}")
+    notify_once(state, event, cfg)
+    state.enqueue_post_trade(event)
+    return portfolio_result
+
+
+def process_post_trade_event(
+    state: State,
+    event: Event,
     risk_pipeline: RiskPipeline | None = None,
     portfolio: PortfolioLedger | None = None,
     execution_journal: ExecutionJournal | None = None,
     intelligence: WalletIntelligenceStore | None = None,
 ) -> None:
+    """Run full analysis after the order hand-off; never precede the fast path."""
     if intelligence is not None:
         try:
             intelligence.record_event(event)
@@ -646,13 +1051,25 @@ def process_event(
         if execution_journal is not None:
             execution_journal.record_risk_decision(event, risk_decision)
         state.mark_sent(risk_id)
-    paper_decision = paper_copy_trade(state, event, cfg, portfolio)
-    if portfolio is not None:
-        try:
-            portfolio.apply_event(event, paper_decision)
-        except Exception:
-            logging.exception("写入持仓与 PnL 账本失败：%s", event.id)
-    notify_once(state, event, cfg)
+
+
+def process_event(
+    state: State,
+    event: Event,
+    cfg: dict[str, Any],
+    risk_pipeline: RiskPipeline | None = None,
+    portfolio: PortfolioLedger | None = None,
+    execution_journal: ExecutionJournal | None = None,
+    intelligence: WalletIntelligenceStore | None = None,
+    phase: str = "full",
+) -> dict[str, Any] | None:
+    if phase not in {"full", "fast", "post"}:
+        raise ValueError(f"unknown processing phase: {phase}")
+    portfolio_result = process_fast_event(state, event, cfg, portfolio) if phase in {"full", "fast"} else None
+    if phase in {"full", "post"}:
+        process_post_trade_event(state, event, risk_pipeline, portfolio, execution_journal, intelligence)
+        state.complete_post_trade(event.id)
+    return portfolio_result
 
 
 def validate_config(cfg: dict[str, Any]) -> None:
@@ -666,14 +1083,28 @@ def sidecar_events(state: State, allowed_user_ids: set[str] | None, path: str = 
     event_path = Path(path)
     if not event_path.exists():
         return []
-    offset = int(state.load("sidecar_offset", 0))
+    canonical_path = str(event_path.resolve())
+    committed = int(state.load(f"sidecar_offset:{canonical_path}", state.load("sidecar_offset", 0)))
+    offset = int(state.load(f"sidecar_scan_offset:{canonical_path}", committed))
     size = event_path.stat().st_size
     if offset > size:
+        # Rotation/truncation: only reset the scan cursor. The durable inbox
+        # still protects already observed event ids from duplicate effects.
         offset = 0
     output: list[Event] = []
     with event_path.open("rb") as stream:
         stream.seek(offset)
-        for raw in stream:
+        while True:
+            start = stream.tell()
+            raw = stream.readline()
+            if not raw:
+                break
+            if not raw.endswith(b"\n"):
+                # A writer is still appending this JSON object. Leave both
+                # scan and committed offsets before the partial record.
+                break
+            end = stream.tell()
+            candidates: list[Event] = []
             try:
                 envelope = json.loads(raw.decode("utf-8"))
                 payload = envelope.get("payload") or {}
@@ -693,18 +1124,59 @@ def sidecar_events(state: State, allowed_user_ids: set[str] | None, path: str = 
                 output.extend(candidates)
             except Exception:
                 logging.exception("解析 Sidecar WebSocket 帧失败")
-        state.save("sidecar_offset", stream.tell())
+            # Persist the complete source span and parsed event before moving
+            # the scan cursor. Filtered/malformed complete lines are durable
+            # no-op records so they cannot block later valid events forever.
+            state.enqueue_sidecar_line(canonical_path, start, end, candidates)
     return output
 
 
+def process_pending_events(
+    state: State,
+    cfg: dict[str, Any],
+    risk_pipeline: RiskPipeline | None,
+    portfolio: PortfolioLedger | None,
+    execution_journal: ExecutionJournal | None,
+    intelligence: WalletIntelligenceStore | None,
+    limit: int = 100,
+    post_trade_async: bool = False,
+) -> int:
+    processed = 0
+    fast_completed: list[tuple[str, Event]] = []
+    for row in state.pending_events(limit):
+        event_id = str(row["event_id"])
+        try:
+            event = Event(**json.loads(row["event_json"]))
+            process_event(state, event, cfg, risk_pipeline, portfolio, execution_journal, intelligence, "fast")
+            if post_trade_async:
+                state.complete_event(event_id)
+                processed += 1
+            else:
+                fast_completed.append((event_id, event))
+        except Exception as exc:
+            # One broken fast-path event is isolated; later signals still run.
+            state.fail_event(event_id, exc)
+            logging.error("极速路径失败，已保留在 durable inbox：event=%s error=%s",
+                          event_id, type(exc).__name__)
+    # Drain the whole burst through the order hand-off before any expensive
+    # profile/risk analysis. This preserves arrival priority under load.
+    for event_id, event in fast_completed:
+        try:
+            process_event(state, event, cfg, risk_pipeline, portfolio, execution_journal, intelligence, "post")
+            state.complete_event(event_id)
+            processed += 1
+        except Exception as exc:
+            state.fail_event(event_id, exc)
+            logging.error("买后分析失败，已保留重试：event=%s error=%s", event_id, type(exc).__name__)
+    return processed
+
+
 def run(cfg: dict[str, Any], once: bool = False) -> None:
+    apply_network_settings(PROJECT_DIR, cfg)
     validate_config(cfg)
     publish_fast_executor_config(cfg)
-    if not once:
-        start_dashboard(PROJECT_DIR, cfg)
-        monitors = BackgroundMonitors(PROJECT_DIR, cfg).start()
-        atexit.register(monitors.stop)
     client, state = FomoClient(), State(cfg["state_db"])
+    state.prune(int(cfg.get("state_sent_ttl_days", 14)), int(cfg.get("inbox_retention_days", 30)))
     leaderboard_scheduler = LeaderboardScheduler(PROJECT_DIR, cfg, client).start() if not once else None
     if leaderboard_scheduler is not None:
         atexit.register(leaderboard_scheduler.stop)
@@ -720,6 +1192,12 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
     ) if portfolio_settings.get("enabled", True) else None
     if portfolio is not None:
         atexit.register(portfolio.close)
+    if not once:
+        start_dashboard(PROJECT_DIR, cfg, on_network_change=lambda: publish_fast_executor_config(cfg))
+        monitors = BackgroundMonitors(PROJECT_DIR, cfg, portfolio=portfolio).start()
+        atexit.register(monitors.stop)
+    notification_worker = NotificationWorker(state.path, cfg).start()
+    atexit.register(notification_worker.stop)
     execution_settings = cfg.get("execution_journal", {})
     execution_path = Path(str(execution_settings.get("database", "data/execution.sqlite3")))
     if not execution_path.is_absolute():
@@ -734,6 +1212,13 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
     intelligence = WalletIntelligenceStore(intelligence_path, intelligence_settings) if intelligence_settings.get("enabled", True) else None
     if intelligence is not None:
         atexit.register(intelligence.close)
+    post_trade_worker = (
+        PostTradeWorker(PROJECT_DIR, state.path, cfg).start()
+        if not once and cfg.get("post_trade", {}).get("enabled", True)
+        else None
+    )
+    if post_trade_worker is not None:
+        atexit.register(post_trade_worker.stop)
     backup_dir = Path(str(portfolio_settings.get("backup_dir", "data/backups")))
     if not backup_dir.is_absolute():
         backup_dir = PROJECT_DIR / backup_dir
@@ -767,8 +1252,7 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
                 following_retry_at = now + 30
                 logging.exception("刷新关注用户白名单失败")
         if cfg.get("browser_sidecar") and following_ids is not None:
-            for event in sidecar_events(state, allowed_user_ids=following_ids or set()):
-                process_event(state, event, cfg, risk_pipeline, portfolio, execution_journal, intelligence)
+            sidecar_events(state, allowed_user_ids=following_ids or set())
         rest_due = once or now - last_rest_poll >= rest_poll_seconds
         if rest_due and cfg.get("account_feed", True) and following_ids is not None:
             try:
@@ -777,7 +1261,7 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
                 initialized = state.load("account_feed_initialized", False)
                 for event in events:
                     if initialized:
-                        process_event(state, event, cfg, risk_pipeline, portfolio, execution_journal, intelligence)
+                        state.enqueue_event(event, source="account_feed")
                     else:
                         state.mark_sent(event.id)
                 state.save("account_feed_initialized", True)
@@ -796,7 +1280,7 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
                 if previous is not None:
                     for event in position_events(handle, previous, balances, min_tokens, min_usd):
                         event.user_id = str(uid)
-                        process_event(state, event, cfg, risk_pipeline, portfolio, execution_journal, intelligence)
+                        state.enqueue_event(event, source="position_poll")
                 state.save(key, balances)
 
                 spotlight = client.get(f"/v2/users/{uid}/spotlight")
@@ -805,12 +1289,17 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
                 initialized = state.load(initialized_key, False)
                 for event in comments:
                     if initialized:
-                        process_event(state, event, cfg, risk_pipeline, portfolio, execution_journal, intelligence)
+                        event.user_id = str(uid)
+                        state.enqueue_event(event, source="thesis_poll")
                     else:
                         state.mark_sent(event.id)
                 state.save(initialized_key, True)
             except Exception:
                 logging.exception("监控 @%s 失败", handle)
+        process_pending_events(
+            state, cfg, risk_pipeline, portfolio, execution_journal, intelligence,
+            post_trade_async=post_trade_worker is not None,
+        )
         if rest_due:
             last_rest_poll = now
         if once:
@@ -864,7 +1353,7 @@ def main() -> None:
         for name in ("access_token", "refresh_token"):
             try:
                 keyring.delete_password(KEYRING_SERVICE, name)
-            except keyring.errors.PasswordDeleteError:
+            except PasswordDeleteError:
                 pass
         print("已从系统安全凭据库删除 Fomo token。")
         return

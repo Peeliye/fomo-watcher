@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS snapshots(snapshot_id INTEGER PRIMARY KEY AUTOINCREME
 CREATE TABLE IF NOT EXISTS ranking_records(snapshot_id INTEGER NOT NULL,user_id TEXT NOT NULL,rank INTEGER NOT NULL,pnl_usd REAL NOT NULL,user_handle TEXT NOT NULL,display_name TEXT NOT NULL,address TEXT NOT NULL,evm_address TEXT NOT NULL,followers INTEGER NOT NULL,num_trades INTEGER NOT NULL,total_volume REAL NOT NULL,total_holdings INTEGER NOT NULL,payload_json TEXT NOT NULL,PRIMARY KEY(snapshot_id,user_id),UNIQUE(snapshot_id,rank),FOREIGN KEY(snapshot_id) REFERENCES snapshots(snapshot_id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_snapshots_cycle_status ON snapshots(cycle_date,status,hour_index DESC);
 CREATE INDEX IF NOT EXISTS idx_records_user ON ranking_records(user_id,snapshot_id);
-PRAGMA user_version=2;
 """
+SCHEMA_VERSION=3
 def _number(v:Any)->float:
     try:
         n=float(v or 0); return n if n==n and abs(n)!=float("inf") else 0.0
@@ -28,12 +28,29 @@ def _public_entry(item:dict[str,Any],position:int,window:str)->dict[str,Any]:
     return {"userId":uid,"rank":int(_number(item.get("rank")) or position),"pnlUsd":round(_number(item.get(field,item.get("pnlUsd"))),6),"userHandle":str(item.get("userHandle") or "unknown"),"displayName":str(item.get("displayName") or ""),"address":str(item.get("address") or ""),"evmAddress":str(item.get("evmAddress") or ""),"followers":int(_number(item.get("followers"))),"numTrades":int(_number(item.get("numTrades"))),"totalVolume":round(_number(item.get("totalVolume")),6),"totalHoldings":int(_number(item.get("totalHoldings"))),"clan":item.get("clan") if isinstance(item.get("clan"),dict) else None,"topHoldings":item.get("topHoldings") if isinstance(item.get("topHoldings"),list) else []}
 
 class LeaderboardArchive:
-    def __init__(self,database:str|Path,archive_dir:str|Path,timezone_name:str="Asia/Shanghai"):
+    def __init__(self,database:str|Path,archive_dir:str|Path,timezone_name:str="Asia/Shanghai",readonly:bool=False):
         self.database,self.archive_dir=Path(database),Path(archive_dir); self.timezone=ZoneInfo(timezone_name)
+        self.readonly=readonly
+        if readonly:
+            # immutable avoids creating or touching -wal/-shm during HTTP GETs.
+            # Writers are short-lived and checkpoint on close before GET opens.
+            self.db=sqlite3.connect(f"file:{self.database.as_posix()}?mode=ro&immutable=1",uri=True,timeout=5)
+            self.db.row_factory=sqlite3.Row;self.db.execute("PRAGMA query_only=ON")
+            return
         self.database.parent.mkdir(parents=True,exist_ok=True); self.archive_dir.mkdir(parents=True,exist_ok=True)
+        existed=self.database.exists() and self.database.stat().st_size>0
         self.db=sqlite3.connect(self.database,timeout=10); self.db.row_factory=sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL"); self.db.execute("PRAGMA synchronous=FULL"); self.db.execute("PRAGMA foreign_keys=ON"); self.db.execute("PRAGMA busy_timeout=10000"); self.db.executescript(SCHEMA); self.db.commit();self._migrate_legacy()
+        version=int(self.db.execute("PRAGMA user_version").fetchone()[0])
+        if version<SCHEMA_VERSION and existed:self._backup_before_migration(version)
+        self.db.execute("PRAGMA journal_mode=WAL"); self.db.execute("PRAGMA synchronous=FULL"); self.db.execute("PRAGMA foreign_keys=ON"); self.db.execute("PRAGMA busy_timeout=10000")
+        if version<SCHEMA_VERSION:
+            self.db.executescript(SCHEMA);self._migrate_legacy();self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}");self.db.commit()
     def close(self)->None:self.db.close()
+    def _backup_before_migration(self,version:int)->None:
+        stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ");directory=self.database.parent/"backups";directory.mkdir(parents=True,exist_ok=True)
+        target=sqlite3.connect(directory/f"{self.database.stem}.pre-v{SCHEMA_VERSION}.from-v{version}.{stamp}.sqlite3")
+        try:self.db.backup(target)
+        finally:target.close()
     def _migrate_legacy(self)->None:
         tables={r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not {"leaderboard_runs","leaderboard_entries"}.issubset(tables):return
@@ -42,7 +59,7 @@ class LeaderboardArchive:
             parsed=datetime.fromisoformat(str(run["captured_at"]).replace("Z","+00:00"));local=(parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(self.timezone);latest[(local.strftime("%Y-%m-%d"),local.hour)]=run
         for (day,hour),run in latest.items():
             if self.db.execute("SELECT 1 FROM snapshots WHERE cycle_date=? AND hour_index=?",(day,hour)).fetchone():continue
-            captured=str(run["captured_at"]);scheduled=f"{day}T{hour:02d}:01:00+08:00";self.db.execute("INSERT OR IGNORE INTO cycles VALUES(?,?,?)",(day,str(self.timezone),captured));cur=self.db.execute("INSERT INTO snapshots(cycle_date,hour_index,scheduled_for,captured_at,status,source_count)VALUES(?,?,?,?, 'success',?)",(day,hour,scheduled,captured,min(50,int(run["source_count"]))));sid=int(cur.lastrowid)
+            captured=str(run["captured_at"]);scheduled=f"{day}T{hour:02d}:01:00+08:00";self.db.execute("INSERT OR IGNORE INTO cycles VALUES(?,?,?)",(day,str(self.timezone),captured));cur=self.db.execute("INSERT INTO snapshots(cycle_date,hour_index,scheduled_for,captured_at,status,source_count)VALUES(?,?,?,?, 'success',?)",(day,hour,scheduled,captured,min(50,int(run["source_count"]))));sid=int(cur.lastrowid or 0)
             for old in self.db.execute("SELECT * FROM leaderboard_entries WHERE run_id=? ORDER BY rank",(run["run_id"],)):
                 if int(old["rank"])>50:continue
                 payload=json.loads(old["payload_json"]);e=_public_entry(payload,int(old["rank"]),"24h");e["pnlUsd"]=_number(old["pnl_usd"])
@@ -70,7 +87,7 @@ class LeaderboardArchive:
             old=self.db.execute("SELECT * FROM snapshots WHERE cycle_date=? AND hour_index=?",(day,hour)).fetchone()
             if old is not None and old["status"]=="success":self.db.rollback();return self._summary(day,hour,int(old["snapshot_id"]),True)
             if old is None:
-                cur=self.db.execute("INSERT INTO snapshots(cycle_date,hour_index,scheduled_for,captured_at,status,source_count)VALUES(?,?,?,?,?,?)",(day,hour,scheduled,captured,"success",len(entries))); sid=int(cur.lastrowid)
+                cur=self.db.execute("INSERT INTO snapshots(cycle_date,hour_index,scheduled_for,captured_at,status,source_count)VALUES(?,?,?,?,?,?)",(day,hour,scheduled,captured,"success",len(entries))); sid=int(cur.lastrowid or 0)
             else:
                 sid=int(old["snapshot_id"]);self.db.execute("DELETE FROM ranking_records WHERE snapshot_id=?",(sid,));self.db.execute("UPDATE snapshots SET captured_at=?,status='success',source_count=?,error_message=NULL WHERE snapshot_id=?",(captured,len(entries),sid))
             self.db.executemany("INSERT INTO ranking_records VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",[(sid,e["userId"],e["rank"],e["pnlUsd"],e["userHandle"],e["displayName"],e["address"],e["evmAddress"],e["followers"],e["numTrades"],e["totalVolume"],e["totalHoldings"],json.dumps(e,ensure_ascii=False,separators=(",",":"))) for e in entries]);self.db.commit()
@@ -98,13 +115,16 @@ class LeaderboardArchive:
         if row is None:return {"cycleDate":day,"hourIndex":int(hour),"status":"missing","records":[]}
         return {"cycleDate":day,"hourIndex":int(hour),"status":row["status"],"capturedAt":row["captured_at"],"error":row["error_message"],"records":self._records(int(row["snapshot_id"])) if row["status"]=="success" else []}
     def participants(self,day:str|None=None)->list[dict[str,Any]]:
-        day=day or datetime.now(timezone.utc).astimezone(self.timezone).strftime("%Y-%m-%d");snaps=self.db.execute("SELECT snapshot_id,hour_index,captured_at FROM snapshots WHERE cycle_date=? AND status='success' ORDER BY hour_index",(day,)).fetchall();current=int(snaps[-1]["snapshot_id"]) if snaps else -1;agg={}
-        for snap in snaps:
-            for row in self.db.execute("SELECT * FROM ranking_records WHERE snapshot_id=? ORDER BY rank",(snap["snapshot_id"],)):
-                x=agg.get(row["user_id"])
-                if x is None:x={"userId":row["user_id"],"userHandle":row["user_handle"],"displayName":row["display_name"],"address":row["address"],"evmAddress":row["evm_address"],"firstSeen":snap["captured_at"],"firstPnl":row["pnl_usd"],"maxPnl":row["pnl_usd"],"minPnl":row["pnl_usd"],"bestRank":row["rank"],"appearCount":0};agg[row["user_id"]]=x
-                x.update({"lastSeen":snap["captured_at"],"latestRank":row["rank"],"latestRankedPnl":row["pnl_usd"],"userHandle":row["user_handle"],"isCurrentRanked":int(snap["snapshot_id"])==current});x["appearCount"]+=1;x["bestRank"]=min(x["bestRank"],row["rank"]);x["maxPnl"]=max(x["maxPnl"],row["pnl_usd"]);x["minPnl"]=min(x["minPnl"],row["pnl_usd"])
-        for x in agg.values():x["pnlChange"]=round(x["latestRankedPnl"]-x["firstPnl"],6);x["appearances"]=x["appearCount"];x["firstRank"]=next((r["rank"] for s in snaps for r in self.db.execute("SELECT rank FROM ranking_records WHERE snapshot_id=? AND user_id=?",(s["snapshot_id"],x["userId"]))),x["bestRank"]);x["lastRank"]=x["latestRank"];x["lastPnlUsd"]=x["latestRankedPnl"];x["presentInLatest"]=x["isCurrentRanked"]
+        day=day or datetime.now(timezone.utc).astimezone(self.timezone).strftime("%Y-%m-%d")
+        rows=self.db.execute("""SELECT s.snapshot_id,s.hour_index,s.captured_at,r.*,
+          (SELECT MAX(snapshot_id) FROM snapshots WHERE cycle_date=? AND status='success') AS current_snapshot
+          FROM snapshots s JOIN ranking_records r USING(snapshot_id)
+          WHERE s.cycle_date=? AND s.status='success' ORDER BY s.hour_index,r.rank""",(day,day)).fetchall();agg={}
+        for row in rows:
+            x=agg.get(row["user_id"])
+            if x is None:x={"userId":row["user_id"],"userHandle":row["user_handle"],"displayName":row["display_name"],"address":row["address"],"evmAddress":row["evm_address"],"firstSeen":row["captured_at"],"firstPnl":row["pnl_usd"],"firstRank":row["rank"],"maxPnl":row["pnl_usd"],"minPnl":row["pnl_usd"],"bestRank":row["rank"],"appearCount":0};agg[row["user_id"]]=x
+            x.update({"lastSeen":row["captured_at"],"latestRank":row["rank"],"latestRankedPnl":row["pnl_usd"],"userHandle":row["user_handle"],"isCurrentRanked":int(row["snapshot_id"])==int(row["current_snapshot"])});x["appearCount"]+=1;x["bestRank"]=min(x["bestRank"],row["rank"]);x["maxPnl"]=max(x["maxPnl"],row["pnl_usd"]);x["minPnl"]=min(x["minPnl"],row["pnl_usd"])
+        for x in agg.values():x["pnlChange"]=round(x["latestRankedPnl"]-x["firstPnl"],6);x["appearances"]=x["appearCount"];x["lastRank"]=x["latestRank"];x["lastPnlUsd"]=x["latestRankedPnl"];x["presentInLatest"]=x["isCurrentRanked"]
         return sorted(agg.values(),key=lambda x:(not x["isCurrentRanked"],x["latestRank"],-x["latestRankedPnl"]))
     def participant_detail(self,day:str,user_id:str)->dict[str,Any]:
         rows=self.db.execute("SELECT s.hour_index,s.captured_at,r.rank,r.pnl_usd FROM snapshots s LEFT JOIN ranking_records r ON r.snapshot_id=s.snapshot_id AND r.user_id=? WHERE s.cycle_date=? AND s.status='success' ORDER BY s.hour_index",(user_id,day)).fetchall();by={int(r["hour_index"]):r for r in rows}

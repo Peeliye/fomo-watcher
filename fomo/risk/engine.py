@@ -270,6 +270,19 @@ class WalletRegistry:
             and (include_revoked or entry.status != "revoked")
         )
 
+    def wallets_for_verified_handle(self, chain_id: str, handle: str) -> tuple[WalletEntry, ...]:
+        """Resolve only exact, evidenced aliases that point to a real platform id."""
+        wanted_chain = str(chain_id)
+        wanted_handle = str(handle).strip().lstrip("@").casefold()
+        return tuple(
+            entry for entry in self.entries
+            if entry.handle.strip().lstrip("@").casefold() == wanted_handle
+            and not entry.kol_id.startswith("handle:")
+            and wanted_chain in entry.chain_ids
+            and entry.status != "revoked"
+            and bool(entry.evidence)
+        )
+
 
 @dataclass(frozen=True)
 class AssetSnapshot:

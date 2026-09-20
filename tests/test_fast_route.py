@@ -32,6 +32,26 @@ class FastRoutePlannerTests(unittest.TestCase):
         decision = FastRoutePlanner(POLICY).select(1, [quote("only", "100", 20)])
         self.assertEqual(decision.status, "blocked")
 
+    def test_speed_mode_accepts_unsimulated_but_scoped_allowlisted_route(self):
+        policy = {**POLICY, "minimum_independent_routes": 1, "require_simulation": False,
+                  "require_allowlisted_route": True, "require_scope_validation": True,
+                  "require_minimum_output": True}
+        decision = FastRoutePlanner(policy).select(1, [
+            quote("primary", "100", 20, simulation_passed=False,
+                  route_allowlisted=True, scope_validated=True,
+                  minimum_output_amount=Decimal("98"))
+        ])
+        self.assertEqual(decision.status, "selected_for_shadow")
+
+    def test_speed_mode_still_rejects_unsafe_transaction_scope(self):
+        policy = {**POLICY, "minimum_independent_routes": 1, "require_simulation": False,
+                  "require_scope_validation": True}
+        decision = FastRoutePlanner(policy).select(1, [
+            quote("primary", "100", 20, simulation_passed=False, scope_validated=False)
+        ])
+        self.assertEqual(decision.status, "blocked")
+        self.assertIn("transaction_scope_invalid", decision.rejected["primary"])
+
     def test_provider_configuration_does_not_imply_adapter_is_implemented(self):
         cfg = {"routing": {"mode": "live", "providers": {"1": [
             {"name": "aggregator", "api_key_env": "QUOTE_KEY", "adapter_env": "ROUTE_ENABLED"}

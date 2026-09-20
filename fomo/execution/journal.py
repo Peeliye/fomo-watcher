@@ -110,7 +110,12 @@ class ExecutionJournal:
         intent_id = f"intent:{signal_id}"
         blockers = [str(value) for value in decision.get("blockers", [])]
         outcome = str(decision.get("outcome") or "needs_data")
-        state = "shadow_ready" if outcome == "approved_for_shadow" else "blocked"
+        phase = str(decision.get("phase") or "pre_trade")
+        state = (
+            "post_trade_observed" if phase == "post_trade"
+            else "shadow_ready" if outcome == "approved_for_shadow"
+            else "blocked"
+        )
         now = datetime.now(timezone.utc).isoformat()
         inserted = self.db.execute(
             """INSERT OR IGNORE INTO execution_intents VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -123,7 +128,7 @@ class ExecutionJournal:
             self.db.execute(
                 "INSERT INTO execution_transitions(intent_id,from_state,to_state,reason,recorded_at,metadata_json) VALUES(?,?,?,?,?,?)",
                 (intent_id, None, state, blockers[0] if blockers else outcome, now,
-                 json.dumps({"policyVersion": decision.get("policyVersion"), "registryVersion": decision.get("registryVersion")}, separators=(",", ":"))),
+                 json.dumps({"policyVersion": decision.get("policyVersion"), "registryVersion": decision.get("registryVersion"), "phase": phase}, separators=(",", ":"))),
             )
             self.db.commit()
         return {"intentId": intent_id, "state": state, "duplicate": inserted.rowcount == 0}

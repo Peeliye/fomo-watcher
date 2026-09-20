@@ -1,6 +1,6 @@
 # Fomo Watcher
 
-一个针对 fomo.family 关注用户的实时监控 bot。它会建立本地基线，随后在检测到买入、减仓、清仓或新喊单时，把统一格式消息推送到 Telegram、飞书、企业微信、QQ OneBot 或自建 webhook。
+一个针对 fomo.family 关注用户的实时监控 bot。它会建立本地基线，随后在检测到买入、减仓、清仓或新喊单时，把统一格式消息推送到 Telegram、飞书或自建 webhook。
 
 ## 已实现
 
@@ -15,7 +15,7 @@
 - WebSocket 断线或 90 秒无活动会自动重连；REST Feed 每 30 秒兜底补漏。
 - 随监控进程长期运行的本地 Web 面板，实时查看模拟买入、过滤原因、链分布和服务状态。
 - RPC 健康度采用当前配置与五分钟新鲜度双重校验；未配置或遥测过期的历史节点不会计为可达。
-- 实盘采用 fail-closed 门禁：每条链必须具备 RPC、至少两条已部署报价/模拟路由，并同时配置 signer、广播总开关与显式 live 模式。
+- 实盘采用 fail-closed 门禁：每条链必须具备 RPC、至少一条已部署的主报价/预检路由，并同时配置 signer、广播总开关与显式 live 模式；第二路报价和完整资产分析后置，不阻塞极速买入。
 - 执行回执账本支持交易哈希幂等、链一致性校验、成功/失败状态迁移及未对账统计；面板接口为 `/api/execution-reconciliation`。
 - 同一平台 handle 的历史合成 ID 会在唯一真实 KOL ID 到达后自动归并，避免画像重复；存在多个真实 ID 时保持隔离。
 - 钱包注册仅在证据字段完整、置信度不低于 0.8、且未过期/撤销时进入可信映射。
@@ -57,11 +57,15 @@ python run.py --config config.yaml
 
 ## 模拟跟单
 
-`config.yaml` 的 `copy_trading.mode: paper` 只记录决策，不读取钱包私钥，也不会签名或广播交易。当前启用 Ethereum（1）、BNB Chain（56）、Robinhood Chain（4663）、ARC（5042）、Base（8453）和 Solana（1399811149）；只接受关注用户的新鲜买入信号：目标成交至少 $100、信号不超过 5 秒、市值至少 $100K；模拟固定买入 $10，单币上限 $20、每日上限 $100、最大滑点参数 2%。
+`config.yaml` 的 `copy_trading.mode: paper` 只记录决策，不读取钱包私钥，也不会签名或广播交易。当前启用 Ethereum（1）、BNB Chain（56）、Robinhood Chain（4663）、ARC（5042）、Base（8453）和 Solana（1399811149）；极速路径只接受关注用户的 `swap_buy` / `single_user_buy` 新鲜买入信号，目标成交至少 $100、信号不超过 5 秒。转账、空投、Mint、充值和收币事件不可通过配置误放行。模拟固定买入 $10，单币上限 $20、每日上限 $100、最大滑点参数 2%。市值、画像和完整资产风控在买入交接后执行，不阻塞同一批后续买入信号。
 
 接受与拒绝的模拟决策都会写入 `data/paper-orders.ndjson`；接受的决策还会在原飞书卡片中显示 `🧪 模拟买入`。成交、持仓、首次购入时间、已实现/未实现 PnL 和日统计持久化到 WAL 模式的 `data/portfolio.sqlite3`。在没有完成链上报价、流动性检查、交易模拟和独立热钱包配置前，不应把模式切换成真实交易。
 
+模拟持仓内置可热更新的退出策略：默认亏损 25% 全部止损、价格达到成本 2 倍时卖出刚好覆盖累计本金的数量、出本后从最高价回撤 25% 清仓、最长持有 168 小时。策略可在“持仓 / PnL”页面修改，持久化于 `data/exit-policy.json`；只有行情未过期时才会触发，自动卖出会进入成交、已实现 PnL 与日统计。
+
 监控启动后，在浏览器打开 `http://127.0.0.1:8765` 即可查看长期可视化面板。“持仓 / PnL”包含购入时间、盈亏差额、日统计、行情陈旧提示，以及 EVM + Solana 逻辑执行钱包到 RPC 阶段的配置状态。“钱包管理”用于维护 KOL 公开地址、证据与有效期，并维护独立观察钱包的标签、通知事件和金额/市值过滤条件；支持 CSV/JSON 批量导入。自定义观察规则保存在 `watch-wallets.json`，变更审计保存在 `data/wallet-management-audit.ndjson`。该页面拒绝私钥、助记词、种子词和 Keystore 字段。页面每 3 秒读取最新记录；默认仅监听本机，不会向局域网或公网暴露数据。详细结构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+“RPC 管理”页面用于维护配置中预设的主备 RPC 插槽，并可对单节点或全部节点执行即时健康测试。完整 URL 只写入本机 `.env`，页面与 API 只返回脱敏主机；测试记录持久化到 `data/rpc-health.sqlite3`，配置和测试操作记录到 `data/rpc-management-audit.ndjson`。健康判定同时要求遥测新鲜、最近样本成功率不低于 95%、P95 延迟不超过配置阈值且区块落后不超限。
 
 RPC 使用每链主备节点池，URL 和密钥只放在 `.env`，面板与 `data/rpc-health.sqlite3` 不保存秘密。填写 `.env.example` 中目标链变量后运行：
 
@@ -115,7 +119,9 @@ KOL/钱包、链、代币、买卖方向、成交数量、美元金额、时间�
 PnL、闭环胜率、入场到峰值倍率、早期入场、峰值后暴跌、归零反弹及验证型画像。没有至少三个
 闭环代币时不会输出“已验证聪明钱”。分型策略目前仍只输出只读建议，不会签名或广播。
 
-WebSocket 收包后还会在 Node 进程内立即执行一遍只读“影子风控”，绕过 Python 轮询，并把信号年龄和决策耗时写入 `data/shadow-executions.ndjson`。该阶段只判断能否进入报价流程，不读取钱包、不签名、不请求真实成交。
+WebSocket 收包后会在 Node 进程内立即执行本地极速门禁，绕过 Python 轮询，并把信号年龄、决策耗时和后置检查项写入 `data/shadow-executions.ndjson`。该阶段只做关注身份、主动买入类型、链、时效与目标金额检查；市值等资产分析移到后置阶段。当前仍为 Shadow/Paper，不读取钱包、不签名、不请求真实成交。
+
+持续运行时，画像、完整资产风控和执行意图审计进入 `state.sqlite3` 的持久化买后队列，由独立线程和独立数据库连接消费；主事件收件箱在完成极速交接后即可继续处理下一条信号。极速路由不要求完整交易模拟或预先证明可卖，但必须由适配器标记为可信路由、通过交易花费范围校验并携带非零 `minOut`。交易范围校验拒绝未知目标、额外转账操作、超出本单金额的授权以及无限授权。当前项目仍未配置真实报价构建、signer 或 broadcaster，因此这些门禁不会自行开启实盘。
 
 ```powershell
 python run.py --save-creds
@@ -144,9 +150,7 @@ python run.py --delete-creds
 
 - Telegram：`TG_BOT_TOKEN`、`TG_CHAT_ID`
 - 飞书群机器人：`FEISHU_WEBHOOK_URL`
-- 企业微信群机器人：`WECHAT_WORK_WEBHOOK_URL`
-- QQ：OneBot v11 的 `ONEBOT_API_BASE`、`ONEBOT_TARGET_TYPE=group|private`、`ONEBOT_TARGET_ID`，可选 `ONEBOT_ACCESS_TOKEN`
-- 个人微信：官方没有等价的群机器人 webhook。建议把 `generic_webhook` 指向你已有、合规的微信桥接服务；本项目不内置绕过个人微信风控的协议机器人。
+- 自建消息桥：`GENERIC_WEBHOOK_URL`
 
 所有平台均关闭时，消息打印到控制台，便于测试。
 

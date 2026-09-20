@@ -8,6 +8,7 @@ chain-derived PnL strictly separated.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import sqlite3
 from collections import defaultdict
@@ -77,8 +78,16 @@ CREATE TABLE IF NOT EXISTS social_identities (
   verified_at TEXT NOT NULL,
   PRIMARY KEY(kol_id, platform, account_handle)
 );
-PRAGMA user_version=1;
+CREATE TABLE IF NOT EXISTS performance_cache (
+  cache_key TEXT PRIMARY KEY,
+  fill_revision INTEGER NOT NULL,
+  market_revision INTEGER NOT NULL,
+  social_revision INTEGER NOT NULL,
+  generated_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
 """
+SCHEMA_VERSION = 2
 
 
 def _decimal(value: Any) -> Decimal:
@@ -116,13 +125,27 @@ class VerifiedPerformanceStore:
         self.path = Path(path)
         self.settings = {**DEFAULT_SETTINGS, **(settings or {})}
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existed = self.path.exists() and self.path.stat().st_size > 0
         self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
+        version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
+        if version < SCHEMA_VERSION:
+            if existed:
+                backup_dir = self.path.parent / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                target = sqlite3.connect(backup_dir / f"{self.path.stem}.pre-v{SCHEMA_VERSION}.{stamp}.sqlite3")
+                try:
+                    self.db.backup(target)
+                finally:
+                    target.close()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=10000")
-        self.db.executescript(SCHEMA)
-        self.db.commit()
+        if version < SCHEMA_VERSION:
+            self.db.executescript(SCHEMA)
+            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -207,6 +230,28 @@ class VerifiedPerformanceStore:
         return inserted
 
     def snapshot(self, limit: int = 200) -> dict[str, Any]:
+        requested = max(1, min(int(limit), 1000))
+        revisions = (
+            int(self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM verified_fills").fetchone()[0]),
+            int(self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM token_market_history").fetchone()[0]),
+            int(self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM social_identities").fetchone()[0]),
+        )
+        cached = self.db.execute("SELECT * FROM performance_cache WHERE cache_key='profiles-v1'").fetchone()
+        if cached and tuple(int(cached[key]) for key in ("fill_revision", "market_revision", "social_revision")) == revisions:
+            payload = json.loads(str(cached["payload_json"]))
+            payload["profiles"] = payload.get("profiles", [])[:requested]
+            return payload
+        payload = self._compute_snapshot(1000)
+        self.db.execute(
+            """INSERT OR REPLACE INTO performance_cache
+               VALUES('profiles-v1',?,?,?,?,?)""",
+            (*revisions, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
+        )
+        self.db.commit()
+        payload["profiles"] = payload["profiles"][:requested]
+        return payload
+
+    def _compute_snapshot(self, limit: int = 1000) -> dict[str, Any]:
         fills = self.db.execute("SELECT * FROM verified_fills ORDER BY executed_at ASC, rowid ASC").fetchall()
         markets = self.db.execute("SELECT * FROM token_market_history ORDER BY observed_at ASC").fetchall()
         socials = self.db.execute("SELECT * FROM social_identities ORDER BY platform,account_handle").fetchall()

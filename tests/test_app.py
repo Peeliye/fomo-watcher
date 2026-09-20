@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 
 from fomo.app import Event, State, event_links, feed_events, feishu_card, is_probably_english, paper_copy_trade, position_events, render
-from fomo.web.server import build_dashboard_payload, build_shadow_payload
+from fomo.web.server import _paths_signature, _websocket_text_frame, build_dashboard_payload, build_shadow_payload
 
 
 CFG = {
@@ -13,6 +13,20 @@ CFG = {
 
 
 class WatcherTests(unittest.TestCase):
+    def test_dashboard_websocket_frame_is_valid_text_frame(self):
+        frame = _websocket_text_frame({"type": "invalidate", "keys": ["portfolio"]})
+        self.assertEqual(frame[0], 0x81)
+        self.assertEqual(frame[1], len(frame) - 2)
+        self.assertIn(b"portfolio", frame)
+
+    def test_dashboard_change_signature_tracks_file_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "status.json"
+            before = _paths_signature([path])
+            path.write_text("{}", encoding="utf-8")
+            after = _paths_signature([path])
+            self.assertNotEqual(before, after)
+
     def test_dashboard_aggregates_and_returns_latest_first(self):
         with tempfile.TemporaryDirectory() as directory:
             log_path = Path(directory) / "orders.ndjson"

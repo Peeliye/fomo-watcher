@@ -1,6 +1,6 @@
 """In-process hourly 50Rank scheduler; safe across restarts via DB uniqueness."""
 from __future__ import annotations
-import logging, threading, time
+import logging, threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

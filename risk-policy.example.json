@@ -37,8 +37,8 @@
     "maximumSlippageBps": 150,
     "maximumQuoteAgeMs": 750,
     "maximumQuoteDivergenceBps": 100,
-    "minimumIndependentQuotes": 2,
-    "requireSimulation": true,
+    "minimumIndependentQuotes": 1,
+    "requireSimulation": false,
     "copyOriginalCalldata": false,
     "allowSkipPreflight": false,
     "parallelBroadcastProviders": 2

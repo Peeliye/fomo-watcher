@@ -27,6 +27,9 @@ class RouteQuote:
     price_impact_bps: Decimal
     simulation_passed: bool
     direct: bool = False
+    route_allowlisted: bool = True
+    scope_validated: bool = True
+    minimum_output_amount: Decimal = Decimal("0")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RouteQuote":
@@ -36,6 +39,9 @@ class RouteQuote:
             submit_p95_ms=_decimal(data.get("submitP95Ms")), quote_age_ms=_decimal(data.get("quoteAgeMs")),
             price_impact_bps=_decimal(data.get("priceImpactBps")),
             simulation_passed=bool(data.get("simulationPassed", False)), direct=bool(data.get("direct", False)),
+            route_allowlisted=bool(data.get("routeAllowlisted", False)),
+            scope_validated=bool(data.get("scopeValidated", False)),
+            minimum_output_amount=_decimal(data.get("minimumOutputAmount")),
         )
 
 
@@ -77,6 +83,10 @@ class FastRoutePlanner:
         maximum_impact = _decimal(self.policy.get("maximum_price_impact_bps", 100))
         sacrifice = _decimal(self.policy.get("maximum_output_sacrifice_bps", 30))
         minimum_routes = int(self.policy.get("minimum_independent_routes", 2))
+        require_simulation = bool(self.policy.get("require_simulation", True))
+        require_allowlisted_route = bool(self.policy.get("require_allowlisted_route", True))
+        require_scope_validation = bool(self.policy.get("require_scope_validation", True))
+        require_minimum_output = bool(self.policy.get("require_minimum_output", False))
         rejected: dict[str, tuple[str, ...]] = {}
         eligible: list[RouteQuote] = []
         for quote in quotes:
@@ -87,7 +97,10 @@ class FastRoutePlanner:
             if quote.quote_latency_ms > deadline: problems.append("quote_deadline_exceeded")
             if quote.quote_age_ms > maximum_age: problems.append("quote_stale")
             if quote.price_impact_bps > maximum_impact: problems.append("price_impact_too_high")
-            if not quote.simulation_passed: problems.append("simulation_required")
+            if require_simulation and not quote.simulation_passed: problems.append("simulation_required")
+            if require_allowlisted_route and not quote.route_allowlisted: problems.append("route_not_allowlisted")
+            if require_scope_validation and not quote.scope_validated: problems.append("transaction_scope_invalid")
+            if require_minimum_output and quote.minimum_output_amount <= 0: problems.append("minimum_output_required")
             if problems:
                 rejected[quote.provider or "unknown"] = tuple(problems)
             else:
@@ -138,6 +151,10 @@ def route_readiness(cfg: dict[str, Any]) -> dict[str, Any]:
         "quoteDeadlineMs": settings.get("quote_deadline_ms", {}),
         "minimumIndependentRoutes": int(settings.get("minimum_independent_routes", 2)),
         "maximumOutputSacrificeBps": int(settings.get("maximum_output_sacrifice_bps", 30)),
+        "requireSimulation": bool(settings.get("require_simulation", True)),
+        "requireAllowlistedRoute": bool(settings.get("require_allowlisted_route", True)),
+        "requireScopeValidation": bool(settings.get("require_scope_validation", True)),
+        "requireMinimumOutput": bool(settings.get("require_minimum_output", False)),
         "chains": chains,
         "note": "Provider adapters must be explicitly enabled after deployment; configuration alone never marks a route ready.",
     }
