@@ -134,8 +134,8 @@
     .identity-stat strong { display:block; margin-top:3px; font-size:18px; font-variant-numeric:tabular-nums; }
     .identity-backlog { min-width:0; padding:9px 12px; }
     .identity-backlog-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:7px; color:var(--muted); font-size:11px; }
-    .backlog-list { display:grid; grid-template-columns:1fr; gap:6px; min-width:0; max-height:138px; overflow-y:auto; padding-right:2px; scrollbar-width:thin; scrollbar-color:#30495d transparent; }
-    .backlog-item { display:grid; gap:3px; min-width:0; min-height:42px; padding:6px 8px; border:1px solid var(--line); border-radius:0; background:var(--surface); overflow:hidden; }
+    .backlog-list { display:flex; flex-wrap:nowrap; gap:6px; width:100%; min-width:0; max-width:100%; overflow-x:auto; overflow-y:hidden; padding:0 0 5px; scrollbar-width:thin; scrollbar-color:#30495d transparent; scroll-snap-type:x proximity; }
+    .backlog-item { display:grid; flex:0 0 260px; gap:3px; width:260px; max-width:260px; min-height:42px; padding:6px 8px; border:1px solid var(--line); border-radius:0; background:var(--surface); overflow:hidden; scroll-snap-align:start; }
     .backlog-item b { overflow:hidden; color:var(--text); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
     .backlog-meta { min-width:0; overflow:hidden; color:var(--muted); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
     .analysis-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-top:14px; }
@@ -380,7 +380,7 @@
       .analysis-card:last-child { grid-column:1/-1; }
       .identity-overview { grid-template-columns:repeat(4,1fr); }
       .identity-backlog { grid-column:1/-1; border-top:1px solid var(--line); }
-      .backlog-list { grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); max-height:none; overflow-y:visible; padding-right:0; }
+      .backlog-list { max-width:100%; overflow-x:auto; overflow-y:hidden; }
       .portfolio-metrics { grid-template-columns:repeat(3,1fr); }
       .exit-policy-form { grid-template-columns:repeat(3,minmax(120px,1fr)); }
       .portfolio-metric:nth-child(3) { border-right:0; }
@@ -869,7 +869,7 @@
       $('identity-pending').textContent=Number(identity.pending||0).toLocaleString();
       $('identity-inactive').textContent=`${Number(identity.expired||0)} / ${Number(identity.revoked||0)}`;
       $('identity-version').textContent='v'+Number(identity.registryVersion||1);
-      $('identity-backlog').innerHTML=(identity.backlog||[]).length?identity.backlog.slice(0,12).map(item=>{const meta=`${chainName(item.networkId)} · ${Number(item.events||0)} 次${item.symbols?.length?' · '+item.symbols.join('/'):''}`;return `<span class="backlog-item" title="${esc(meta)}"><b>@${esc(handleText(item.handle,'未知用户'))}</b><span class="backlog-meta">${esc(meta)}</span></span>`}).join(''):'<span class="backlog-meta">当前没有待登记对象</span>';
+      $('identity-backlog').innerHTML=(identity.backlog||[]).length?identity.backlog.slice(0,12).map(item=>{const handle=handleText(item.handle,'未知用户'),meta=`${chainName(item.networkId)} · ${Number(item.events||0)} 次${item.symbols?.length?' · '+item.symbols.join('/'):''}`,tip=`@${handle} · ${meta}`;return `<span class="backlog-item" title="${esc(tip)}"><b title="${esc('@'+handle)}">@${esc(handle)}</b><span class="backlog-meta" title="${esc(meta)}">${esc(meta)}</span></span>`}).join(''):'<span class="backlog-meta">当前没有待登记对象</span>';
     }
     function renderIntelligence(){
       const intel=state.intelligence||{};
@@ -887,14 +887,17 @@
         const visibleHandle=handleText(row.handle),profileUrl=`https://fomo.family/profile/${encodeURIComponent(visibleHandle==='—'?'':visibleHandle)}`;
         return `<tr><td><span class="kol-identity"><a class="kol-link" href="${esc(profileUrl)}" target="_blank" rel="noopener noreferrer" title="在 Fomo 打开 @${esc(visibleHandle)}">@${esc(visibleHandle)}<span class="outbound">↗</span></a>${walletMarkup}<span class="kol-chains">${esc(chains||'未知链')}</span></span></td><td><span class="badge ${row.evidenceStatus==='sufficient_behavior_sample'?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td>${esc(evidence)}</td><td class="num">${Number(row.buyEvents||0)} / ${Number(row.sellEvents||0)}</td><td class="num">${Number(row.distinctTokens||0)} / ${Number(row.activeDays||0)}</td><td class="num">${money(row.observedBuyUsd)}</td><td class="num">${money(row.averageBuyUsd)}</td><td class="num">${row.medianMarketCapUsd==null?'—':'$'+compact(row.medianMarketCapUsd)}</td><td class="num">${(Number(row.lowCapBuyRate||0)*100).toFixed(1)}%</td><td class="num">${Number(row.largeBuyEvents||0)}</td><td title="${esc(flags)}">${esc(flags||'无')}</td></tr>`;
       }).join('')||'<tr><td colspan="11" class="empty">暂无可画像的买入事件</td></tr>';
-      $('performance-note').textContent=`${Number(performance.verifiedFills||0).toLocaleString()} 笔链上成交 · ${Number(performance.marketObservations||0).toLocaleString()} 个行情观测`;
+      const verifiedFillCount=Number(performance.verifiedFills||0),marketObservationCount=Number(performance.marketObservations||0);
+      $('performance-note').textContent=verifiedFillCount||marketObservationCount
+        ?`${verifiedFillCount.toLocaleString()} 笔链上成交 · ${marketObservationCount.toLocaleString()} 个行情观测`
+        :'功能已启用 · 尚未导入链上成交与行情观测';
       $('performance-rows').innerHTML=(performance.profiles||[]).map(row=>{
         const wallet=String(row.wallet||'');
         const social=(row.socialIdentities||[]).map(item=>`${item.platform}: @${item.handle}`).join(' · ')||'未匹配';
         const status=row.performanceVerified?'已验证':row.historicallyVerified?'数据过期':'闭环不足';
         const ci=row.winRateConfidence95?` · ${(Number(row.winRateConfidence95[0])*100).toFixed(0)}–${(Number(row.winRateConfidence95[1])*100).toFixed(0)}%` : '';
         return `<tr><td><span class="token">@${esc(handleText(row.handle))}<span class="chain mono" title="${esc(wallet)}">${esc(wallet?wallet.slice(0,6)+'…'+wallet.slice(-4):'未登记')}</span></span></td><td><span class="badge ${row.performanceVerified?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td class="num">${row.winRate==null?'—':(Number(row.winRate)*100).toFixed(1)+'%'+ci}</td><td class="num ${pnlClass(row.roi)}">${row.roi==null?'—':(Number(row.roi)*100).toFixed(2)+'%'}</td><td class="num negative">${money(row.maxDrawdownUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${signedMoney(row.realizedPnlUsd)}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${signedMoney(row.unrealizedPnlUsd)}</td><td class="num">${Number(row.verifiedFills||0)} / ${Number(row.tokens||0)}</td><td class="num">${(Number(row.earlyEntryRate||0)*100).toFixed(1)}%</td><td class="num">${(Number(row.reboundEntryRate||0)*100).toFixed(1)}%</td><td>${esc(social)}</td><td><span class="badge ${row.performanceVerified?'good':''}">${status}</span><span class="chain">${esc(row.sampleConfidence||'low')} confidence</span></td></tr>`;
-      }).join('')||'<tr><td colspan="12" class="empty">没有满足交易哈希、成交估值和来源置信度要求的数据</td></tr>';
+      }).join('')||'<tr><td colspan="12" class="empty">功能已启用，但尚未导入标准化链上成交、历史行情与社交身份数据</td></tr>';
       bindCopy();
       $('visible').textContent=`${Number(intel.profiled||0)} 个观察画像 · ${Number(performance.verifiedProfiles||0)} 个真实业绩已验证`;
     }
