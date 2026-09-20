@@ -1,0 +1,22 @@
+[Unit]
+Description=FOMO watcher and local dashboard
+Wants=network-online.target fomo-realtime.service fomo-privy.service
+After=network-online.target fomo-realtime.service fomo-privy.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/fomo-watcher
+Environment=HOME=/home/ubuntu
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/fomo-watcher/.venv/bin/python /opt/fomo-watcher/run.py --config /opt/fomo-watcher/config.yaml
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

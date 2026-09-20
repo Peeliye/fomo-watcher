@@ -1,0 +1,21 @@
+[Unit]
+Description=FOMO Privy session keeper
+Wants=network-online.target
+After=network-online.target snapd.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/fomo-watcher/sidecar
+Environment=HOME=/home/ubuntu
+Environment=CHROME_PATH=/usr/bin/google-chrome-stable
+ExecStart=/usr/bin/npm run start:privy
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
