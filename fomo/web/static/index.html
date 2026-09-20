@@ -735,7 +735,7 @@
           </section>
           <section class="panel manager-card manager-table">
             <div class="rpc-test-actions"><button class="action primary-action" id="rpc-test-all" type="button">测试全部节点</button><span id="rpc-test-state" class="manager-message">每个节点测试 3 次，结果写入长期遥测</span><div class="rpc-policy" id="rpc-policy"></div></div>
-            <div class="table-wrap"><table class="rpc-network-table"><thead><tr><th>网络</th><th>主节点</th><th>备用 / 回退</th><th>主节点状态</th><th class="num">成功率</th><th class="num">P50 / P95</th><th class="num">区块落后</th><th>最近测试</th><th>操作</th></tr></thead><tbody id="rpc-manager-rows"><tr><td colspan="9" class="empty">正在载入 RPC 节点…</td></tr></tbody></table></div>
+            <div class="table-wrap"><table class="rpc-network-table"><thead><tr><th>网络</th><th>主节点</th><th>备用节点</th><th>主节点状态</th><th class="num">成功率</th><th class="num">P50 / P95</th><th class="num">区块落后</th><th>最近测试</th><th>操作</th></tr></thead><tbody id="rpc-manager-rows"><tr><td colspan="9" class="empty">正在载入 RPC 节点…</td></tr></tbody></table></div>
           </section>
         </div>
       </section>
@@ -1093,13 +1093,13 @@
       const labels={healthy:'交易级健康',slow:'连通但较慢',degraded:'连接不稳定',stale:'遥测过期',untested:'尚未测试',unconfigured:'未配置',disabled:'网络已禁用'};
       const statusText=row=>row?.status==='degraded'&&Number(row.successRate||0)===0?'连接失败':labels[row?.status]||row?.status||'未知';
       const tone=row=>row?.status==='healthy'?'rpc-tone-good':row?.status==='slow'?'rpc-tone-slow':row?.status==='degraded'?'rpc-tone-bad':'rpc-tone-off';
-      const tooltip=row=>{const rate=row.successRate==null?'无成功率':`${(Number(row.successRate)*100).toFixed(1)}% 成功率`,latency=row.p95LatencyMs==null?'无延迟数据':`P95 ${Number(row.p95LatencyMs).toFixed(0)} ms`;return `${row.role==='primary'?'主节点':row.role==='fallback'?'回退节点':'备用节点'} · ${row.provider} · ${statusText(row)} · ${rate} · ${latency}${row.wsConfigured?' · WSS 已配置':''}`};
+      const tooltip=row=>{const rate=row.successRate==null?'无成功率':`${(Number(row.successRate)*100).toFixed(1)}% 成功率`,latency=row.p95LatencyMs==null?'无延迟数据':`P95 ${Number(row.p95LatencyMs).toFixed(0)} ms`;return `${row.role==='primary'?'主节点':'备用节点'} · ${row.provider} · ${statusText(row)} · ${rate} · ${latency}${row.wsConfigured?' · WSS 已配置':''}`};
       const tower='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16M8 20h8M9.5 8.5 12 4l2.5 4.5M7.5 12a6 6 0 0 1 0-8M16.5 4a6 6 0 0 1 0 8"/></svg>';
       const shield='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 19 6v5c0 4.5-2.7 7.7-7 10-4.3-2.3-7-5.5-7-10V6l7-3Z"/></svg>';
       const groups=networks.map(network=>({network,rows:endpoints.filter(row=>String(row.chainId)===String(network.chainId))}));
       endpoints.filter(row=>!networks.some(network=>String(network.chainId)===String(row.chainId))).forEach(row=>{let group=groups.find(item=>String(item.network.chainId)===String(row.chainId));if(group)group.rows.push(row);else groups.push({network:{chainId:row.chainId,name:chainName(row.chainId),enabled:row.chainEnabled},rows:[row]})});
       stableRows('rpc-manager-rows',groups,item=>item.network.chainId,item=>{
-        const primary=item.rows.find(row=>row.role==='primary')||item.rows[0],backups=item.rows.filter(row=>row!==primary);
+        const primary=item.rows.find(row=>row.role==='primary')||item.rows[0],backups=item.rows.filter(row=>row!==primary).sort((a,b)=>Number(a.priority||999)-Number(b.priority||999)).slice(0,1);
         if(!primary)return `<tr><td><div class="rpc-chain-name"><span><b>${esc(item.network.name)}</b><small>${item.network.enabled?'已启用':'已禁用'}</small></span></div></td><td colspan="8" class="empty">该网络尚未配置节点</td></tr>`;
         const source=primary.httpSource==='environment'?'环境变量':primary.httpSource==='public'?'内置公开':'未配置';
         const primaryWss=primary.wsConfigured?`<i class="rpc-wss-dot ${tone(primary)}" title="WSS · ${esc(statusText(primary))}"></i>`:'';
