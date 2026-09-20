@@ -112,8 +112,7 @@ rpc_pool:
     "56": [{provider: quicknode, role: primary, http_env: RPC_BSC_URL, ws_env: RPC_BSC_WSS, priority: 10}, {provider: alchemy, role: backup, http_env: RPC_BSC_BACKUP_URL, ws_env: RPC_BSC_BACKUP_WSS, priority: 20}]
     "4663":
       - {provider: quicknode, role: primary, http_env: RPC_ROBINHOOD_URL, ws_env: RPC_ROBINHOOD_WSS, priority: 10}
-      - {provider: publicnode, role: backup, http_env: RPC_ROBINHOOD_BACKUP_URL, ws_env: RPC_ROBINHOOD_BACKUP_WSS, priority: 20}
-      - {provider: robinhood_official, role: fallback, http_env: RPC_ROBINHOOD_FALLBACK_URL, ws_env: RPC_ROBINHOOD_FALLBACK_WSS, priority: 30}
+      - {provider: robinhood_official, role: backup, http_env: RPC_ROBINHOOD_BACKUP_URL, ws_env: RPC_ROBINHOOD_BACKUP_WSS, priority: 20}
     "8453": [{provider: quicknode, role: primary, http_env: RPC_BASE_URL, ws_env: RPC_BASE_WSS, priority: 10}, {provider: alchemy, role: backup, http_env: RPC_BASE_BACKUP_URL, ws_env: RPC_BASE_BACKUP_WSS, priority: 20}]
     "1399811149": [{provider: helius, role: primary, http_env: RPC_SOLANA_URL, ws_env: RPC_SOLANA_WSS, priority: 10}, {provider: quicknode, role: backup, http_env: RPC_SOLANA_BACKUP_URL, ws_env: RPC_SOLANA_BACKUP_WSS, priority: 20}]
 
