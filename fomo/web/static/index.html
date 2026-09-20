@@ -115,6 +115,8 @@
     .wallet-chip:hover { color:#03120d; border-color:var(--green); background:var(--green); }
     .wallet-count { color:var(--muted); font-size:10px; }
     .wallet-empty { color:var(--amber); font-size:11px; white-space:nowrap; }
+    .wallet-associate { padding:3px 7px; border:1px solid rgb(245 158 11 / 45%); background:rgb(245 158 11 / 7%); cursor:pointer; font:inherit; }
+    .wallet-associate:hover,.wallet-associate:focus-visible { color:#111827; border-color:var(--amber); outline:0; background:var(--amber); }
     .badge { display:inline-flex; align-items:center; border-radius:0; padding:2px 7px; font-size:11px; white-space:nowrap; color:var(--amber); background:rgb(244 182 93 / 10%); border:1px solid rgb(244 182 93 / 20%); }
     .badge.good { color:var(--green); background:rgb(66 213 155 / 9%); border-color:rgb(66 213 155 / 22%); }
     .badge::before { content:""; width:5px; height:5px; border-radius:0; margin-right:5px; background:currentColor; }
@@ -135,9 +137,10 @@
     .identity-backlog { min-width:0; padding:9px 12px; }
     .identity-backlog-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:7px; color:var(--muted); font-size:11px; }
     .backlog-list { display:flex; flex-wrap:nowrap; gap:6px; width:100%; min-width:0; max-width:100%; overflow-x:auto; overflow-y:hidden; padding:0 0 5px; scrollbar-width:thin; scrollbar-color:#30495d transparent; scroll-snap-type:x proximity; }
-    .backlog-item { display:grid; flex:0 0 260px; gap:3px; width:260px; max-width:260px; min-height:42px; padding:6px 8px; border:1px solid var(--line); border-radius:0; background:var(--surface); overflow:hidden; scroll-snap-align:start; }
-    .backlog-item b { overflow:hidden; color:var(--text); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
-    .backlog-meta { min-width:0; overflow:hidden; color:var(--muted); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+    .backlog-item { display:flex; flex:0 0 320px; align-items:center; gap:9px; width:320px; max-width:320px; min-height:34px; padding:6px 8px; border:1px solid var(--line); border-radius:0; color:inherit; background:var(--surface); overflow:hidden; cursor:pointer; font:inherit; text-align:left; scroll-snap-align:start; }
+    .backlog-item:hover,.backlog-item:focus-visible { border-color:var(--cyan); outline:0; background:rgb(34 211 238 / 5%); }
+    .backlog-item b { flex:0 1 112px; min-width:54px; overflow:hidden; color:var(--text); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+    .backlog-meta { flex:1 1 auto; min-width:0; overflow:hidden; color:var(--muted); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
     .analysis-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-top:14px; }
     .analysis-card { min-height:250px; padding:16px; }
     .analysis-card h2 { margin:0 0 15px; font-size:13px; font-weight:650; }
@@ -794,9 +797,9 @@
     const matches=(row,status,chain,q)=>(status==='all'||(row.status||row.outcome)===status)&&(chain==='all'||String(row.networkId)===chain)&&(!q||`${row.handle} ${row.kolId} ${row.wallet} ${row.symbol} ${row.ca}`.toLowerCase().includes(q));
     function statusOptions(){
       const options=state.view==='signals'
-        ? [['all','全部结果'],['eligible','可进入报价'],['not_following','非关注用户'],['stale_signal','信号过期'],['unsupported_network','链未启用（历史）'],['unsupported_event_type','事件类型未启用']]
+        ? [['all','全部结果'],['eligible','已通过，等待询价'],['not_following','未跟踪用户'],['stale_signal','已过有效期'],['unsupported_network','网络未启用（历史）'],['unsupported_event_type','事件类型未启用']]
         : state.view==='risk'
-        ? [['all','全部判定'],['needs_identity','待身份登记'],['needs_data','待风控数据'],['rejected','已拒绝'],['approved_for_shadow','影子准入']]
+        ? [['all','全部判定'],['needs_identity','待关联钱包'],['needs_data','待补风控数据'],['rejected','风控拒绝'],['approved_for_shadow','影子模式通过']]
         : [['all','全部状态'],['accepted','成功买入'],['target_trade_too_small','目标金额过小'],['stale_signal','信号过期'],['unsupported_network','链未启用（历史）'],['unsupported_event_type','事件类型未启用'],['daily_limit_reached','每日限额'],['per_kol_daily_limit_reached','KOL 日限额'],['per_token_limit_reached','单币限额'],['maximum_open_positions_reached','持仓数上限'],['risk_limit_reached','触发风控限额']];
       const old=$('status').value;
       $('status').innerHTML=options.map(([value,label])=>`<option value="${value}">${label}</option>`).join('');
@@ -869,7 +872,7 @@
       $('identity-pending').textContent=Number(identity.pending||0).toLocaleString();
       $('identity-inactive').textContent=`${Number(identity.expired||0)} / ${Number(identity.revoked||0)}`;
       $('identity-version').textContent='v'+Number(identity.registryVersion||1);
-      $('identity-backlog').innerHTML=(identity.backlog||[]).length?identity.backlog.slice(0,12).map(item=>{const handle=handleText(item.handle,'未知用户'),meta=`${chainName(item.networkId)} · ${Number(item.events||0)} 次${item.symbols?.length?' · '+item.symbols.join('/'):''}`,tip=`@${handle} · ${meta}`;return `<span class="backlog-item" title="${esc(tip)}"><b title="${esc('@'+handle)}">@${esc(handle)}</b><span class="backlog-meta" title="${esc(meta)}">${esc(meta)}</span></span>`}).join(''):'<span class="backlog-meta">当前没有待登记对象</span>';
+      $('identity-backlog').innerHTML=(identity.backlog||[]).length?identity.backlog.slice(0,12).map(item=>{const handle=handleText(item.handle,'未知用户'),meta=`${chainName(item.networkId)} · ${Number(item.events||0)} 次${item.symbols?.length?' · '+item.symbols.join('/'):''}`,tip=`@${handle} · ${meta} · 点击关联钱包`;return `<button class="backlog-item" type="button" data-associate-wallet data-handle="${esc(handle)}" data-kol-id="${esc(item.kolId||'')}" data-chain-ids="${esc(String(item.networkId||''))}" title="${esc(tip)}"><b title="${esc('@'+handle)}">@${esc(handle)}</b><span class="backlog-meta" title="${esc(meta)}">${esc(meta)}</span></button>`}).join(''):'<span class="backlog-meta">当前没有待登记对象</span>';
     }
     function renderIntelligence(){
       const intel=state.intelligence||{};
@@ -883,7 +886,7 @@
         const chains=(row.chains||[]).map(chainName).join(' / ');
         const evidence=row.evidenceStatus==='sufficient_behavior_sample'?`充分 · ${Number(row.evidenceScore||0)}`:`不足 · ${Number(row.evidenceScore||0)}`;
         const wallets=(row.wallets||[]),wallet=wallets[0]?.address||'';
-        const walletMarkup=wallet?`<span class="wallet-stack"><button class="wallet-chip mono" type="button" data-copy="${esc(wallet)}" title="复制 ${esc(wallet)}">⧉ ${esc(wallet.slice(0,6)+'…'+wallet.slice(-4))}</button>${wallets.length>1?`<span class="wallet-count">+${wallets.length-1}</span>`:''}</span>`:'<span class="wallet-empty">未登记</span>';
+        const walletMarkup=wallet?`<span class="wallet-stack"><button class="wallet-chip mono" type="button" data-copy="${esc(wallet)}" title="复制 ${esc(wallet)}">⧉ ${esc(wallet.slice(0,6)+'…'+wallet.slice(-4))}</button>${wallets.length>1?`<span class="wallet-count">+${wallets.length-1}</span>`:''}</span>`:`<button class="wallet-empty wallet-associate" type="button" data-associate-wallet data-handle="${esc(handleText(row.handle,'未知用户'))}" data-kol-id="${esc(row.kolId||'')}" data-chain-ids="${esc((row.chains||[]).join(','))}" title="打开钱包管理并带入当前用户信息">关联钱包</button>`;
         const visibleHandle=handleText(row.handle),profileUrl=`https://fomo.family/profile/${encodeURIComponent(visibleHandle==='—'?'':visibleHandle)}`;
         return `<tr><td><span class="kol-identity"><a class="kol-link" href="${esc(profileUrl)}" target="_blank" rel="noopener noreferrer" title="在 Fomo 打开 @${esc(visibleHandle)}">@${esc(visibleHandle)}<span class="outbound">↗</span></a>${walletMarkup}<span class="kol-chains">${esc(chains||'未知链')}</span></span></td><td><span class="badge ${row.evidenceStatus==='sufficient_behavior_sample'?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td>${esc(evidence)}</td><td class="num">${Number(row.buyEvents||0)} / ${Number(row.sellEvents||0)}</td><td class="num">${Number(row.distinctTokens||0)} / ${Number(row.activeDays||0)}</td><td class="num">${money(row.observedBuyUsd)}</td><td class="num">${money(row.averageBuyUsd)}</td><td class="num">${row.medianMarketCapUsd==null?'—':'$'+compact(row.medianMarketCapUsd)}</td><td class="num">${(Number(row.lowCapBuyRate||0)*100).toFixed(1)}%</td><td class="num">${Number(row.largeBuyEvents||0)}</td><td title="${esc(flags)}">${esc(flags||'无')}</td></tr>`;
       }).join('')||'<tr><td colspan="11" class="empty">暂无可画像的买入事件</td></tr>';
@@ -1020,6 +1023,15 @@
       $('kol-entry-id').value=entry.entryId;$('kol-handle').value=entry.handle;$('kol-id').value=entry.kolId;$('kol-address').value=entry.address;$('kol-confidence').value=entry.confidence;$('kol-status').value=entry.status;
       const family=String(entry.chainIds?.[0])==='1399811149'?'solana':'evm';$('kol-family').value=family;renderChainChecks('kol-chains',family,entry.chainIds||[]);
       const evidence=entry.evidence?.[0]||{};$('kol-evidence-type').value=evidence.type||'user-attestation';$('kol-evidence-reference').value=evidence.reference||'';$('kol-expires').value=localDateTime(entry.expiresAt);$('kol-handle').focus();
+    }
+    function beginKolAssociation(button){
+      const handle=handleText(button.dataset.handle,'未知用户'),rawKolId=String(button.dataset.kolId||''),kolId=rawKolId.startsWith('handle:')?'':rawKolId;
+      const sourceChains=String(button.dataset.chainIds||'').split(',').map(x=>x.trim()).filter(Boolean),family=sourceChains.includes('1399811149')?'solana':'evm';
+      const allowed=new Set(managementChains[family].map(([id])=>id)),chainIds=sourceChains.filter(id=>allowed.has(id));
+      setView('wallets');resetKolForm();$('kol-handle').value=handle;$('kol-id').value=kolId;$('kol-family').value=family;renderChainChecks('kol-chains',family,chainIds);
+      $('kol-evidence-type').value='fomoscan';$('kol-evidence-reference').value=`https://fomo.family/profile/${encodeURIComponent(handle)}`;
+      managerMessage('kol-message',kolId?'已带入用户与链，请填写公开钱包地址后保存':'已带入用户与链；该记录缺少平台 kolId，请一并补充',Boolean(kolId));
+      $('kol-address').focus();$('kol-wallet-form').scrollIntoView({behavior:'smooth',block:'start'});
     }
     function editWatch(wallet){
       $('watch-id').value=wallet.id;$('watch-name').value=wallet.name;$('watch-address').value=wallet.address;$('watch-tags').value=(wallet.tags||[]).join(', ');$('watch-status').value=wallet.status;
@@ -1207,6 +1219,7 @@
     $('kol-family').addEventListener('change',()=>renderChainChecks('kol-chains',$('kol-family').value));
     $('watch-family').addEventListener('change',()=>renderChainChecks('watch-chains',$('watch-family').value));
     $('kol-reset').addEventListener('click',resetKolForm);$('watch-reset').addEventListener('click',resetWatchForm);
+    document.addEventListener('click',event=>{const button=event.target.closest('[data-associate-wallet]');if(button)beginKolAssociation(button)});
     $('kol-wallet-form').addEventListener('submit',async event=>{
       event.preventDefault();
       try{
