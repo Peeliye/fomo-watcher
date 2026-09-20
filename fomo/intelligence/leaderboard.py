@@ -32,9 +32,9 @@ class LeaderboardArchive:
         self.database,self.archive_dir=Path(database),Path(archive_dir); self.timezone=ZoneInfo(timezone_name)
         self.readonly=readonly
         if readonly:
-            # immutable avoids creating or touching -wal/-shm during HTTP GETs.
-            # Writers are short-lived and checkpoint on close before GET opens.
-            self.db=sqlite3.connect(f"file:{self.database.as_posix()}?mode=ro&immutable=1",uri=True,timeout=5)
+            # A normal read-only connection participates in WAL visibility;
+            # immutable=1 would silently ignore newly committed WAL frames.
+            self.db=sqlite3.connect(f"file:{self.database.as_posix()}?mode=ro",uri=True,timeout=5)
             self.db.row_factory=sqlite3.Row;self.db.execute("PRAGMA query_only=ON")
             return
         self.database.parent.mkdir(parents=True,exist_ok=True); self.archive_dir.mkdir(parents=True,exist_ok=True)

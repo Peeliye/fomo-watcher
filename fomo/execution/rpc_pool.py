@@ -17,10 +17,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
+from urllib.parse import urlparse
 
 from curl_cffi import requests as cf
+from curl_cffi.const import CurlOpt
 
 from .networks import enabled_chain_ids
+from .url_safety import UnsafeEndpointError, validate_endpoint_url
 
 
 @dataclass(frozen=True)
@@ -112,15 +115,36 @@ def probe_rpc_endpoint(endpoint: RpcEndpoint, timeout_seconds: float = 2.0) -> d
     method = "getSlot" if endpoint.chain_id == "1399811149" else "eth_blockNumber"
     started = time.perf_counter()
     try:
+        url, first_addresses = validate_endpoint_url(url)
+        _, second_addresses = validate_endpoint_url(url)
+        if first_addresses != second_addresses:
+            return {"success": False, "latency_ms": None, "block_height": None,
+                    "error_code": "dns_rebinding_rejected"}
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        host = str(parsed.hostname)
+        resolve = [f"{host}:{port}:{'[' + address + ']' if ':' in address else address}"
+                   for address in sorted(second_addresses)]
         response = cf.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": []},
-                           headers={"Accept": "application/json"}, timeout=timeout_seconds, impersonate="chrome")
+                           headers={"Accept": "application/json"}, timeout=timeout_seconds,
+                           impersonate="chrome", allow_redirects=False, proxy="",
+                           curl_options={CurlOpt.RESOLVE: resolve, CurlOpt.PROXY: ""})
         latency_ms = (time.perf_counter() - started) * 1000
+        if response.primary_ip and response.primary_ip not in second_addresses:
+            return {"success": False, "latency_ms": latency_ms, "block_height": None,
+                    "error_code": "connected_address_mismatch"}
+        if 300 <= response.status_code < 400:
+            return {"success": False, "latency_ms": latency_ms, "block_height": None,
+                    "error_code": "redirect_rejected"}
         if response.status_code >= 400:
             return {"success": False, "latency_ms": latency_ms, "block_height": None,
                     "error_code": f"http_{response.status_code}"}
         result = response.json().get("result")
         height = int(result, 16) if isinstance(result, str) and result.startswith("0x") else int(result)
         return {"success": True, "latency_ms": latency_ms, "block_height": height, "error_code": None}
+    except UnsafeEndpointError as error:
+        return {"success": False, "latency_ms": (time.perf_counter() - started) * 1000,
+                "block_height": None, "error_code": str(error)}
     except (OSError, ValueError, TypeError, json.JSONDecodeError, cf.RequestsError) as error:
         return {"success": False, "latency_ms": (time.perf_counter() - started) * 1000,
                 "block_height": None, "error_code": type(error).__name__}
@@ -153,26 +177,40 @@ def run_rpc_probe_endpoints(
     database = Path(str(settings.get("database", "data/rpc-health.sqlite3")))
     if not database.is_absolute():
         database = project_dir / database
-    store = RpcHealthStore(database)
+    max_samples = max(100, int(settings.get("max_samples_per_endpoint", 5000)))
+    store = RpcHealthStore(database, max_samples_per_endpoint=max_samples)
     try:
         if endpoints:
+            batch: list[tuple[RpcEndpoint, dict[str, Any]]] = []
             with ThreadPoolExecutor(max_workers=min(12, len(endpoints))) as executor:
                 for _ in range(max(1, min(int(samples), 20))):
                     jobs = [(endpoint, executor.submit(probe_rpc_endpoint, endpoint, max(0.2, timeout_seconds))) for endpoint in endpoints]
                     for endpoint, future in jobs:
                         method = "getSlot" if endpoint.chain_id == "1399811149" else "eth_blockNumber"
-                        store.record(endpoint, method=method, **future.result())
+                        batch.append((endpoint, {"method": method, **future.result()}))
+            store.record_many(batch)
         return store.snapshot(cfg)
     finally:
         store.close()
 
 
 class RpcHealthStore:
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, max_samples_per_endpoint: int = 5000) -> None:
         self.path = Path(database)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existed = self.path.exists() and self.path.stat().st_size > 0
         self.connection = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+        if existed and version < 2:
+            backup_dir = self.path.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            target = sqlite3.connect(backup_dir / f"{self.path.stem}.pre-v2.from-v{version}.{stamp}.sqlite3")
+            try:
+                self.connection.backup(target)
+            finally:
+                target.close()
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
         self.connection.executescript("""
@@ -191,9 +229,12 @@ class RpcHealthStore:
             );
             CREATE INDEX IF NOT EXISTS idx_rpc_samples_endpoint_time
                 ON rpc_samples(endpoint_id, sampled_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_rpc_samples_endpoint_id
+                ON rpc_samples(endpoint_id, id DESC);
         """)
+        self.connection.execute("PRAGMA user_version=2")
         self.connection.commit()
-        self._records_since_prune = 0
+        self.max_samples_per_endpoint = max(100, int(max_samples_per_endpoint))
 
     def close(self) -> None:
         self.connection.close()
@@ -209,25 +250,83 @@ class RpcHealthStore:
         error_code: str | None = None,
         sampled_at: str | None = None,
     ) -> None:
-        timestamp = sampled_at or datetime.now(timezone.utc).isoformat()
-        self.connection.execute(
-            """INSERT INTO rpc_samples
-               (endpoint_id, chain_id, provider, role, sampled_at, method,
-                latency_ms, success, block_height, error_code)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (endpoint.endpoint_id, endpoint.chain_id, endpoint.provider, endpoint.role,
-             timestamp, method, latency_ms, int(success), block_height, error_code),
-        )
-        self.connection.commit()
-        self._records_since_prune += 1
-        if self._records_since_prune >= 100:
-            self.connection.execute(
-                """DELETE FROM rpc_samples WHERE endpoint_id=? AND id NOT IN
-                   (SELECT id FROM rpc_samples WHERE endpoint_id=? ORDER BY id DESC LIMIT 5000)""",
-                (endpoint.endpoint_id, endpoint.endpoint_id),
+        self.record_many([(
+            endpoint,
+            {
+                "method": method,
+                "latency_ms": latency_ms,
+                "success": success,
+                "block_height": block_height,
+                "error_code": error_code,
+                "sampled_at": sampled_at,
+            },
+        )])
+
+    def record_many(self, samples: list[tuple[RpcEndpoint, dict[str, Any]]]) -> None:
+        if not samples:
+            return
+        endpoint_ids = sorted({endpoint.endpoint_id for endpoint, _ in samples})
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.executemany(
+                """INSERT INTO rpc_samples
+                   (endpoint_id, chain_id, provider, role, sampled_at, method,
+                    latency_ms, success, block_height, error_code)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        endpoint.endpoint_id,
+                        endpoint.chain_id,
+                        endpoint.provider,
+                        endpoint.role,
+                        values.get("sampled_at") or datetime.now(timezone.utc).isoformat(),
+                        values["method"],
+                        values.get("latency_ms"),
+                        int(bool(values.get("success"))),
+                        values.get("block_height"),
+                        values.get("error_code"),
+                    )
+                    for endpoint, values in samples
+                ],
             )
+            self._prune_locked(endpoint_ids, self.max_samples_per_endpoint)
             self.connection.commit()
-            self._records_since_prune = 0
+        except BaseException:
+            self.connection.rollback()
+            raise
+
+    def _prune_locked(self, endpoint_ids: list[str] | None, maximum: int) -> int:
+        if endpoint_ids:
+            placeholders = ",".join("?" for _ in endpoint_ids)
+            sql = f"""DELETE FROM rpc_samples WHERE id IN (
+                SELECT id FROM (
+                  SELECT id,ROW_NUMBER() OVER(PARTITION BY endpoint_id ORDER BY id DESC) AS row_num
+                  FROM rpc_samples WHERE endpoint_id IN ({placeholders})
+                ) WHERE row_num>?
+            )"""
+            cursor = self.connection.execute(sql, (*endpoint_ids, maximum))
+        else:
+            cursor = self.connection.execute(
+                """DELETE FROM rpc_samples WHERE id IN (
+                     SELECT id FROM (
+                       SELECT id,ROW_NUMBER() OVER(PARTITION BY endpoint_id ORDER BY id DESC) AS row_num
+                       FROM rpc_samples
+                     ) WHERE row_num>?
+                   )""",
+                (maximum,),
+            )
+        return cursor.rowcount
+
+    def prune(self, maximum: int | None = None) -> int:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            deleted = self._prune_locked(None, max(100, int(maximum or self.max_samples_per_endpoint)))
+            self.connection.commit()
+            self.connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            return deleted
+        except BaseException:
+            self.connection.rollback()
+            raise
 
     def snapshot(self, cfg: dict[str, Any]) -> dict[str, Any]:
         pool_cfg = cfg.get("rpc_pool", {}) if isinstance(cfg.get("rpc_pool", {}), dict) else {}

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import ipaddress
-import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +10,7 @@ from urllib.parse import urlparse
 
 from ..execution.rpc_pool import load_rpc_endpoints, rpc_health_snapshot, run_rpc_probe_endpoints
 from ..execution.networks import enabled_chain_ids, network_snapshot, save_enabled_chain_ids
+from ..execution.url_safety import UnsafeEndpointError, validate_endpoint_url
 
 
 class RpcManagementError(ValueError):
@@ -23,38 +22,10 @@ def _now() -> str:
 
 
 def _safe_url(value: Any, websocket: bool = False) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if any(character in text for character in ("\r", "\n", "\x00")):
-        raise RpcManagementError("RPC URL 含有非法控制字符")
-    parsed = urlparse(text)
-    allowed = {"ws", "wss"} if websocket else {"http", "https"}
-    if parsed.scheme.lower() not in allowed or not parsed.hostname:
-        kind = "WebSocket" if websocket else "HTTP"
-        raise RpcManagementError(f"{kind} RPC URL 格式无效")
-    if parsed.username or parsed.password:
-        raise RpcManagementError("RPC URL 不能包含 username:password 形式的凭据")
-    if len(text) > 2048:
-        raise RpcManagementError("RPC URL 过长")
-    hostname = str(parsed.hostname or "").rstrip(".").casefold()
-    if hostname in {"localhost", "metadata", "metadata.google.internal"} or hostname.endswith((".localhost", ".local", ".internal")):
-        raise RpcManagementError("RPC URL 不得访问本机、内网或云 metadata")
-    addresses: set[str] = set()
     try:
-        addresses.add(str(ipaddress.ip_address(hostname)))
-    except ValueError:
-        try:
-            addresses.update(str(item[4][0]) for item in socket.getaddrinfo(
-                hostname, parsed.port or 443, type=socket.SOCK_STREAM
-            ))
-        except socket.gaierror:
-            pass
-    for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if not ip.is_global or ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            raise RpcManagementError("RPC URL 不得访问本机、内网或云 metadata")
-    return text
+        return validate_endpoint_url(value, websocket=websocket)[0]
+    except UnsafeEndpointError as exc:
+        raise RpcManagementError("RPC URL 无法安全解析或指向受限网络") from exc
 
 
 def _masked_host(value: str) -> str:

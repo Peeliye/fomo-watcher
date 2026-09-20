@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -103,6 +104,20 @@ class ExecutionJournal:
     def close(self) -> None:
         self.db.close()
 
+    @contextmanager
+    def _transaction(self):
+        """Leave the reusable connection clean after every write attempt."""
+        if self.db.in_transaction:
+            self.db.rollback()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.db.rollback()
+            raise
+        else:
+            self.db.commit()
+
     def record_risk_decision(self, event: Any, decision: dict[str, Any] | None) -> dict[str, Any] | None:
         if not decision:
             return None
@@ -117,21 +132,23 @@ class ExecutionJournal:
             else "blocked"
         )
         now = datetime.now(timezone.utc).isoformat()
-        inserted = self.db.execute(
-            """INSERT OR IGNORE INTO execution_intents VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (intent_id, signal_id, str(event.id), now, now, self.account_id,
-             str(getattr(event, "user_id", "") or ""), str(event.handle or ""), int(event.network_id or 0),
-             str(event.ca or ""), str(event.symbol or "UNKNOWN"), "sell" if event.kind in {"sell", "clear"} else str(event.kind),
-             _micros(event.amount_usd), state, outcome, json.dumps(blockers, ensure_ascii=False), 1),
-        )
-        if inserted.rowcount:
-            self.db.execute(
-                "INSERT INTO execution_transitions(intent_id,from_state,to_state,reason,recorded_at,metadata_json) VALUES(?,?,?,?,?,?)",
-                (intent_id, None, state, blockers[0] if blockers else outcome, now,
-                 json.dumps({"policyVersion": decision.get("policyVersion"), "registryVersion": decision.get("registryVersion"), "phase": phase}, separators=(",", ":"))),
+        inserted_count = 0
+        with self._transaction():
+            inserted = self.db.execute(
+                """INSERT OR IGNORE INTO execution_intents VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (intent_id, signal_id, str(event.id), now, now, self.account_id,
+                 str(getattr(event, "user_id", "") or ""), str(event.handle or ""), int(event.network_id or 0),
+                 str(event.ca or ""), str(event.symbol or "UNKNOWN"), "sell" if event.kind in {"sell", "clear"} else str(event.kind),
+                 _micros(event.amount_usd), state, outcome, json.dumps(blockers, ensure_ascii=False), 1),
             )
-            self.db.commit()
-        return {"intentId": intent_id, "state": state, "duplicate": inserted.rowcount == 0}
+            inserted_count = inserted.rowcount
+            if inserted_count:
+                self.db.execute(
+                    "INSERT INTO execution_transitions(intent_id,from_state,to_state,reason,recorded_at,metadata_json) VALUES(?,?,?,?,?,?)",
+                    (intent_id, None, state, blockers[0] if blockers else outcome, now,
+                     json.dumps({"policyVersion": decision.get("policyVersion"), "registryVersion": decision.get("registryVersion"), "phase": phase}, separators=(",", ":"))),
+                )
+        return {"intentId": intent_id, "state": state, "duplicate": inserted_count == 0}
 
     def record_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Persist a verified chain receipt and reconcile its execution intent.
@@ -145,42 +162,44 @@ class ExecutionJournal:
         status = str(receipt.get("status") or "").lower()
         if not tx_hash or not intent_id or status not in {"confirmed", "failed"}:
             raise ValueError("receipt requires txHash, intentId and confirmed/failed status")
-        intent = self.db.execute(
-            "SELECT state,chain_id FROM execution_intents WHERE intent_id=?", (intent_id,)
-        ).fetchone()
-        if intent is None:
-            raise ValueError("receipt intent does not exist")
         chain_id = int(receipt.get("chainId") or 0)
-        if chain_id != int(intent["chain_id"]):
-            raise ValueError("receipt chain does not match intent")
-        existing = self.db.execute(
-            "SELECT intent_id,chain_id,status FROM execution_receipts WHERE tx_hash=?", (tx_hash,)
-        ).fetchone()
-        if existing is not None and (
-            existing["intent_id"] != intent_id or int(existing["chain_id"]) != chain_id or existing["status"] != status
-        ):
-            raise ValueError("conflicting receipt already exists for txHash")
         now = datetime.now(timezone.utc).isoformat()
-        inserted = self.db.execute(
-            """INSERT OR IGNORE INTO execution_receipts
-               (tx_hash,intent_id,chain_id,status,block_number,actual_usd_micros,fee_usd_micros,recorded_at,raw_reference)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
-            (tx_hash, intent_id, chain_id, status, receipt.get("blockNumber"),
-             _micros(receipt.get("actualUsd")), _micros(receipt.get("feeUsd")), now,
-             str(receipt.get("rawReference") or "") or None),
-        )
-        if inserted.rowcount:
-            target_state = "confirmed" if status == "confirmed" else "failed"
-            self.db.execute(
-                "UPDATE execution_intents SET state=?,updated_at=? WHERE intent_id=?", (target_state, now, intent_id)
+        inserted_count = 0
+        with self._transaction():
+            intent = self.db.execute(
+                "SELECT state,chain_id FROM execution_intents WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if intent is None:
+                raise ValueError("receipt intent does not exist")
+            if chain_id != int(intent["chain_id"]):
+                raise ValueError("receipt chain does not match intent")
+            existing = self.db.execute(
+                "SELECT intent_id,chain_id,status FROM execution_receipts WHERE tx_hash=?", (tx_hash,)
+            ).fetchone()
+            if existing is not None and (
+                existing["intent_id"] != intent_id or int(existing["chain_id"]) != chain_id or existing["status"] != status
+            ):
+                raise ValueError("conflicting receipt already exists for txHash")
+            inserted = self.db.execute(
+                """INSERT OR IGNORE INTO execution_receipts
+                   (tx_hash,intent_id,chain_id,status,block_number,actual_usd_micros,fee_usd_micros,recorded_at,raw_reference)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (tx_hash, intent_id, chain_id, status, receipt.get("blockNumber"),
+                 _micros(receipt.get("actualUsd")), _micros(receipt.get("feeUsd")), now,
+                 str(receipt.get("rawReference") or "") or None),
             )
-            self.db.execute(
-                "INSERT INTO execution_transitions(intent_id,from_state,to_state,reason,recorded_at,metadata_json) VALUES(?,?,?,?,?,?)",
-                (intent_id, intent["state"], target_state, f"receipt_{status}", now,
-                 json.dumps({"txHash": tx_hash, "blockNumber": receipt.get("blockNumber")}, separators=(",", ":"))),
-            )
-            self.db.commit()
-        return {"txHash": tx_hash, "intentId": intent_id, "status": status, "duplicate": inserted.rowcount == 0}
+            inserted_count = inserted.rowcount
+            if inserted_count:
+                target_state = "confirmed" if status == "confirmed" else "failed"
+                self.db.execute(
+                    "UPDATE execution_intents SET state=?,updated_at=? WHERE intent_id=?", (target_state, now, intent_id)
+                )
+                self.db.execute(
+                    "INSERT INTO execution_transitions(intent_id,from_state,to_state,reason,recorded_at,metadata_json) VALUES(?,?,?,?,?,?)",
+                    (intent_id, intent["state"], target_state, f"receipt_{status}", now,
+                     json.dumps({"txHash": tx_hash, "blockNumber": receipt.get("blockNumber")}, separators=(",", ":"))),
+                )
+        return {"txHash": tx_hash, "intentId": intent_id, "status": status, "duplicate": inserted_count == 0}
 
 
 def reconciliation_snapshot(path: str | Path, limit: int = 100) -> dict[str, Any]:

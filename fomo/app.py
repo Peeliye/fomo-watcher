@@ -31,7 +31,7 @@ from curl_cffi import requests as cf
 from fomo.execution.journal import ExecutionJournal
 from fomo.execution.fast_path import evaluate_copy_buy
 from fomo.execution.networks import apply_network_settings
-from fomo.audit import append_ndjson
+from fomo.audit import enqueue_ndjson
 from fomo.intelligence.profile import WalletIntelligenceStore
 from fomo.intelligence.leaderboard_scheduler import LeaderboardScheduler
 from fomo.monitoring import BackgroundMonitors
@@ -185,11 +185,11 @@ class State:
         self.db = sqlite3.connect(db_path, timeout=5)
         self.db.row_factory = sqlite3.Row
         version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
-        if existed and version < 3:
+        if existed and version < 5:
             backup_dir = db_path.parent / "backups"
             backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            target = sqlite3.connect(backup_dir / f"{db_path.stem}.pre-v3.from-v{version}.{stamp}.sqlite3")
+            target = sqlite3.connect(backup_dir / f"{db_path.stem}.pre-v5.from-v{version}.{stamp}.sqlite3")
             try:
                 self.db.backup(target)
             finally:
@@ -197,6 +197,7 @@ class State:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS sent (id TEXT PRIMARY KEY, at INTEGER NOT NULL)")
         self.db.executescript("""
@@ -204,6 +205,7 @@ class State:
           event_id TEXT PRIMARY KEY,
           source TEXT NOT NULL,
           source_path TEXT,
+          source_generation INTEGER NOT NULL DEFAULT 0,
           start_offset INTEGER,
           end_offset INTEGER,
           event_json TEXT NOT NULL,
@@ -220,11 +222,14 @@ class State:
           ON event_inbox(source_path,start_offset,end_offset);
         CREATE TABLE IF NOT EXISTS sidecar_records (
           source_path TEXT NOT NULL,
+          generation INTEGER NOT NULL DEFAULT 0,
           start_offset INTEGER NOT NULL,
           end_offset INTEGER NOT NULL,
           event_id TEXT,
           status TEXT NOT NULL,
-          PRIMARY KEY(source_path,start_offset)
+          created_at REAL NOT NULL DEFAULT 0,
+          completed_at REAL,
+          PRIMARY KEY(source_path,generation,start_offset)
         );
         CREATE TABLE IF NOT EXISTS notification_outbox (
           event_id TEXT NOT NULL,
@@ -247,13 +252,58 @@ class State:
           attempts INTEGER NOT NULL DEFAULT 0,
           next_attempt_at REAL NOT NULL DEFAULT 0,
           last_error TEXT,
+          failed_step TEXT,
           created_at REAL NOT NULL,
           completed_at REAL
         );
         CREATE INDEX IF NOT EXISTS idx_post_trade_outbox_pending
           ON post_trade_outbox(status,next_attempt_at,created_at);
+        CREATE TABLE IF NOT EXISTS post_trade_steps (
+          event_id TEXT NOT NULL,
+          step TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          payload_json TEXT,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          completed_at REAL,
+          PRIMARY KEY(event_id,step),
+          FOREIGN KEY(event_id) REFERENCES post_trade_outbox(event_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_post_trade_steps_status
+          ON post_trade_steps(status,event_id,step);
+        CREATE TABLE IF NOT EXISTS risk_decisions (
+          event_id TEXT PRIMARY KEY,
+          decision_id TEXT NOT NULL UNIQUE,
+          recorded_at REAL NOT NULL,
+          record_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_risk_decisions_time
+          ON risk_decisions(recorded_at DESC,event_id);
         """)
-        self.db.execute("PRAGMA user_version=3")
+        columns = {str(row[1]) for row in self.db.execute("PRAGMA table_info(post_trade_outbox)")}
+        if "failed_step" not in columns:
+            self.db.execute("ALTER TABLE post_trade_outbox ADD COLUMN failed_step TEXT")
+        inbox_columns = {str(row[1]) for row in self.db.execute("PRAGMA table_info(event_inbox)")}
+        if "source_generation" not in inbox_columns:
+            self.db.execute("ALTER TABLE event_inbox ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0")
+        sidecar_columns = {str(row[1]) for row in self.db.execute("PRAGMA table_info(sidecar_records)")}
+        if "generation" not in sidecar_columns:
+            self.db.executescript("""
+            ALTER TABLE sidecar_records RENAME TO sidecar_records_legacy;
+            CREATE TABLE sidecar_records (
+              source_path TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 0,
+              start_offset INTEGER NOT NULL,end_offset INTEGER NOT NULL,event_id TEXT,
+              status TEXT NOT NULL,created_at REAL NOT NULL DEFAULT 0,completed_at REAL,
+              PRIMARY KEY(source_path,generation,start_offset)
+            );
+            INSERT INTO sidecar_records
+              (source_path,generation,start_offset,end_offset,event_id,status,created_at,completed_at)
+              SELECT source_path,0,start_offset,end_offset,event_id,status,0,
+                     CASE WHEN status='done' THEN 0 ELSE NULL END
+              FROM sidecar_records_legacy;
+            DROP TABLE sidecar_records_legacy;
+            """)
+        self.db.execute("PRAGMA user_version=5")
         self.db.commit()
 
     def load(self, key: str, default: Any) -> Any:
@@ -292,49 +342,55 @@ class State:
         with self.db:
             cursor = self.db.execute(
                 """INSERT OR IGNORE INTO event_inbox
-                   (event_id,source,source_path,start_offset,end_offset,event_json,created_at)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (event.id, source, source_path, start_offset, end_offset, payload, time.time()),
+                   (event_id,source,source_path,source_generation,start_offset,end_offset,event_json,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (event.id, source, source_path, 0, start_offset, end_offset, payload, time.time()),
             )
         return cursor.rowcount == 1
 
-    def enqueue_sidecar_line(self, path: str, start: int, end: int, events: list["Event"]) -> None:
+    def enqueue_sidecar_line(
+        self, path: str, generation: int, start: int, end: int, events: list["Event"]
+    ) -> None:
         now = time.time()
         with self.db:
             if not events:
                 self.db.execute(
-                    "INSERT OR IGNORE INTO sidecar_records VALUES(?,?,?,?, 'done')",
-                    (path, start, end, None),
+                    """INSERT OR IGNORE INTO sidecar_records
+                       (source_path,generation,start_offset,end_offset,event_id,status,created_at,completed_at)
+                       VALUES(?,?,?,?,?,'done',?,?)""",
+                    (path, generation, start, end, None, now, now),
                 )
             for event in events:
                 payload = json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
                 self.db.execute(
                     """INSERT OR IGNORE INTO event_inbox
-                       (event_id,source,source_path,start_offset,end_offset,event_json,created_at)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (event.id, "sidecar", path, start, end, payload, now),
+                       (event_id,source,source_path,source_generation,start_offset,end_offset,event_json,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (event.id, "sidecar", path, generation, start, end, payload, now),
                 )
                 existing = self.db.execute(
                     "SELECT status FROM event_inbox WHERE event_id=?", (event.id,)
                 ).fetchone()
                 line_status = "done" if existing and existing[0] == "done" else "pending"
                 self.db.execute(
-                    "INSERT OR IGNORE INTO sidecar_records VALUES(?,?,?,?,?)",
-                    (path, start, end, event.id, line_status),
+                    """INSERT OR IGNORE INTO sidecar_records
+                       (source_path,generation,start_offset,end_offset,event_id,status,created_at,completed_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (path, generation, start, end, event.id, line_status, now, now if line_status == "done" else None),
                 )
             self.db.execute(
                 "INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)",
-                (f"sidecar_scan_offset:{path}", json.dumps(end)),
+                (f"sidecar_scan_offset:{path}:{generation}", json.dumps(end)),
             )
-        self._advance_sidecar_offset(path)
+        self._advance_sidecar_offset(path, generation)
 
-    def _advance_sidecar_offset(self, path: str) -> None:
-        committed = int(self.load(f"sidecar_offset:{path}", 0))
+    def _advance_sidecar_offset(self, path: str, generation: int) -> None:
+        committed = int(self.load(f"sidecar_offset:{path}:{generation}", 0))
         while True:
             row = self.db.execute(
                 """SELECT end_offset,status FROM sidecar_records
-                   WHERE source_path=? AND start_offset=?""",
-                (path, committed),
+                   WHERE source_path=? AND generation=? AND start_offset=?""",
+                (path, generation, committed),
             ).fetchone()
             if not row or row[1] != "done":
                 break
@@ -342,7 +398,7 @@ class State:
         with self.db:
             self.db.execute(
                 "INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)",
-                (f"sidecar_offset:{path}", json.dumps(committed)),
+                (f"sidecar_offset:{path}:{generation}", json.dumps(committed)),
             )
             self.db.execute(
                 "INSERT OR REPLACE INTO kv(k,v) VALUES('sidecar_offset',?)", (json.dumps(committed),)
@@ -364,16 +420,17 @@ class State:
                 (now, event_id),
             )
             row = self.db.execute(
-                "SELECT source_path FROM event_inbox WHERE event_id=?", (event_id,)
+                "SELECT source_path,source_generation FROM event_inbox WHERE event_id=?", (event_id,)
             ).fetchone()
             if row and row[0]:
                 path = str(row[0])
                 self.db.execute(
-                    "UPDATE sidecar_records SET status='done' WHERE source_path=? AND event_id=?",
-                    (path, event_id),
+                    """UPDATE sidecar_records SET status='done',completed_at=?
+                       WHERE source_path=? AND generation=? AND event_id=?""",
+                    (now, path, int(row[1]), event_id),
                 )
         if row and row[0]:
-            self._advance_sidecar_offset(str(row[0]))
+            self._advance_sidecar_offset(str(row[0]), int(row[1]))
 
     def fail_event(self, event_id: str, error: BaseException, max_retries: int = 20) -> None:
         row = self.db.execute("SELECT attempts FROM event_inbox WHERE event_id=?", (event_id,)).fetchone()
@@ -416,22 +473,116 @@ class State:
     def complete_post_trade(self, event_id: str) -> None:
         with self.db:
             self.db.execute(
-                "UPDATE post_trade_outbox SET status='done',completed_at=?,last_error=NULL WHERE event_id=?",
+                """UPDATE post_trade_outbox
+                   SET status='done',completed_at=?,last_error=NULL,failed_step=NULL
+                   WHERE event_id=?""",
                 (time.time(), event_id),
             )
 
-    def prune(self, sent_ttl_days: int = 14, completed_ttl_days: int = 30) -> None:
-        now = time.time()
+    def post_trade_step(self, event_id: str, step: str) -> tuple[bool, dict[str, Any] | None]:
+        row = self.db.execute(
+            "SELECT status,payload_json FROM post_trade_steps WHERE event_id=? AND step=?",
+            (event_id, step),
+        ).fetchone()
+        if row is None or row["status"] != "done":
+            return False, None
+        return True, json.loads(row["payload_json"]) if row["payload_json"] is not None else None
+
+    def complete_post_trade_step(
+        self,
+        event_id: str,
+        step: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) if payload is not None else None
         with self.db:
-            self.db.execute("DELETE FROM sent WHERE at<?", (int(now - max(1, sent_ttl_days) * 86400),))
             self.db.execute(
-                "DELETE FROM event_inbox WHERE status='done' AND completed_at<?",
-                (now - max(1, completed_ttl_days) * 86400,),
+                """INSERT INTO post_trade_steps(event_id,step,status,payload_json,completed_at)
+                   VALUES(?,?,'done',?,?)
+                   ON CONFLICT(event_id,step) DO UPDATE SET
+                     status='done',payload_json=excluded.payload_json,last_error=NULL,
+                     completed_at=excluded.completed_at""",
+                (event_id, step, encoded, time.time()),
+            )
+
+    def complete_risk_step(self, event_id: str, decision: dict[str, Any] | None) -> None:
+        encoded = json.dumps(decision, ensure_ascii=False, separators=(",", ":")) if decision is not None else None
+        with self.db:
+            if decision is not None:
+                decision_id = str(decision.get("signalId") or f"fomo:{event_id}")
+                self.db.execute(
+                    """INSERT INTO risk_decisions(event_id,decision_id,recorded_at,record_json)
+                       VALUES(?,?,?,?) ON CONFLICT(event_id) DO NOTHING""",
+                    (event_id, decision_id, time.time(), encoded),
+                )
+            self.db.execute(
+                """INSERT INTO post_trade_steps(event_id,step,status,payload_json,completed_at)
+                   VALUES(?,'risk','done',?,?)
+                   ON CONFLICT(event_id,step) DO UPDATE SET
+                     status='done',payload_json=excluded.payload_json,last_error=NULL,
+                     completed_at=excluded.completed_at""",
+                (event_id, encoded, time.time()),
+            )
+
+    def fail_post_trade_step(self, event_id: str, step: str, error: BaseException) -> None:
+        error_name = type(error).__name__[:120]
+        with self.db:
+            self.db.execute(
+                """INSERT INTO post_trade_steps(event_id,step,status,attempts,last_error)
+                   VALUES(?,?,'retry',1,?)
+                   ON CONFLICT(event_id,step) DO UPDATE SET
+                     status='retry',attempts=post_trade_steps.attempts+1,last_error=excluded.last_error""",
+                (event_id, step, error_name),
             )
             self.db.execute(
-                "DELETE FROM post_trade_outbox WHERE status='done' AND completed_at<?",
-                (now - max(1, completed_ttl_days) * 86400,),
+                "UPDATE post_trade_outbox SET failed_step=?,last_error=? WHERE event_id=?",
+                (step, error_name, event_id),
             )
+
+    def prune(
+        self,
+        sent_ttl_days: int = 14,
+        completed_ttl_days: int = 30,
+        dead_ttl_days: int = 90,
+        batch_size: int = 500,
+    ) -> dict[str, int]:
+        now = time.time()
+        batch = max(10, min(int(batch_size), 5000))
+        completed_cutoff = now - max(1, completed_ttl_days) * 86400
+        dead_cutoff = now - max(completed_ttl_days + 1, dead_ttl_days) * 86400
+        deleted: dict[str, int] = {}
+
+        def delete_batch(name: str, where: str, params: tuple[Any, ...]) -> None:
+            cursor = self.db.execute(
+                f"DELETE FROM {name} WHERE rowid IN (SELECT rowid FROM {name} WHERE {where} LIMIT ?)",
+                (*params, batch),
+            )
+            deleted[name] = deleted.get(name, 0) + max(0, cursor.rowcount)
+
+        with self.db:
+            delete_batch("sent", "at<?", (int(now - max(1, sent_ttl_days) * 86400),))
+            delete_batch("notification_outbox", "status='sent' AND sent_at<?", (completed_cutoff,))
+            delete_batch("notification_outbox", "status='dead' AND created_at<?", (dead_cutoff,))
+            delete_batch("sidecar_records", "status='done' AND completed_at IS NOT NULL AND completed_at<?", (completed_cutoff,))
+            delete_batch("event_inbox", "status='done' AND completed_at<?", (completed_cutoff,))
+            delete_batch("event_inbox", "status='dead' AND created_at<?", (dead_cutoff,))
+            old_post_ids = [
+                str(row[0]) for row in self.db.execute(
+                    """SELECT event_id FROM post_trade_outbox
+                       WHERE (status='done' AND completed_at<?)
+                          OR (status='dead' AND created_at<?)
+                       LIMIT ?""",
+                    (completed_cutoff, dead_cutoff, batch),
+                )
+            ]
+            if old_post_ids:
+                placeholders = ",".join("?" for _ in old_post_ids)
+                self.db.execute(f"DELETE FROM post_trade_steps WHERE event_id IN ({placeholders})", old_post_ids)
+                self.db.execute(f"DELETE FROM risk_decisions WHERE event_id IN ({placeholders})", old_post_ids)
+                cursor = self.db.execute(f"DELETE FROM post_trade_outbox WHERE event_id IN ({placeholders})", old_post_ids)
+                deleted["post_trade_outbox"] = max(0, cursor.rowcount)
+        self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        return deleted
 
 
 @dataclass
@@ -825,6 +976,16 @@ class NotificationWorker:
             (time.time(), limit),
         ).fetchall()
         for row in rows:
+            channel = str(row["channel"])
+            if channel != "console" and not self.cfg.get("notifications", {}).get(channel, False):
+                with db:
+                    db.execute(
+                        """UPDATE notification_outbox SET status='suppressed_disabled',
+                           attempts=attempts+1,last_error='channel_disabled'
+                           WHERE event_id=? AND channel=?""",
+                        (row["event_id"], channel),
+                    )
+                continue
             event = Event(**json.loads(row["event_json"]))
             max_age = max(0.0, float(self.cfg.get("notifications", {}).get("max_event_age_seconds", 300)))
             if max_age and _event_age_seconds(event.created_at) > max_age:
@@ -839,7 +1000,7 @@ class NotificationWorker:
             try:
                 if event.original_text and not event.translated_text and is_probably_english(event.original_text):
                     event.translated_text = translate(event.original_text)
-                notify_channel(str(row["channel"]), render(event, self.cfg), event, self.cfg)
+                notify_channel(channel, render(event, self.cfg), event, self.cfg)
             except Exception as exc:
                 attempts = int(row["attempts"]) + 1
                 status = "dead" if attempts >= self.max_retries else "retry"
@@ -1017,7 +1178,12 @@ def paper_copy_trade(state: State, event: Event, cfg: dict[str, Any], portfolio:
         "decisionLatencyMs": gate.decision_latency_ms,
     }
     log_path = PROJECT_DIR / settings.get("log_path", "data/paper-orders.ndjson")
-    append_ndjson(log_path, record, int(settings.get("audit_retention_days", 30)))
+    record["durableEnqueueLatencyMs"] = enqueue_ndjson(
+        log_path,
+        record,
+        int(settings.get("audit_retention_days", 30)),
+        int(settings.get("audit_queue_max", 10_000)),
+    )
     if reason == "accepted" and portfolio is None:
         state.save(daily_key, daily_spend + order_usd)
         state.save(token_key, token_exposure + order_usd)
@@ -1052,19 +1218,49 @@ def process_post_trade_event(
     execution_journal: ExecutionJournal | None = None,
     intelligence: WalletIntelligenceStore | None = None,
 ) -> None:
-    """Run full analysis after the order hand-off; never precede the fast path."""
-    if intelligence is not None:
+    """Run restart-safe, independently idempotent analysis steps."""
+    intelligence_done, _ = state.post_trade_step(event.id, "intelligence")
+    if not intelligence_done:
         try:
-            intelligence.record_event(event)
-        except Exception:
-            logging.exception("写入只读地址画像样本失败：%s", event.id)
-    risk_id = f"risk:{event.id}"
-    if risk_pipeline is not None and not state.was_sent(risk_id):
-        context = RiskContext(exposure=portfolio.exposure_snapshot(event)) if portfolio is not None else None
-        risk_decision = risk_pipeline.evaluate_event(event, context)
-        if execution_journal is not None:
-            execution_journal.record_risk_decision(event, risk_decision)
-        state.mark_sent(risk_id)
+            if intelligence is not None:
+                intelligence.record_event(event)
+        except Exception as exc:
+            state.fail_post_trade_step(event.id, "intelligence", exc)
+            raise
+        state.complete_post_trade_step(event.id, "intelligence")
+
+    risk_done, risk_decision = state.post_trade_step(event.id, "risk")
+    if not risk_done:
+        try:
+            context = RiskContext(exposure=portfolio.exposure_snapshot(event)) if portfolio is not None else None
+            risk_decision = (
+                risk_pipeline.evaluate_event(event, context, persist_audit=False)
+                if risk_pipeline is not None else None
+            )
+            state.complete_risk_step(event.id, risk_decision)
+        except Exception as exc:
+            state.fail_post_trade_step(event.id, "risk", exc)
+            raise
+
+    journal_done, _ = state.post_trade_step(event.id, "journal")
+    if not journal_done:
+        try:
+            if execution_journal is not None:
+                execution_journal.record_risk_decision(event, risk_decision)
+        except Exception as exc:
+            state.fail_post_trade_step(event.id, "journal", exc)
+            raise
+        state.complete_post_trade_step(event.id, "journal")
+
+    audit_done, _ = state.post_trade_step(event.id, "risk_audit")
+    if not audit_done:
+        try:
+            if risk_pipeline is not None and risk_decision is not None:
+                risk_pipeline.append_audit(risk_decision)
+        except Exception as exc:
+            state.fail_post_trade_step(event.id, "risk_audit", exc)
+            raise
+        state.complete_post_trade_step(event.id, "risk_audit")
 
 
 def process_event(
@@ -1093,17 +1289,62 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ValueError("至少配置一个 targets.handle")
 
 
+def _sidecar_resume_offset(state: State, canonical_path: str, generation: int, size: int) -> int | None:
+    """Resume a copied sidecar stream without replaying its historical prefix."""
+    exact_keys = (
+        f"sidecar_scan_offset:{canonical_path}:{generation}",
+        f"sidecar_scan_offset:{canonical_path}",
+        "sidecar_scan_offset",
+    )
+    for key in exact_keys:
+        row = state.db.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        if row is None:
+            continue
+        try:
+            value = int(json.loads(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if 0 <= value <= size:
+            return value
+
+    # Older releases keyed the scan cursor by an absolute Windows path. When
+    # the same stream is copied to Linux, reuse the furthest valid cursor.
+    candidates: list[int] = []
+    for row in state.db.execute("SELECT v FROM kv WHERE k LIKE 'sidecar_scan_offset:%'"):
+        try:
+            value = int(json.loads(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if 0 <= value <= size:
+            candidates.append(value)
+    return max(candidates) if candidates else None
+
+
 def sidecar_events(state: State, allowed_user_ids: set[str] | None, path: str = "data/ws-events.ndjson") -> list[Event]:
     event_path = Path(path)
     if not event_path.exists():
         return []
     canonical_path = str(event_path.resolve())
-    committed = int(state.load(f"sidecar_offset:{canonical_path}", state.load("sidecar_offset", 0)))
-    offset = int(state.load(f"sidecar_scan_offset:{canonical_path}", committed))
+    marker = event_path.with_name(event_path.name + ".rotation.json")
+    try:
+        writer_generation = max(0, int(json.loads(marker.read_text(encoding="utf-8")).get("generation") or 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        writer_generation = 0
+    known_generation = int(state.load(f"sidecar_generation:{canonical_path}", writer_generation))
+    generation = writer_generation
+    if generation != known_generation:
+        state.save(f"sidecar_generation:{canonical_path}", generation)
     size = event_path.stat().st_size
+    committed = int(state.load(f"sidecar_offset:{canonical_path}:{generation}", 0))
+    resume_offset = _sidecar_resume_offset(state, canonical_path, generation, size)
+    offset = committed if resume_offset is None else resume_offset
+    state.save(f"sidecar_scan_offset:{canonical_path}:{generation}", offset)
+    state.save("sidecar_scan_offset", offset)
     if offset > size:
-        # Rotation/truncation: only reset the scan cursor. The durable inbox
-        # still protects already observed event ids from duplicate effects.
+        # An external truncation without marker metadata still gets a fresh
+        # generation so reused byte offsets cannot collide with old records.
+        generation = max(generation, known_generation + 1)
+        state.save(f"sidecar_generation:{canonical_path}", generation)
         offset = 0
     output: list[Event] = []
     with event_path.open("rb") as stream:
@@ -1141,7 +1382,7 @@ def sidecar_events(state: State, allowed_user_ids: set[str] | None, path: str = 
             # Persist the complete source span and parsed event before moving
             # the scan cursor. Filtered/malformed complete lines are durable
             # no-op records so they cannot block later valid events forever.
-            state.enqueue_sidecar_line(canonical_path, start, end, candidates)
+            state.enqueue_sidecar_line(canonical_path, generation, start, end, candidates)
     return output
 
 
@@ -1190,7 +1431,13 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
     validate_config(cfg)
     publish_fast_executor_config(cfg)
     client, state = FomoClient(), State(cfg["state_db"])
-    state.prune(int(cfg.get("state_sent_ttl_days", 14)), int(cfg.get("inbox_retention_days", 30)))
+    retention = cfg.get("retention", {})
+    state.prune(
+        int(cfg.get("state_sent_ttl_days", 14)),
+        int(cfg.get("inbox_retention_days", 30)),
+        int(retention.get("dead_days", 90)),
+        int(retention.get("prune_batch_size", 500)),
+    )
     leaderboard_scheduler = LeaderboardScheduler(PROJECT_DIR, cfg, client).start() if not once else None
     if leaderboard_scheduler is not None:
         atexit.register(leaderboard_scheduler.stop)
@@ -1243,10 +1490,23 @@ def run(cfg: dict[str, Any], once: bool = False) -> None:
     following_retry_at = 0.0
     following_refresh_seconds = max(60, int(cfg.get("following_refresh_seconds", 300)))
     last_rest_poll = 0.0
+    last_maintenance = time.time()
+    maintenance_interval = max(300, int(retention.get("maintenance_interval_seconds", 3600)))
     rest_poll_seconds = int(cfg["poll_seconds"])
     realtime_poll_seconds = max(0.2, float(cfg.get("realtime_poll_seconds", 1)))
     while True:
         now = time.time()
+        if now - last_maintenance >= maintenance_interval:
+            try:
+                state.prune(
+                    int(cfg.get("state_sent_ttl_days", 14)),
+                    int(cfg.get("inbox_retention_days", 30)),
+                    int(retention.get("dead_days", 90)),
+                    int(retention.get("prune_batch_size", 500)),
+                )
+            except sqlite3.Error:
+                logging.exception("周期状态保留清理失败")
+            last_maintenance = now
         if portfolio is not None and portfolio_settings.get("daily_backup", True):
             try:
                 portfolio.maybe_daily_backup(backup_dir)

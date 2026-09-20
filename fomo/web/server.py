@@ -203,8 +203,8 @@ def build_status_payload(data_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_dashboard_payload(log_path: Path, limit: int = 500) -> dict[str, Any]:
-    index=AuditLogIndex(log_path);db=index.sync()
+def build_dashboard_payload(log_path: Path, limit: int = 500, retention_days: int = 30) -> dict[str, Any]:
+    index=AuditLogIndex(log_path, retention_days);db=index.sync()
     try:
         metrics=index.metrics(db)
         total=int(metrics.get("total",(0,None))[0]);accepted=int(metrics.get("accepted",(0,None))[0]);accepted_usd=metrics.get("accepted_usd",(0,None))[0]
@@ -225,8 +225,8 @@ def build_dashboard_payload(log_path: Path, limit: int = 500) -> dict[str, Any]:
     }
 
 
-def build_shadow_payload(log_path: Path, limit: int = 200) -> dict[str, Any]:
-    index=AuditLogIndex(log_path);db=index.sync()
+def build_shadow_payload(log_path: Path, limit: int = 200, retention_days: int = 30) -> dict[str, Any]:
+    index=AuditLogIndex(log_path, retention_days);db=index.sync()
     try:
         metrics=index.metrics(db);total=int(metrics.get("total",(0,None))[0]);eligible=int(metrics.get("eligible",(0,None))[0]);latency_count=metrics.get("latency_count",(0,None))[0]
         average=metrics.get("latency_sum",(0,None))[0]/latency_count if latency_count else None
@@ -245,8 +245,8 @@ def build_shadow_payload(log_path: Path, limit: int = 200) -> dict[str, Any]:
     }
 
 
-def build_risk_payload(log_path: Path, limit: int = 500) -> dict[str, Any]:
-    index=AuditLogIndex(log_path);db=index.sync()
+def build_risk_payload(log_path: Path, limit: int = 500, retention_days: int = 30) -> dict[str, Any]:
+    index=AuditLogIndex(log_path, retention_days);db=index.sync()
     try:
         metrics=index.metrics(db);total=int(metrics.get("total",(0,None))[0])
         outcomes={key.removeprefix("outcome:"):int(value[0]) for key,value in metrics.items() if key.startswith("outcome:")}
@@ -262,7 +262,7 @@ def build_risk_payload(log_path: Path, limit: int = 500) -> dict[str, Any]:
     }
 
 
-def build_identity_payload(registry_path: Path, risk_log_path: Path) -> dict[str, Any]:
+def build_identity_payload(registry_path: Path, risk_log_path: Path, retention_days: int = 30) -> dict[str, Any]:
     registry = _read_json(registry_path)
     wallets = registry.get("wallets", []) if isinstance(registry.get("wallets", []), list) else []
     now = datetime.now(timezone.utc)
@@ -293,7 +293,7 @@ def build_identity_payload(registry_path: Path, risk_log_path: Path) -> dict[str
         })
 
     backlog_rows=[]
-    index=AuditLogIndex(risk_log_path);db=index.sync()
+    index=AuditLogIndex(risk_log_path, retention_days);db=index.sync()
     try:
         grouped=db.execute("""SELECT COALESCE(json_extract(payload_json,'$.kolId'),''),network_id,
           COUNT(*),MAX(recorded_at),MAX(json_extract(payload_json,'$.handle')),
@@ -480,12 +480,21 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
 
         def _send_json(self, payload: Any, status: int = 200) -> None:
             content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(content)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(content)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+
+        def _write_content(self, content: bytes) -> None:
+            try:
+                self.wfile.write(content)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
 
         def _same_origin(self) -> bool:
             origin = str(self.headers.get("Origin") or "").rstrip("/")
@@ -566,7 +575,7 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Cache-Control", "public, max-age=86400")
                 self.end_headers()
-                self.wfile.write(content)
+                self._write_content(content)
                 return
             if parsed.path == "/":
                 try:
@@ -579,7 +588,7 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(content)
+                self._write_content(content)
                 return
             if parsed.path == "/api/paper-orders":
                 query = parse_qs(parsed.query)
@@ -587,7 +596,9 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                     limit = int(query.get("limit", ["500"])[0])
                 except ValueError:
                     limit = 500
-                self._send_json(build_dashboard_payload(log_path, limit))
+                self._send_json(build_dashboard_payload(
+                    log_path, limit, int(copy_settings.get("audit_retention_days", 30))
+                ))
                 return
             if parsed.path == "/api/status":
                 self._send_json(build_status_payload(data_dir, cfg))
@@ -605,7 +616,11 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                     limit = int(query.get("limit", ["200"])[0])
                 except ValueError:
                     limit = 200
-                self._send_json(build_shadow_payload(data_dir / "shadow-executions.ndjson", limit))
+                self._send_json(build_shadow_payload(
+                    data_dir / "shadow-executions.ndjson",
+                    limit,
+                    int(copy_settings.get("audit_retention_days", 30)),
+                ))
                 return
             if parsed.path == "/api/risk-decisions":
                 query = parse_qs(parsed.query)
@@ -613,10 +628,14 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                     limit = int(query.get("limit", ["500"])[0])
                 except ValueError:
                     limit = 500
-                self._send_json(build_risk_payload(risk_log_path, limit))
+                self._send_json(build_risk_payload(
+                    risk_log_path, limit, int(risk_settings.get("audit_retention_days", 30))
+                ))
                 return
             if parsed.path == "/api/wallet-registry":
-                self._send_json(build_identity_payload(registry_path, risk_log_path))
+                self._send_json(build_identity_payload(
+                    registry_path, risk_log_path, int(risk_settings.get("audit_retention_days", 30))
+                ))
                 return
             if parsed.path == "/api/wallet-management":
                 try:

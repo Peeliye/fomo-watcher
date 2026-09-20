@@ -3,9 +3,15 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from fomo.execution.rpc_pool import RpcHealthStore, load_rpc_endpoints, rpc_pool_readiness
+from fomo.execution.rpc_pool import (
+    RpcEndpoint,
+    RpcHealthStore,
+    load_rpc_endpoints,
+    probe_rpc_endpoint,
+    rpc_pool_readiness,
+)
 
 
 CFG = {
@@ -102,6 +108,64 @@ class RpcPoolTests(unittest.TestCase):
                 store.close()
         self.assertEqual(result["reachable"], 0)
         self.assertEqual(result["endpoints"][0]["status"], "stale")
+
+    def test_retention_limit_applies_across_short_lived_store_instances(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"RPC_FAST": "https://fast.invalid"}, clear=False
+        ):
+            path = Path(directory) / "health.sqlite3"
+            endpoint = load_rpc_endpoints(CFG)[0]
+            for cycle in range(3):
+                store = RpcHealthStore(path, max_samples_per_endpoint=100)
+                try:
+                    store.record_many([
+                        (endpoint, {
+                            "method": "eth_blockNumber", "latency_ms": 10 + cycle,
+                            "success": True, "block_height": cycle * 100 + index,
+                        })
+                        for index in range(60)
+                    ])
+                finally:
+                    store.close()
+            check = RpcHealthStore(path, max_samples_per_endpoint=100)
+            try:
+                count = check.connection.execute(
+                    "SELECT COUNT(*) FROM rpc_samples WHERE endpoint_id=?", (endpoint.endpoint_id,)
+                ).fetchone()[0]
+            finally:
+                check.close()
+            self.assertEqual(count, 100)
+
+    def test_probe_rejects_dns_rebinding_before_network_request(self):
+        endpoint = RpcEndpoint("1", "test", "primary", public_http_url="https://rpc.example/key")
+        with (
+            patch(
+                "fomo.execution.rpc_pool.validate_endpoint_url",
+                side_effect=[
+                    (endpoint.resolved_http_url, frozenset({"93.184.216.34"})),
+                    (endpoint.resolved_http_url, frozenset({"93.184.216.35"})),
+                ],
+            ),
+            patch("fomo.execution.rpc_pool.cf.post") as post,
+        ):
+            result = probe_rpc_endpoint(endpoint)
+        self.assertEqual(result["error_code"], "dns_rebinding_rejected")
+        post.assert_not_called()
+
+    def test_probe_rejects_redirect_without_following_it(self):
+        endpoint = RpcEndpoint("1", "test", "primary", public_http_url="https://rpc.example/key")
+        response = Mock(status_code=302, primary_ip="93.184.216.34")
+        with (
+            patch(
+                "fomo.execution.rpc_pool.validate_endpoint_url",
+                return_value=(endpoint.resolved_http_url, frozenset({"93.184.216.34"})),
+            ),
+            patch("fomo.execution.rpc_pool.cf.post", return_value=response) as post,
+        ):
+            result = probe_rpc_endpoint(endpoint)
+        self.assertEqual(result["error_code"], "redirect_rejected")
+        self.assertFalse(post.call_args.kwargs["allow_redirects"])
+        self.assertEqual(post.call_args.kwargs["proxy"], "")
 
 
 if __name__ == "__main__":

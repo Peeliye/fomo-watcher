@@ -13,6 +13,8 @@ Environment=CHROME_PATH=/usr/bin/google-chrome-stable
 ExecStart=/usr/bin/npm run start:privy
 Restart=always
 RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

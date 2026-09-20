@@ -3,6 +3,10 @@ timezone: Asia/Shanghai
 state_db: data/state.sqlite3
 state_sent_ttl_days: 14
 inbox_retention_days: 30
+retention:
+  dead_days: 90
+  maintenance_interval_seconds: 3600
+  prune_batch_size: 500
 
 dashboard:
   enabled: true
@@ -54,6 +58,7 @@ copy_trading:
   max_open_positions: 5
   log_path: data/paper-orders.ndjson
   audit_retention_days: 30
+  audit_queue_max: 10000
 
 # 只读风控流水线：钱包未登记时只记录 needs_identity，不猜测归属。
 read_only_risk:
@@ -97,6 +102,7 @@ execution:
 
 rpc_pool:
   database: data/rpc-health.sqlite3
+  max_samples_per_endpoint: 5000
   sample_window: 100
   maximum_p95_latency_ms: 750
   maximum_block_lag: 3

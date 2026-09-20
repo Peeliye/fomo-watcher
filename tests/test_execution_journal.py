@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,6 +63,56 @@ class ExecutionJournalTests(unittest.TestCase):
             intent_id = journal.record_risk_decision(event, {"signalId": "fomo:event-3", "outcome": "approved_for_shadow", "blockers": []})["intentId"]
             with self.assertRaises(ValueError):
                 journal.record_receipt({"txHash": "0xdef", "intentId": intent_id, "chainId": 56, "status": "confirmed"})
+            journal.close()
+
+    def test_intent_transition_failure_rolls_back_and_connection_is_reusable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = ExecutionJournal(Path(directory) / "execution.sqlite3")
+            journal.db.execute(
+                """CREATE TRIGGER fail_intent_transition BEFORE INSERT ON execution_transitions
+                   BEGIN SELECT RAISE(ABORT,'injected'); END"""
+            )
+            journal.db.commit()
+            event = SimpleNamespace(id="event-fault", user_id="kol-1", handle="alice", network_id=1,
+                                    ca="0x1111111111111111111111111111111111111111", symbol="MEME",
+                                    kind="buy", amount_usd=100)
+            decision = {"signalId": "fomo:event-fault", "outcome": "needs_data", "blockers": ["test"]}
+            with self.assertRaises(sqlite3.IntegrityError):
+                journal.record_risk_decision(event, decision)
+            self.assertFalse(journal.db.in_transaction)
+            self.assertEqual(journal.db.execute("SELECT COUNT(*) FROM execution_intents").fetchone()[0], 0)
+            journal.db.execute("DROP TRIGGER fail_intent_transition")
+            journal.db.commit()
+            self.assertFalse(journal.record_risk_decision(event, decision)["duplicate"])
+            journal.close()
+
+    def test_receipt_transition_failure_rolls_back_all_three_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = ExecutionJournal(Path(directory) / "execution.sqlite3")
+            event = SimpleNamespace(id="event-receipt-fault", user_id="kol-1", handle="alice", network_id=1,
+                                    ca="0x1111111111111111111111111111111111111111", symbol="MEME",
+                                    kind="buy", amount_usd=100)
+            intent_id = journal.record_risk_decision(
+                event, {"signalId": "fomo:event-receipt-fault", "outcome": "approved_for_shadow", "blockers": []}
+            )["intentId"]
+            journal.db.execute(
+                """CREATE TRIGGER fail_receipt_transition BEFORE INSERT ON execution_transitions
+                   WHEN NEW.reason LIKE 'receipt_%'
+                   BEGIN SELECT RAISE(ABORT,'injected'); END"""
+            )
+            journal.db.commit()
+            receipt = {"txHash": "0xfault", "intentId": intent_id, "chainId": 1, "status": "confirmed"}
+            with self.assertRaises(sqlite3.IntegrityError):
+                journal.record_receipt(receipt)
+            self.assertFalse(journal.db.in_transaction)
+            self.assertEqual(journal.db.execute("SELECT COUNT(*) FROM execution_receipts").fetchone()[0], 0)
+            self.assertEqual(
+                journal.db.execute("SELECT state FROM execution_intents WHERE intent_id=?", (intent_id,)).fetchone()[0],
+                "shadow_ready",
+            )
+            journal.db.execute("DROP TRIGGER fail_receipt_transition")
+            journal.db.commit()
+            self.assertFalse(journal.record_receipt(receipt)["duplicate"])
             journal.close()
 
 

@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -18,14 +20,53 @@ class LeaderboardCycleTests(unittest.TestCase):
             archive = LeaderboardArchive(path, root / "leaderboard")
             archive.capture([member("u1", "alpha")])
             archive.close()
-            watched = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
-            before = {str(item): (item.stat().st_mtime_ns, item.stat().st_size) for item in watched if item.exists()}
+            before = (path.stat().st_mtime_ns, path.stat().st_size)
             readonly = LeaderboardArchive(path, root / "leaderboard", readonly=True)
+            business_before = readonly.db.execute("SELECT COUNT(*) FROM ranking_records").fetchone()[0]
             readonly.overview(); readonly.current_ranking(); readonly.history(datetime.now().strftime("%Y-%m-%d"), 0)
             readonly.participants(); readonly.participant_detail(datetime.now().strftime("%Y-%m-%d"), "u1")
+            business_after = readonly.db.execute("SELECT COUNT(*) FROM ranking_records").fetchone()[0]
             readonly.close()
-            after = {str(item): (item.stat().st_mtime_ns, item.stat().st_size) for item in watched if item.exists()}
-            self.assertEqual(before, after)
+            self.assertEqual(before, (path.stat().st_mtime_ns, path.stat().st_size))
+            self.assertEqual(business_before, business_after)
+
+    def test_readonly_reader_sees_latest_committed_wal_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); path = root / "rank.sqlite3"
+            writer = LeaderboardArchive(path, root / "leaderboard")
+            try:
+                writer.capture([member("u1", "alpha")], captured_at=datetime(2026, 9, 20, 1, tzinfo=timezone.utc))
+                writer.capture([member("u2", "beta")], captured_at=datetime(2026, 9, 20, 2, tzinfo=timezone.utc))
+                self.assertTrue(Path(str(path) + "-wal").exists())
+                reader = LeaderboardArchive(path, root / "leaderboard", readonly=True)
+                try:
+                    self.assertEqual([row["userId"] for row in reader.current_ranking("2026-09-20")], ["u2"])
+                finally:
+                    reader.close()
+            finally:
+                writer.close()
+
+    def test_reader_recovers_committed_wal_left_by_abrupt_writer_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); path = root / "rank.sqlite3"
+            archive = LeaderboardArchive(path, root / "leaderboard")
+            archive.close()
+            script = """
+import json,os,sqlite3,sys
+db=sqlite3.connect(sys.argv[1]);db.execute('PRAGMA journal_mode=WAL')
+db.execute("INSERT INTO cycles VALUES('2026-09-20','Asia/Shanghai','2026-09-20T03:00:00+00:00')")
+cur=db.execute("INSERT INTO snapshots(cycle_date,hour_index,scheduled_for,captured_at,status,source_count) VALUES('2026-09-20',11,'2026-09-20T11:01:00+08:00','2026-09-20T03:00:00+00:00','success',1)")
+p={'userId':'crash-user','rank':1,'pnlUsd':7,'userHandle':'crash','displayName':'','address':'','evmAddress':'','followers':0,'numTrades':0,'totalVolume':0,'totalHoldings':0,'clan':None,'topHoldings':[]}
+db.execute('INSERT INTO ranking_records VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(cur.lastrowid,'crash-user',1,7,'crash','','','',0,0,0,0,json.dumps(p)))
+db.commit();os._exit(0)
+"""
+            subprocess.run([sys.executable, "-c", script, str(path)], check=True)
+            self.assertTrue(Path(str(path) + "-wal").exists())
+            reader = LeaderboardArchive(path, root / "leaderboard", readonly=True)
+            try:
+                self.assertEqual(reader.current_ranking("2026-09-20")[0]["userId"], "crash-user")
+            finally:
+                reader.close()
     def test_hourly_compare_and_daily_merge_keep_removed_members(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

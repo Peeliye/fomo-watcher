@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateShadow } from "./fast-shadow.mjs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { gunzip } from "node:zlib";
+import { promisify } from "node:util";
+import { createNdjsonQueue, evaluateShadow } from "./fast-shadow.mjs";
+
+const gunzipAsync = promisify(gunzip);
 
 const now = Date.parse("2026-09-10T00:00:01Z");
 const config = {
@@ -65,4 +72,51 @@ test("missing asset metadata is deferred after the fast path", () => {
   assert.equal(record.status, "eligible");
   assert.deepEqual(record.deferredChecks, ["missing_market_cap"]);
   assert.equal(record.stage, "fast_path_ready");
+});
+
+test("ordered async audit queue preserves a 1000-event burst", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "fomo-audit-"));
+  try {
+    const path = join(directory, "events.ndjson");
+    const queue = createNdjsonQueue(path, { maxQueue: 2000 });
+    await Promise.all(Array.from({ length: 1000 }, (_, id) => queue.enqueue({ id })));
+    await queue.close();
+    const rows = (await readFile(path, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(rows.map(row => row.id), Array.from({ length: 1000 }, (_, id) => id));
+    assert.equal(queue.stats().persisted, 1000);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("audit queue applies bounded backpressure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "fomo-backpressure-"));
+  try {
+    const queue = createNdjsonQueue(join(directory, "events.ndjson"), { maxQueue: 1 });
+    const first = queue.enqueue({ id: 1 });
+    await assert.rejects(queue.enqueue({ id: 2 }), /audit_queue_backpressure/);
+    await first;
+    await queue.close();
+    assert.equal(queue.stats().rejected, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("async rotation uses generation marker and keeps order", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "fomo-rotation-"));
+  try {
+    const path = join(directory, "events.ndjson");
+    await writeFile(path, '{"id":"old"}\n');
+    await writeFile(`${path}.rotation.json`, JSON.stringify({ activeDay: "2020-01-01", generation: 0 }));
+    const queue = createNdjsonQueue(path, { maxQueue: 10 });
+    await queue.enqueue({ id: "new-first" });
+    await queue.enqueue({ id: "new-second" });
+    await queue.close();
+    assert.equal((await gunzipAsync(await readFile(`${path}.2020-01-01.gz`))).toString(), '{"id":"old"}\n');
+    const rows = (await readFile(path, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(rows.map(row => row.id), ["new-first", "new-second"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

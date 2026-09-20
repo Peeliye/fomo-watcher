@@ -71,6 +71,10 @@ class RiskPipeline:
         append_ndjson(self.log_path, record, int(self.settings.get("audit_retention_days", 30)))
         return record
 
+    def append_audit(self, record: dict[str, Any]) -> None:
+        """Export a durable decision to the append-only human audit archive."""
+        self._append(record)
+
     def _mtimes(self) -> tuple[int, int]:
         return (self.policy_path.stat().st_mtime_ns, self.registry_path.stat().st_mtime_ns)
 
@@ -110,7 +114,13 @@ class RiskPipeline:
             "estimatedUsd": float(event.amount_usd or 0),
         }
 
-    def evaluate_event(self, event: Any, context: RiskContext | None = None) -> dict[str, Any] | None:
+    def evaluate_event(
+        self,
+        event: Any,
+        context: RiskContext | None = None,
+        *,
+        persist_audit: bool = True,
+    ) -> dict[str, Any] | None:
         if not self.enabled or self.engine is None or event.kind not in {"buy", "sell", "clear"}:
             return None
         self._reload_if_changed()
@@ -149,7 +159,7 @@ class RiskPipeline:
                 "blockers": [reason],
                 "latencyMs": round((time.perf_counter() - started) * 1000, 3),
             })
-            return self._append(record)
+            return self._append(record) if persist_audit else record
 
         entry = next(iter(candidates))
         safe_payload = {
@@ -196,4 +206,4 @@ class RiskPipeline:
             "signal": _signal_dict(signal),
             "latencyMs": round((time.perf_counter() - started) * 1000, 3),
         })
-        return self._append(record)
+        return self._append(record) if persist_audit else record

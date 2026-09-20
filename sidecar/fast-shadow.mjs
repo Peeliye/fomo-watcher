@@ -1,6 +1,10 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { appendFile, readFile, readdir, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { gzipSync } from "node:zlib";
+import { promisify } from "node:util";
+import { gzip } from "node:zlib";
+
+const gzipAsync = promisify(gzip);
 
 export function loadJson(path, fallback = null) {
   try {
@@ -64,32 +68,129 @@ export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = D
 }
 
 export function appendShadow(path, record) {
-  appendNdjson(path, record);
+  return appendNdjson(path, record);
 }
 
+const queues = new Map();
+
 export function appendNdjson(path, record) {
-  const today = new Date().toISOString().slice(0, 10);
-  const marker = `${path}.active-day`;
-  let activeDay = today;
-  try { activeDay = readFileSync(marker, "utf8").trim() || today; } catch {}
-  if (activeDay !== today && existsSync(path) && statSync(path).size > 0) {
-    const archive = `${path}.${activeDay}.gz`;
-    writeFileSync(archive, gzipSync(readFileSync(path), { level: 6 }));
-    writeFileSync(path, "");
+  let queue = queues.get(path);
+  if (!queue) {
+    queue = createNdjsonQueue(path);
+    queues.set(path, queue);
   }
-  writeFileSync(marker, today);
-  appendFileSync(path, JSON.stringify(record) + "\n");
-  const cutoff = Date.now() - 30 * 86400_000;
-  try {
-    for (const name of readdirSync(dirname(path))) {
-      if (name.startsWith(`${basename(path)}.`) && name.endsWith(".gz")) {
-        const archive = join(dirname(path), name);
-        if (statSync(archive).mtimeMs < cutoff) unlinkSync(archive);
-      }
-    }
-  } catch {}
+  return queue.enqueue(record);
 }
 
 export function fileMtime(path) {
   try { return statSync(path).mtimeMs; } catch { return 0; }
+}
+
+export function createNdjsonQueue(path, options = {}) {
+  const maxQueue = Math.max(1, Number(options.maxQueue || 10_000));
+  const retentionDays = Math.max(2, Number(options.retentionDays || 30));
+  const pending = [];
+  let running = false;
+  let closing = false;
+  let idleResolve = null;
+  let persisted = 0;
+  let rejected = 0;
+  let rotationInitialized = false;
+  let activeDayState = "";
+  let generationState = 0;
+
+  async function rotateIfNeeded() {
+    const today = new Date().toISOString().slice(0, 10);
+    const marker = `${path}.rotation.json`;
+    const legacyMarker = `${path}.active-day`;
+    if (!rotationInitialized) {
+      activeDayState = today;
+      try {
+        const value = JSON.parse(await readFile(marker, "utf8"));
+        activeDayState = String(value.activeDay || today);
+        generationState = Math.max(0, Number(value.generation || 0));
+      } catch {
+        try { activeDayState = (await readFile(legacyMarker, "utf8")).trim() || today; } catch {}
+      }
+      rotationInitialized = true;
+    }
+    if (activeDayState !== today) {
+      try {
+        const info = await stat(path);
+        if (info.size > 0) {
+          const suffix = generationState === 0 ? "" : `.g${generationState}`;
+          const archive = `${path}.${activeDayState}${suffix}.gz`;
+          const compressed = await gzipAsync(await readFile(path), { level: 6 });
+          await writeFile(`${archive}.tmp`, compressed);
+          await rename(`${archive}.tmp`, archive);
+          await truncate(path, 0);
+          generationState += 1;
+        }
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      await writeFile(`${marker}.tmp`, JSON.stringify({ activeDay: today, generation: generationState }));
+      await rename(`${marker}.tmp`, marker);
+      await writeFile(legacyMarker, today);
+      const cutoff = Date.now() - retentionDays * 86400_000;
+      try {
+        for (const name of await readdir(dirname(path))) {
+          if (!name.startsWith(`${basename(path)}.`) || !name.endsWith(".gz")) continue;
+          const archive = join(dirname(path), name);
+          if ((await stat(archive)).mtimeMs < cutoff) await unlink(archive);
+        }
+      } catch {}
+      activeDayState = today;
+    }
+  }
+
+  async function pump() {
+    if (running) return;
+    running = true;
+    try {
+      while (pending.length) {
+        const item = pending[0];
+        try {
+          await rotateIfNeeded();
+          await appendFile(path, item.line, "utf8");
+          persisted += 1;
+          item.resolve({
+            persistenceLatencyMs: Math.round((performance.now() - item.enqueuedAt) * 1000) / 1000,
+            queueDepth: pending.length - 1,
+          });
+        } catch (error) {
+          item.reject(error);
+        } finally {
+          pending.shift();
+        }
+      }
+    } finally {
+      running = false;
+      if (!pending.length && idleResolve) {
+        idleResolve();
+        idleResolve = null;
+      }
+      if (pending.length) void pump();
+    }
+  }
+
+  return {
+    enqueue(record) {
+      if (closing || pending.length >= maxQueue) {
+        rejected += 1;
+        return Promise.reject(new Error("audit_queue_backpressure"));
+      }
+      const line = JSON.stringify(record) + "\n";
+      const enqueuedAt = performance.now();
+      const promise = new Promise((resolve, reject) => pending.push({ line, enqueuedAt, resolve, reject }));
+      void pump();
+      return promise;
+    },
+    async close() {
+      closing = true;
+      if (!running && !pending.length) return;
+      await new Promise(resolve => { idleResolve = resolve; });
+    },
+    stats() { return { depth: pending.length, maxQueue, persisted, rejected, running }; },
+  };
 }

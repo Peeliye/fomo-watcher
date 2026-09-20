@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -19,6 +20,7 @@ from fomo.app import (
 )
 from fomo.audit import append_ndjson
 from fomo.portfolio.ledger import PortfolioLedger, portfolio_snapshot
+from fomo.web.audit_index import AuditLogIndex
 from fomo.web.server import DashboardChangeBus, build_dashboard_payload
 
 
@@ -62,6 +64,59 @@ def config(root: Path) -> dict:
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_new_sidecar_path_resumes_previous_host_scan_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stream = root / "events.ndjson"
+            state = State(str(root / "state.sqlite3"))
+
+            def frame(event_id: str) -> bytes:
+                return (json.dumps({"payload": {
+                    "id": event_id, "userId": "kol-1", "type": "swap_buy",
+                    "networkId": 1, "tokenAddress": event().ca, "price": 1,
+                    "usdAmount": 500, "marketCap": 1_000_000,
+                    "body": {"userHandle": "alice"},
+                }}) + "\n").encode()
+
+            historical = frame("historical")
+            current = frame("current")
+            stream.write_bytes(historical + current)
+            state.save("sidecar_scan_offset:C:\\old-host\\data\\events.ndjson", len(historical))
+            try:
+                parsed = sidecar_events(state, {"kol-1"}, str(stream))
+                self.assertEqual(len(parsed), 1)
+                self.assertIn("current", parsed[0].id)
+            finally:
+                state.db.close()
+
+    def test_stale_notifications_are_never_enqueued_or_delivered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(str(Path(directory) / "state.sqlite3"))
+            cfg = {"notifications": {"feishu": True, "max_event_age_seconds": 300}}
+            stale = event("stale")
+            stale.created_at = "2026-09-11T00:00:00+00:00"
+            state.enqueue_notifications(stale, cfg)
+            self.assertEqual(state.db.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
+
+            with state.db:
+                state.db.execute(
+                    """INSERT INTO notification_outbox
+                       (event_id,channel,event_json,created_at) VALUES(?,?,?,?)""",
+                    (stale.id, "feishu", json.dumps(stale.__dict__), time.time()),
+                )
+            worker = NotificationWorker(state.path, cfg)
+            db = sqlite3.connect(state.path)
+            db.row_factory = sqlite3.Row
+            with patch("fomo.app.notify_channel") as deliver:
+                worker._drain(db)
+            deliver.assert_not_called()
+            self.assertEqual(
+                db.execute("SELECT status FROM notification_outbox WHERE event_id=?", (stale.id,)).fetchone()[0],
+                "suppressed_stale",
+            )
+            db.close()
+            state.db.close()
+
     def test_incomplete_sidecar_tail_does_not_advance_and_later_recovers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -305,6 +360,65 @@ class ReliabilityTests(unittest.TestCase):
                 bus.unregister()
                 bus.unregister()
                 bus.stop()
+
+    def test_replaced_log_larger_than_old_offset_indexes_from_new_file_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "orders.ndjson"
+            append_ndjson(path, {"recordedAt": "old", "status": "accepted", "eventId": "old"})
+            self.assertEqual(build_dashboard_payload(path)["total"], 1)
+            replacement = path.with_suffix(".replacement")
+            first = {"recordedAt": "new-first", "status": "rejected", "eventId": "new-first", "padding": "x" * 500}
+            second = {"recordedAt": "new-second", "status": "accepted", "eventId": "new-second"}
+            replacement.write_text(
+                json.dumps(first, separators=(",", ":")) + "\n" + json.dumps(second, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(replacement, path)
+            payload = build_dashboard_payload(path, 10)
+            self.assertEqual(payload["total"], 3)
+            self.assertEqual(
+                {row["eventId"] for row in payload["orders"]},
+                {"old", "new-first", "new-second"},
+            )
+
+    def test_audit_partial_line_waits_and_malformed_complete_line_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "orders.ndjson"
+            path.write_bytes(
+                b'{"recordedAt":"one","status":"accepted"}\n'
+                b'{malformed}\n'
+                b'{"recordedAt":"two","status":"rejected"'
+            )
+            first = build_dashboard_payload(path, 10)
+            self.assertEqual(first["total"], 1)
+            with path.open("ab") as stream:
+                stream.write(b'}\n')
+            second = build_dashboard_payload(path, 10)
+            self.assertEqual(second["total"], 2)
+            self.assertEqual({row["recordedAt"] for row in second["orders"]}, {"one", "two"})
+
+    def test_audit_retention_prunes_rows_and_rebuilds_metrics_together(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "orders.ndjson"
+            old = '{"recordedAt":"2020-01-01T00:00:00+00:00","status":"accepted","paperBuyUsd":2}\n'
+            current = json.dumps({
+                "recordedAt": datetime.now(timezone.utc).isoformat(),
+                "status": "rejected",
+            }) + "\n"
+            path.write_text(old * 20 + current, encoding="utf-8")
+            index = AuditLogIndex(path, retention_days=2)
+            db = index.sync()
+            db.execute("UPDATE audit_metrics SET text_value='0' WHERE name='maintenance_at'")
+            db.commit()
+            index.close(db)
+            db = index.sync()
+            try:
+                metrics = index.metrics(db)
+                self.assertEqual(metrics["total"][0], 1)
+                self.assertEqual(metrics["status:rejected"][0], 1)
+                self.assertNotIn("status:accepted", metrics)
+            finally:
+                index.close(db)
 
 
 if __name__ == "__main__":

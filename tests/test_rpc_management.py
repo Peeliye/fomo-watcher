@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fomo.web.rpc_management import RpcManagementError, RpcManagementStore
+from fomo.web.rpc_management import RpcManagementError, RpcManagementStore, _safe_url
 
 
 class RpcManagementTests(unittest.TestCase):
@@ -45,7 +45,11 @@ class RpcManagementTests(unittest.TestCase):
         self.assertFalse(snapshot["secretsExposed"])
 
     def test_save_updates_only_predeclared_environment_slot(self) -> None:
-        with patch.dict(os.environ, {"RPC_TEST_URL": "https://old.example/key"}, clear=False):
+        public_dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with (
+            patch.dict(os.environ, {"RPC_TEST_URL": "https://old.example/key"}, clear=False),
+            patch("fomo.execution.url_safety.socket.getaddrinfo", return_value=public_dns),
+        ):
             result = self.store.mutate(
                 {
                     "action": "save_endpoint",
@@ -85,6 +89,22 @@ class RpcManagementTests(unittest.TestCase):
                         "httpUrl": url,
                     }
                 )
+
+    def test_dns_failure_private_ipv6_and_mixed_resolution_are_rejected(self) -> None:
+        with self.assertRaises(RpcManagementError):
+            _safe_url("https://does-not-resolve.invalid/rpc")
+        for value in ("http://[::1]:8545", "http://[fc00::1]:8545", "http://0.0.0.0:8545"):
+            with self.subTest(value=value), self.assertRaises(RpcManagementError):
+                _safe_url(value)
+        mixed = [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+            (2, 1, 6, "", ("10.0.0.2", 443)),
+        ]
+        with (
+            patch("fomo.execution.url_safety.socket.getaddrinfo", return_value=mixed),
+            self.assertRaises(RpcManagementError),
+        ):
+            _safe_url("https://mixed.example/rpc")
 
     def test_public_endpoint_cannot_be_edited(self) -> None:
         cfg = {

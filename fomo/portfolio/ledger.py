@@ -281,7 +281,10 @@ class PortfolioLedger:
             elif age_hours >= max_hours:
                 reason, sell_quantity = "max_holding_time", quantity
             if reason and sell_quantity > 0:
-                results.append(self._paper_exit(row, sell_quantity, price, reason, now))
+                # Wall clocks can repeat or move backwards by a few microseconds.
+                # Preserve ledger ordering relative to the position generation.
+                executed_at = max(now, _event_time(row["last_trade_at"]) + timedelta(microseconds=1))
+                results.append(self._paper_exit(row, sell_quantity, price, reason, executed_at))
         if results:
             self._refresh_daily_snapshot(self._day(now), now)
         return results
