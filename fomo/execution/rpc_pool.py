@@ -123,8 +123,13 @@ def probe_rpc_endpoint(endpoint: RpcEndpoint, timeout_seconds: float = 2.0) -> d
         parsed = urlparse(url)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         host = str(parsed.hostname)
-        resolve = [f"{host}:{port}:{'[' + address + ']' if ':' in address else address}"
-                   for address in sorted(second_addresses)]
+        # Multiple duplicate CURLOPT_RESOLVE entries for one host are not a
+        # fallback list: libcurl effectively uses the last one. Cloudflare
+        # returns both IPv4 and IPv6, so an IPv6 address could be selected on
+        # IPv4-only VPS hosts and make a healthy endpoint look unreachable.
+        ipv4_addresses = sorted(address for address in second_addresses if ":" not in address)
+        pinned_address = (ipv4_addresses or sorted(second_addresses))[0]
+        resolve = [f"{host}:{port}:{'[' + pinned_address + ']' if ':' in pinned_address else pinned_address}"]
         response = cf.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": []},
                            headers={"Accept": "application/json"}, timeout=timeout_seconds,
                            impersonate="chrome", allow_redirects=False, proxy="",

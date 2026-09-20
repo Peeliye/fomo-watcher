@@ -167,6 +167,26 @@ class RpcPoolTests(unittest.TestCase):
         self.assertFalse(post.call_args.kwargs["allow_redirects"])
         self.assertEqual(post.call_args.kwargs["proxy"], "")
 
+    def test_probe_prefers_ipv4_when_dns_returns_ipv4_and_ipv6(self):
+        endpoint = RpcEndpoint("1", "test", "primary", public_http_url="https://rpc.example/key")
+        addresses = frozenset({"2606:4700:10::1", "93.184.216.34"})
+        response = Mock(status_code=200, primary_ip="93.184.216.34")
+        response.json.return_value = {"result": "0x10"}
+        with (
+            patch(
+                "fomo.execution.rpc_pool.validate_endpoint_url",
+                return_value=(endpoint.resolved_http_url, addresses),
+            ),
+            patch("fomo.execution.rpc_pool.cf.post", return_value=response) as post,
+        ):
+            result = probe_rpc_endpoint(endpoint)
+        self.assertTrue(result["success"])
+        resolve_entries = next(
+            value for key, value in post.call_args.kwargs["curl_options"].items()
+            if getattr(key, "name", "") == "RESOLVE" or int(key) == 10203
+        )
+        self.assertEqual(resolve_entries, ["rpc.example:443:93.184.216.34"])
+
 
 if __name__ == "__main__":
     unittest.main()
