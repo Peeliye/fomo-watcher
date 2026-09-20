@@ -391,6 +391,10 @@ class State:
             )
 
     def enqueue_notifications(self, event: "Event", cfg: dict[str, Any]) -> None:
+        settings = cfg.get("notifications", {})
+        max_age = max(0.0, float(settings.get("max_event_age_seconds", 300)))
+        if max_age and _event_age_seconds(event.created_at) > max_age:
+            return
         channels = notification_channels(cfg)
         payload = json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
         now = time.time()
@@ -822,6 +826,16 @@ class NotificationWorker:
         ).fetchall()
         for row in rows:
             event = Event(**json.loads(row["event_json"]))
+            max_age = max(0.0, float(self.cfg.get("notifications", {}).get("max_event_age_seconds", 300)))
+            if max_age and _event_age_seconds(event.created_at) > max_age:
+                with db:
+                    db.execute(
+                        """UPDATE notification_outbox SET status='suppressed_stale',
+                           attempts=attempts+1,last_error='stale_event'
+                           WHERE event_id=? AND channel=?""",
+                        (row["event_id"], row["channel"]),
+                    )
+                continue
             try:
                 if event.original_text and not event.translated_text and is_probably_english(event.original_text):
                     event.translated_text = translate(event.original_text)

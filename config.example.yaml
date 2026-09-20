@@ -156,6 +156,8 @@ links:
 notifications:
   max_retries: 8
   retry_base_seconds: 2
+  # 历史事件、迁移重放或积压超过 5 分钟后不再对外推送。
+  max_event_age_seconds: 300
   telegram: false
   feishu: false
   generic_webhook: false
