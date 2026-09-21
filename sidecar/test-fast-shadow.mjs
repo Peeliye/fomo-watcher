@@ -97,6 +97,16 @@ test("missing asset metadata is deferred after the fast path", () => {
   assert.equal(record.stage, "fast_path_ready");
 });
 
+test("versioned golden vectors match the Node gate", async () => {
+  const golden = JSON.parse(await readFile(join(import.meta.dirname, "..", "golden", "fast-path-v1.json"), "utf8"));
+  for (const vector of golden.vectors) {
+    const record = evaluateShadow(vector.event, golden.receivedAt, golden.config, golden.whitelist, golden.nowMs);
+    assert.equal(record.status, vector.status, vector.name);
+    assert.equal(record.eventId, vector.eventId, vector.name);
+    assert.equal(record.proposedBuyUsd, vector.proposedBuyUsd, vector.name);
+  }
+});
+
 test("ordered async audit queue preserves a 1000-event burst", async () => {
   const directory = await mkdtemp(join(tmpdir(), "fomo-audit-"));
   try {

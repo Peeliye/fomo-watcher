@@ -1,13 +1,15 @@
-"""Durable, read-only execution intent journal.
+"""Durable execution state machine and atomic reservation journal.
 
-The journal deliberately has no transaction builder, signer, or broadcaster.
-It makes every risk result auditable and keeps live execution fail-closed.
+No adapter in this module signs or broadcasts. ``live_armed`` remains locked to
+zero by default; external execution services must pass every capability and
+preflight check before using the state-machine methods.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -79,8 +81,75 @@ CREATE TABLE IF NOT EXISTS execution_receipts (
   FOREIGN KEY(intent_id) REFERENCES execution_intents(intent_id)
 );
 CREATE INDEX IF NOT EXISTS idx_receipts_intent ON execution_receipts(intent_id,recorded_at DESC);
-PRAGMA user_version=2;
+CREATE TABLE IF NOT EXISTS execution_jobs (
+  intent_id TEXT PRIMARY KEY,
+  signal_id TEXT NOT NULL UNIQUE,
+  source TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  chain_id TEXT NOT NULL,
+  side TEXT NOT NULL CHECK(side IN ('buy','sell')),
+  token_in TEXT NOT NULL,
+  token_out TEXT NOT NULL,
+  requested_usd_micros INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN (
+    'reserved','quoted','simulated','built','signed','submitted','broadcast',
+    'confirmed','failed','replaced','dropped','expired','reorged'
+  )),
+  tx_hash TEXT UNIQUE,
+  serialized_tx_hash TEXT,
+  provider TEXT,
+  nonce_or_blockhash TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_jobs_recovery
+  ON execution_jobs(state,updated_at,intent_id);
+CREATE TABLE IF NOT EXISTS capital_accounts (
+  account_id TEXT PRIMARY KEY,
+  available_usd_micros INTEGER NOT NULL,
+  reserved_usd_micros INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_reservations (
+  intent_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  amount_usd_micros INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('active','consumed','released','reversed')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(intent_id) REFERENCES execution_jobs(intent_id),
+  FOREIGN KEY(account_id) REFERENCES capital_accounts(account_id)
+);
+CREATE TABLE IF NOT EXISTS execution_artifacts (
+  intent_id TEXT PRIMARY KEY,
+  quote_json TEXT,
+  simulation_json TEXT,
+  serialized_tx_hash TEXT,
+  provider TEXT,
+  nonce_or_blockhash TEXT,
+  receipt_json TEXT,
+  fee_usd_micros INTEGER,
+  token_delta_json TEXT,
+  native_delta TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(intent_id) REFERENCES execution_jobs(intent_id)
+);
+PRAGMA user_version=4;
 """
+
+JOB_TRANSITIONS: dict[str, frozenset[str]] = {
+    "reserved": frozenset({"quoted", "failed", "dropped", "expired"}),
+    "quoted": frozenset({"simulated", "failed", "dropped", "expired"}),
+    "simulated": frozenset({"built", "failed", "dropped", "expired"}),
+    "built": frozenset({"signed", "failed", "expired"}),
+    "signed": frozenset({"submitted", "failed", "expired"}),
+    "submitted": frozenset({"broadcast", "failed", "replaced", "dropped", "expired"}),
+    "broadcast": frozenset({"confirmed", "failed", "replaced", "dropped", "expired", "reorged"}),
+    "confirmed": frozenset({"reorged"}),
+    "replaced": frozenset({"broadcast", "confirmed", "failed", "expired"}),
+    "reorged": frozenset({"broadcast", "failed", "dropped"}),
+    "failed": frozenset(), "dropped": frozenset(), "expired": frozenset(),
+}
 
 
 class ExecutionJournal:
@@ -88,8 +157,20 @@ class ExecutionJournal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.account_id = account_id
-        self.db = sqlite3.connect(self.path, timeout=5)
+        existed = self.path.exists() and self.path.stat().st_size > 0
+        self.db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self._write_lock = threading.RLock()
+        version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
+        if existed and version < 4:
+            directory = self.path.parent / "backups"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            target = sqlite3.connect(directory / f"{self.path.stem}.pre-v4.from-v{version}.{stamp}.sqlite3")
+            try:
+                self.db.backup(target)
+            finally:
+                target.close()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -101,22 +182,134 @@ class ExecutionJournal:
         )
         self.db.commit()
 
+    def set_capital_snapshot(self, account_id: str, available_usd: Any) -> None:
+        """Store a trusted balance snapshot; reservations never infer zero gas/balance."""
+        amount = _micros(available_usd)
+        if amount < 0:
+            raise ValueError("available balance must be non-negative")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            self.db.execute(
+                "INSERT INTO capital_accounts VALUES(?,?,0,?) ON CONFLICT(account_id) DO UPDATE SET "
+                "available_usd_micros=excluded.available_usd_micros,updated_at=excluded.updated_at",
+                (account_id, amount, now),
+            )
+
+    def reserve_intent(self, intent: Any) -> dict[str, Any]:
+        """Atomically dedupe the signal and reserve capital across all sources."""
+        intent_id = str(intent.intent_id)
+        signal_id = str(intent.signal_id)
+        account_id = str(getattr(intent, "account_id", self.account_id))
+        amount = _micros(getattr(intent, "requested_usd", 0))
+        if amount < 0:
+            raise ValueError("reservation amount must be non-negative")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            existing = self.db.execute(
+                "SELECT intent_id,state FROM execution_jobs WHERE signal_id=? OR intent_id=?", (signal_id, intent_id)
+            ).fetchone()
+            if existing:
+                return {"intentId": str(existing["intent_id"]), "state": str(existing["state"]), "duplicate": True}
+            capital = self.db.execute(
+                "SELECT available_usd_micros,reserved_usd_micros FROM capital_accounts WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+            if capital is None:
+                raise ValueError("trusted_balance_snapshot_required")
+            spendable = int(capital["available_usd_micros"]) - int(capital["reserved_usd_micros"])
+            if amount > spendable:
+                raise ValueError("insufficient_unreserved_balance")
+            self.db.execute(
+                "INSERT INTO execution_jobs(intent_id,signal_id,source,account_id,chain_id,side,token_in,token_out,"
+                "requested_usd_micros,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'reserved',?,?)",
+                (intent_id, signal_id, str(intent.source), account_id, str(intent.chain_id), str(intent.side),
+                 str(intent.token_in), str(intent.token_out), amount, now, now),
+            )
+            self.db.execute(
+                "UPDATE capital_accounts SET reserved_usd_micros=reserved_usd_micros+?,updated_at=? WHERE account_id=?",
+                (amount, now, account_id),
+            )
+            self.db.execute(
+                "INSERT INTO execution_reservations VALUES(?,?,?,'active',?,?)",
+                (intent_id, account_id, amount, now, now),
+            )
+        return {"intentId": intent_id, "state": "reserved", "duplicate": False}
+
+    def transition_job(self, intent_id: str, to_state: str, *, metadata: dict[str, Any] | None = None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            row = self.db.execute("SELECT state FROM execution_jobs WHERE intent_id=?", (intent_id,)).fetchone()
+            if row is None:
+                raise ValueError("execution intent does not exist")
+            current = str(row["state"])
+            if to_state == current:
+                return
+            if to_state not in JOB_TRANSITIONS.get(current, frozenset()):
+                raise ValueError(f"invalid execution transition: {current}->{to_state}")
+            self.db.execute("UPDATE execution_jobs SET state=?,updated_at=? WHERE intent_id=?", (to_state, now, intent_id))
+            if metadata is not None:
+                fields = {
+                    "quote_json": metadata.get("quote"), "simulation_json": metadata.get("simulation"),
+                    "serialized_tx_hash": metadata.get("serializedTxHash"), "provider": metadata.get("provider"),
+                    "nonce_or_blockhash": metadata.get("nonceOrBlockhash"),
+                }
+                encoded = {key: json.dumps(value, separators=(",", ":")) if isinstance(value, (dict, list)) else value
+                           for key, value in fields.items()}
+                self.db.execute(
+                    "INSERT INTO execution_artifacts(intent_id,quote_json,simulation_json,serialized_tx_hash,provider,"
+                    "nonce_or_blockhash,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(intent_id) DO UPDATE SET "
+                    "quote_json=coalesce(excluded.quote_json,quote_json),simulation_json=coalesce(excluded.simulation_json,simulation_json),"
+                    "serialized_tx_hash=coalesce(excluded.serialized_tx_hash,serialized_tx_hash),provider=coalesce(excluded.provider,provider),"
+                    "nonce_or_blockhash=coalesce(excluded.nonce_or_blockhash,nonce_or_blockhash),updated_at=excluded.updated_at",
+                    (intent_id, encoded["quote_json"], encoded["simulation_json"], encoded["serialized_tx_hash"],
+                     encoded["provider"], encoded["nonce_or_blockhash"], now),
+                )
+
+    def persist_broadcast(self, intent_id: str, tx_hash: str, provider: str,
+                          nonce_or_blockhash: str, serialized_tx_hash: str) -> dict[str, Any]:
+        """Persist tx hash before returning; repeat calls never rebroadcast an intent."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            row = self.db.execute("SELECT state,tx_hash FROM execution_jobs WHERE intent_id=?", (intent_id,)).fetchone()
+            if row is None:
+                raise ValueError("execution intent does not exist")
+            if row["tx_hash"]:
+                if str(row["tx_hash"]) != tx_hash:
+                    raise ValueError("intent already has a different transaction hash")
+                return {"intentId": intent_id, "txHash": tx_hash, "duplicate": True}
+            if str(row["state"]) not in {"submitted", "replaced", "reorged"}:
+                raise ValueError("intent must be submitted before broadcast")
+            self.db.execute(
+                "UPDATE execution_jobs SET state='broadcast',tx_hash=?,serialized_tx_hash=?,provider=?,"
+                "nonce_or_blockhash=?,updated_at=? WHERE intent_id=?",
+                (tx_hash, serialized_tx_hash, provider, nonce_or_blockhash, now, intent_id),
+            )
+        return {"intentId": intent_id, "txHash": tx_hash, "duplicate": False}
+
+    def recoverable_broadcasts(self) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT intent_id,chain_id,tx_hash,state,provider,nonce_or_blockhash FROM execution_jobs "
+            "WHERE tx_hash IS NOT NULL AND state IN ('submitted','broadcast','replaced','reorged') ORDER BY updated_at"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def close(self) -> None:
         self.db.close()
 
     @contextmanager
     def _transaction(self):
         """Leave the reusable connection clean after every write attempt."""
-        if self.db.in_transaction:
-            self.db.rollback()
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            yield
-        except BaseException:
-            self.db.rollback()
-            raise
-        else:
-            self.db.commit()
+        with self._write_lock:
+            if self.db.in_transaction:
+                self.db.rollback()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self.db.rollback()
+                raise
+            else:
+                self.db.commit()
 
     def record_risk_decision(self, event: Any, decision: dict[str, Any] | None) -> dict[str, Any] | None:
         if not decision:

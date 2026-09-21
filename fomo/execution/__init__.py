@@ -1,5 +1,7 @@
-"""Read-only execution preparation and route planning."""
+"""Fail-closed execution preparation, contracts, and route planning."""
 
+from .capabilities import CapabilityRegistry, CapabilityStatus
+from .core import PreflightEvidence, SharedExecutionCore, validate_serialized_transaction
 from .journal import ExecutionJournal, execution_snapshot
 from .readiness import execution_readiness
 from .routing import FastRoutePlanner, RouteQuote, route_readiness
@@ -7,4 +9,4 @@ from .rpc_pool import RpcEndpoint, RpcHealthStore, load_rpc_endpoints, rpc_healt
 from .transaction_scope import TransactionScopeDecision, validate_transaction_scope
 from .wallet_vault import WalletSecret, WalletVault
 
-__all__ = ["ExecutionJournal", "FastRoutePlanner", "RouteQuote", "RpcEndpoint", "RpcHealthStore", "TransactionScopeDecision", "WalletSecret", "WalletVault", "execution_readiness", "execution_snapshot", "load_rpc_endpoints", "route_readiness", "rpc_health_snapshot", "rpc_pool_readiness", "validate_transaction_scope"]
+__all__ = ["CapabilityRegistry", "CapabilityStatus", "ExecutionJournal", "FastRoutePlanner", "PreflightEvidence", "RouteQuote", "RpcEndpoint", "RpcHealthStore", "SharedExecutionCore", "TransactionScopeDecision", "WalletSecret", "WalletVault", "execution_readiness", "execution_snapshot", "load_rpc_endpoints", "route_readiness", "rpc_health_snapshot", "rpc_pool_readiness", "validate_serialized_transaction", "validate_transaction_scope"]

@@ -15,6 +15,7 @@ from typing import Any
 
 from curl_cffi import requests
 from ..risk.engine import chain_family, normalize_wallet
+from .capabilities import DEFAULT_CAPABILITY_REGISTRY, CapabilityRegistry
 from .rpc_pool import load_rpc_endpoints, rpc_pool_readiness
 from .routing import route_readiness
 
@@ -65,7 +66,8 @@ def load_wallet_profile(path: str | Path) -> dict[str, Any]:
     return profile
 
 
-def execution_readiness(project_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+def execution_readiness(project_dir: Path, cfg: dict[str, Any],
+                        capabilities: CapabilityRegistry | None = None) -> dict[str, Any]:
     settings = cfg.get("execution", {})
     profile_value = Path(str(settings.get("wallet_profile", "execution-wallet.json")))
     profile_path = profile_value if profile_value.is_absolute() else project_dir / profile_value
@@ -141,11 +143,11 @@ def execution_readiness(project_dir: Path, cfg: dict[str, Any]) -> dict[str, Any
     signer = profile.get("signer", {}) if isinstance(profile.get("signer", {}), dict) else {}
     execution_mode = str(profile.get("mode") or "disabled")
     signer_backend = str(signer.get("backend") or "disabled")
-    signer_configured = signer_backend not in {"", "disabled", "unconfigured"} and bool(signer.get("reference"))
-    broadcaster_env = str(settings.get("broadcaster_enabled_env") or "")
-    broadcaster_configured = bool(
-        broadcaster_env and os.getenv(broadcaster_env, "").strip().lower() in {"1", "true", "yes"}
-    )
+    capability_status = (capabilities or DEFAULT_CAPABILITY_REGISTRY).status()
+    signer_status = capability_status["capabilities"]["signer"]
+    broadcaster_status = capability_status["capabilities"]["broadcaster"]
+    signer_configured = bool(signer_status["implemented"] and signer_status["ready"])
+    broadcaster_configured = bool(broadcaster_status["implemented"] and broadcaster_status["ready"])
     if not signer_configured:
         blockers.append("signer_required")
     if not broadcaster_configured:
@@ -172,6 +174,7 @@ def execution_readiness(project_dir: Path, cfg: dict[str, Any]) -> dict[str, Any
         "stage": stage, "ready": stage == "live_execution_ready",
         "readOnly": stage != "live_execution_ready", "signerBackend": signer_backend, "signerConfigured": signer_configured,
         "broadcasterConfigured": broadcaster_configured,
+        "capabilityRegistry": capability_status,
         "accounts": accounts, "chains": chains, "rpcPool": pool, "routeReadiness": routes,
         "blockers": sorted(set(blockers)),
         "note": "One logical wallet profile uses one EVM address across EVM chains and one Solana address. No secret is loaded here.",

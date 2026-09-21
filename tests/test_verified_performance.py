@@ -16,6 +16,8 @@ class VerifiedPerformanceTests(unittest.TestCase):
             "chainId": 1, "tokenAddress": "0xTOKEN", "symbol": "T", "side": side,
             "tokenQuantity": quantity, "grossUsd": gross,
             "executedAt": "2026-09-20T00:00:00Z", "sourceConfidence": 1,
+            "historyComplete": True, "receiptVerified": True,
+            "finality": "finalized", "indexerCheckpoint": "test-checkpoint",
         }
         row.update(overrides)
         return row
@@ -128,11 +130,13 @@ class VerifiedPerformanceTests(unittest.TestCase):
                         {"txHash": f"b{i}", "kolId": "k1", "handle": "alpha", "wallet": "w", "chainId": 1,
                          "tokenAddress": token, "symbol": "T", "side": "buy", "tokenQuantity": 100,
                          "grossUsd": 100, "priceUsd": 1, "marketCapUsd": 100_000,
-                         "executedAt": f"2026-01-0{i}T00:00:00Z", "sourceConfidence": 1},
+                         "executedAt": f"2026-01-0{i}T00:00:00Z", "sourceConfidence": 1,
+                         "historyComplete": True, "receiptVerified": True, "finality": "finalized", "indexerCheckpoint": "test"},
                         {"txHash": f"s{i}", "kolId": "k1", "handle": "alpha", "wallet": "w", "chainId": 1,
                          "tokenAddress": token, "symbol": "T", "side": "sell", "tokenQuantity": 100,
                          "grossUsd": 100 + pnl, "priceUsd": (100 + pnl) / 100,
-                         "executedAt": f"2026-01-0{i}T01:00:00Z", "sourceConfidence": 1},
+                         "executedAt": f"2026-01-0{i}T01:00:00Z", "sourceConfidence": 1,
+                         "historyComplete": True, "receiptVerified": True, "finality": "finalized", "indexerCheckpoint": "test"},
                     ])
                     marks.extend([
                         {"chainId": 1, "tokenAddress": token, "observedAt": f"2026-01-0{i}T00:00:00Z", "priceUsd": 1, "marketCapUsd": 100_000},
@@ -173,10 +177,12 @@ class VerifiedPerformanceTests(unittest.TestCase):
                     rows.extend([
                         {"txHash": f"old-b{index}", "kolId": "k", "handle": "old", "wallet": "w", "chainId": 1,
                          "tokenAddress": f"t{index}", "side": "buy", "tokenQuantity": 1, "grossUsd": 1,
-                         "executedAt": "2020-01-01T00:00:00Z", "sourceConfidence": 1},
+                         "executedAt": "2020-01-01T00:00:00Z", "sourceConfidence": 1,
+                         "historyComplete": True, "receiptVerified": True, "finality": "finalized", "indexerCheckpoint": "test"},
                         {"txHash": f"old-s{index}", "kolId": "k", "handle": "old", "wallet": "w", "chainId": 1,
                          "tokenAddress": f"t{index}", "side": "sell", "tokenQuantity": 1, "grossUsd": 2,
-                         "executedAt": "2020-01-01T01:00:00Z", "sourceConfidence": 1},
+                         "executedAt": "2020-01-01T01:00:00Z", "sourceConfidence": 1,
+                         "historyComplete": True, "receiptVerified": True, "finality": "finalized", "indexerCheckpoint": "test"},
                     ])
                 store.ingest_fills(rows)
                 result = store.snapshot()["profiles"][0]
@@ -230,8 +236,8 @@ class VerifiedPerformanceTests(unittest.TestCase):
                 row = store.db.execute(
                     "SELECT wallet_key,token_key,history_complete FROM verified_fills"
                 ).fetchone()
-                self.assertEqual(tuple(row), ("0xabc", "0xdef", 1))
-                self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(tuple(row), ("0xabc", "0xdef", 0))
+                self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 5)
                 self.assertEqual(store.db.execute("SELECT COUNT(*) FROM performance_profiles").fetchone()[0], 1)
                 self.assertEqual(tuple(store.db.execute(
                     "SELECT fill_count,market_count,social_count FROM performance_stats"
@@ -254,7 +260,7 @@ class VerifiedPerformanceTests(unittest.TestCase):
                 )
             finally:
                 store.close()
-            pattern = "verified.pre-v4.from-v2.*.sqlite3"
+            pattern = "verified.pre-v5.from-v2.*.sqlite3"
             self.assertEqual(len(list((Path(directory) / "backups").glob(pattern))), 1)
 
             reopened = VerifiedPerformanceStore(path)

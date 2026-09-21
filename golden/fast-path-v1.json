@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "nowMs": 1788998405000,
+  "receivedAt": "2026-09-10T00:00:01.000Z",
+  "config": {
+    "enabled": true,
+    "networkIds": [1],
+    "eventTypes": ["swap_buy"],
+    "activeBuyEventTypes": ["swap_buy"],
+    "fixedUsd": 10,
+    "minTargetBuyUsd": 100,
+    "sourcePolicies": {"fomo_push": {"maximumAgeMs": 5000}},
+    "minMarketCapUsd": 100000,
+    "whitelistMaxAgeSeconds": 600
+  },
+  "whitelist": {"followingIds": ["followed"], "updatedAt": 1788998404000},
+  "vectors": [
+    {"name": "accepted", "event": {"id": "v1", "type": "swap_buy", "createdAt": "2026-09-10T00:00:00Z", "userId": "followed", "networkId": 1, "tokenAddress": "0xabc", "usdAmount": 500, "marketCap": 1000000}, "status": "eligible", "eventId": "v1", "proposedBuyUsd": 10},
+    {"name": "missing amount", "event": {"id": "v2", "type": "swap_buy", "createdAt": "2026-09-10T00:00:00Z", "userId": "followed", "networkId": 1, "tokenAddress": "0xabc", "marketCap": 1000000}, "status": "target_trade_too_small", "eventId": "v2", "proposedBuyUsd": 0},
+    {"name": "late is explicit", "event": {"id": "v3", "type": "swap_buy", "createdAt": "2026-09-09T23:59:00Z", "userId": "followed", "networkId": 1, "tokenAddress": "0xabc", "usdAmount": 500, "marketCap": 1000000}, "status": "dropped_late", "eventId": "v3", "proposedBuyUsd": 0},
+    {"name": "passive", "event": {"id": "v4", "type": "large_transfer_in", "createdAt": "2026-09-10T00:00:00Z", "userId": "followed", "networkId": 1, "tokenAddress": "0xabc", "usdAmount": 500, "marketCap": 1000000}, "status": "passive_asset_event", "eventId": "v4", "proposedBuyUsd": 0}
+  ]
+}

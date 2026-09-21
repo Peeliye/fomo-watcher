@@ -3,6 +3,8 @@ import dotenv from "dotenv";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { appendNdjson } from "./fast-shadow.mjs";
+import { acquireSingletonLock } from "./process-lock.mjs";
+import { storeSessionTokens } from "./secret-store.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 dotenv.config({ path: resolve(root, ".env"), quiet: true });
@@ -14,6 +16,7 @@ const eventFile = resolve(root, "data", "ws-events.ndjson");
 const statusFile = resolve(root, "data", "sidecar-status.json");
 const requestLog = resolve(root, "data", "following-requests.log");
 const protocolLog = resolve(root, "data", "ws-protocol.log");
+const releaseWriterLock = await acquireSingletonLock(resolve(root, "data", "fomo-events-writer.lock"), "debug");
 const chrome = process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 // 常驻监控默认完全无窗口；仅在排障时显式设置 SIDECAR_HEADLESS=false。
 const headless = process.env.SIDECAR_HEADLESS !== "false";
@@ -73,7 +76,8 @@ const persistBrowserSession = async () => {
     const part = tokens.access.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
     tokenExpiresAt = new Date(JSON.parse(Buffer.from(part, "base64url").toString("utf8")).exp * 1000).toISOString();
   } catch { tokenExpiresAt = null; }
-  writeFileSync(sessionFile, `FOMO_ACCESS_TOKEN=${tokens.access}\nFOMO_REFRESH_TOKEN=${tokens.refresh}\n`);
+  const storage = storeSessionTokens(root, sessionFile, tokens.access, tokens.refresh);
+  status({ sessionStorage: storage.storedIn, diskFallback: storage.diskFallback });
   return true;
 };
 
@@ -212,6 +216,7 @@ const shutdown = async signal => {
   status({ running: false, reason: signal });
   if (!process.env.CHROME_CDP_URL) await context.close();
   else await browser?.close().catch(() => {});
+  await releaseWriterLock();
   process.exit(0);
 };
 process.on("SIGINT", () => shutdown("SIGINT"));

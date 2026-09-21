@@ -46,7 +46,7 @@ class FastPathGate:
 
     @property
     def accepted(self) -> bool:
-        return self.status == "accepted"
+        return self.status == "eligible"
 
 
 def evaluate_copy_buy(event: Any, settings: dict[str, Any], *, now: datetime | None = None) -> FastPathGate:
@@ -69,6 +69,10 @@ def evaluate_copy_buy(event: Any, settings: dict[str, Any], *, now: datetime | N
     }
     age = _event_age_seconds(str(getattr(event, "created_at", "") or ""), now)
     deferred: list[str] = []
+    source_policy = settings.get("source_policies", {}).get("fomo_push", {})
+    maximum_age = float(
+        source_policy.get("maximum_age_ms", float(settings.get("max_signal_age_seconds", 5)) * 1000)
+    ) / 1000
 
     if kind != "buy":
         status = "not_buy"
@@ -80,8 +84,8 @@ def evaluate_copy_buy(event: Any, settings: dict[str, Any], *, now: datetime | N
         status = "missing_ca"
     elif int(getattr(event, "network_id", 0) or 0) not in allowed_networks:
         status = "unsupported_network"
-    elif age > float(settings.get("max_signal_age_seconds", 5)):
-        status = "stale_signal"
+    elif age > maximum_age:
+        status = "dropped_late"
     elif float(getattr(event, "amount_usd", 0) or 0) < float(settings.get("min_target_buy_usd", 100)):
         status = "target_trade_too_small"
     elif (
@@ -105,6 +109,6 @@ def evaluate_copy_buy(event: Any, settings: dict[str, Any], *, now: datetime | N
             else:
                 status = "market_cap_too_small"
                 return FastPathGate(status, age, (), round((time.perf_counter() - started) * 1000, 3))
-        status = "accepted"
+        status = "eligible"
 
     return FastPathGate(status, age, tuple(deferred), round((time.perf_counter() - started) * 1000, 3))

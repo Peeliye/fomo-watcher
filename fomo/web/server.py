@@ -26,7 +26,7 @@ from ..execution.networks import apply_network_settings, network_settings_path
 from ..execution.readiness import execution_readiness
 from ..execution.rpc_pool import rpc_health_snapshot
 from ..execution.routing import route_readiness
-from ..intelligence.profile import intelligence_snapshot
+from ..intelligence.profile import DEFAULT_SETTINGS as INTELLIGENCE_DEFAULTS, intelligence_snapshot
 from ..intelligence.performance import performance_snapshot
 from ..intelligence.leaderboard import LeaderboardArchive
 from ..portfolio.ledger import portfolio_snapshot
@@ -45,6 +45,17 @@ CHAIN_NAMES = {
     8453: "Base",
     1399811149: "Solana",
 }
+
+
+def dashboard_requires_auth(host: str, settings: dict[str, Any]) -> bool:
+    """Proxy/public deployment is authenticated even when the socket is loopback."""
+    try:
+        loopback = host.casefold() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    public_hostname = bool(str(settings.get("public_hostname") or "").strip())
+    trusted_proxies = bool(settings.get("trusted_proxies") or [])
+    return not loopback or public_hostname or trusted_proxies
 
 
 def public_execution_readiness(project_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -281,6 +292,8 @@ def build_identity_payload(
     retention_days: int = 30,
     following_path: Path | None = None,
     intelligence_database: Path | None = None,
+    intelligence_settings: dict[str, Any] | None = None,
+    performance_database: Path | None = None,
 ) -> dict[str, Any]:
     registry = _read_json(registry_path)
     wallets = registry.get("wallets", []) if isinstance(registry.get("wallets", []), list) else []
@@ -329,15 +342,42 @@ def build_identity_payload(
     backlog_rows.sort(key=lambda item:str(item.get("latestAt") or ""),reverse=True)
     followed_document = _read_json(following_path) if following_path is not None else {}
     followed_kols = len({str(value) for value in followed_document.get("followingIds", []) if str(value)})
-    profiled_kols = 0
+    observed_unique = materialized_profiles = sufficient_profiles = 0
     if intelligence_database is not None and intelligence_database.exists():
         profile_db = sqlite3.connect(f"file:{intelligence_database.as_posix()}?mode=ro", uri=True, timeout=5)
         try:
-            profiled_kols = int(profile_db.execute("SELECT COUNT(DISTINCT kol_id) FROM intelligence_events").fetchone()[0])
+            observed_unique = int(profile_db.execute("SELECT COUNT(DISTINCT kol_id) FROM intelligence_events").fetchone()[0])
+            columns = {str(row[1]) for row in profile_db.execute("PRAGMA table_info(intelligence_events)")}
+            materialized_profiles = observed_unique
+            if {"side", "token_address", "event_time"}.issubset(columns):
+                settings = {**INTELLIGENCE_DEFAULTS, **(intelligence_settings or {})}
+                rows = profile_db.execute(
+                    "SELECT kol_id,SUM(CASE WHEN side='buy' THEN 1 ELSE 0 END),"
+                    "COUNT(DISTINCT CASE WHEN side='buy' THEN token_address END),"
+                    "COUNT(DISTINCT CASE WHEN side='buy' THEN substr(event_time,1,10) END) "
+                    "FROM intelligence_events GROUP BY kol_id"
+                ).fetchall()
+                sufficient_profiles = sum(
+                    1 for _, buys, tokens, days in rows
+                    if int(buys or 0) >= int(settings["minimum_buy_events"])
+                    and int(tokens or 0) >= int(settings["minimum_distinct_tokens"])
+                    and int(days or 0) >= int(settings["minimum_active_days"])
+                )
         except sqlite3.Error:
-            profiled_kols = 0
+            observed_unique = materialized_profiles = sufficient_profiles = 0
         finally:
             profile_db.close()
+    verified_performance_profiles = 0
+    if performance_database is not None and performance_database.exists():
+        performance_db = sqlite3.connect(f"file:{performance_database.as_posix()}?mode=ro", uri=True, timeout=5)
+        try:
+            verified_performance_profiles = int(performance_db.execute(
+                "SELECT COUNT(*) FROM performance_profiles WHERE performance_verified=1"
+            ).fetchone()[0])
+        except sqlite3.Error:
+            verified_performance_profiles = 0
+        finally:
+            performance_db.close()
     registered_entries = sum(1 for item in public_wallets if item["trusted"])
     registered_unique = len({item["kolId"] for item in public_wallets if item["trusted"] and item["kolId"]})
     expired_entries = sum(1 for item in public_wallets if item["expired"] and item["status"] != "revoked")
@@ -345,12 +385,15 @@ def build_identity_payload(
     pending_unique = len({item["kolId"] for item in backlog_rows if item["kolId"]})
     return {
         "registryVersion": int(registry.get("version", 1)),
-        "followedKols": followed_kols,
-        "profiledKols": profiled_kols,
+        "currentFollowedUniqueKols": followed_kols,
+        "observedUniqueKols": observed_unique,
+        "materializedProfiles": materialized_profiles,
+        "sufficientProfiles": sufficient_profiles,
         "pendingUniqueKols": pending_unique,
         "pendingKolChainPairs": len(backlog_rows),
         "registeredWalletEntries": registered_entries,
         "registeredUniqueKols": registered_unique,
+        "verifiedPerformanceProfiles": verified_performance_profiles,
         "expiredWalletEntries": expired_entries,
         "revokedWalletEntries": revoked_entries,
         # Compatibility aliases have explicit units above and are not used by the UI.
@@ -358,6 +401,9 @@ def build_identity_payload(
         "revoked": revoked_entries,
         "expired": expired_entries,
         "pending": len(backlog_rows),
+        # Deprecated aliases are exact mappings, not mixed-unit counters.
+        "followedKols": followed_kols,
+        "profiledKols": materialized_profiles,
         "wallets": public_wallets,
         "backlog": backlog_rows,
     }
@@ -414,15 +460,14 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
 
     host = str(settings.get("host", "127.0.0.1"))
     port = int(settings.get("port", 8765))
-    try:
-        loopback_bind = host.casefold() == "localhost" or ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback_bind = False
     admin_token = os.getenv(str(settings.get("admin_token_env", "FOMO_DASHBOARD_ADMIN_TOKEN")), "")
     csrf_token = os.getenv(str(settings.get("csrf_token_env", "FOMO_DASHBOARD_CSRF_TOKEN")), "")
-    if not loopback_bind and (not admin_token or not csrf_token):
-        logging.error("Dashboard 拒绝远程绑定：必须配置管理认证和 CSRF 环境变量")
+    authentication_required = dashboard_requires_auth(host, settings)
+    if authentication_required and (not admin_token or not csrf_token):
+        logging.error("Dashboard 拒绝公网/代理配置：必须配置 Bearer/SSO 认证和 CSRF")
         return None
+    trusted_proxies = {str(value).strip() for value in settings.get("trusted_proxies", []) if str(value).strip()}
+    sso_identity_header = str(settings.get("sso_identity_header") or "").strip()
     html_path = Path(__file__).with_name("static") / "index.html"
     logo_path = html_path.parent / "assets" / "fomo-exec-logo-v1.png"
     copy_settings = cfg.get("copy_trading", {})
@@ -560,16 +605,30 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
             if not origin:
                 return True
             allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+            public_hostname = str(settings.get("public_hostname") or "").strip().rstrip("/")
+            if public_hostname:
+                allowed.add(public_hostname if "://" in public_hostname else f"https://{public_hostname}")
             allowed.update(str(value).rstrip("/") for value in settings.get("allowed_origins", []))
             return origin in allowed
 
-        def _admin_authorized(self) -> bool:
-            supplied_csrf = str(self.headers.get("X-Fomo-CSRF") or "")
-            if loopback_bind:
-                return self._same_origin() and hmac.compare_digest(supplied_csrf, "1")
+        def _identity_authorized(self) -> bool:
+            if not authentication_required:
+                return True
             authorization = str(self.headers.get("Authorization") or "")
             supplied_token = authorization[7:] if authorization.startswith("Bearer ") else ""
-            return (self._same_origin() and hmac.compare_digest(supplied_token, admin_token)
+            if admin_token and hmac.compare_digest(supplied_token, admin_token):
+                return True
+            peer = str(self.client_address[0])
+            return bool(
+                sso_identity_header and peer in trusted_proxies
+                and str(self.headers.get(sso_identity_header) or "").strip()
+            )
+
+        def _admin_authorized(self) -> bool:
+            supplied_csrf = str(self.headers.get("X-Fomo-CSRF") or "")
+            if not authentication_required:
+                return self._same_origin() and hmac.compare_digest(supplied_csrf, "1")
+            return (self._same_origin() and self._identity_authorized()
                     and hmac.compare_digest(supplied_csrf, csrf_token))
 
         def _read_json_body(self) -> dict[str, Any]:
@@ -591,6 +650,9 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            if authentication_required and parsed.path != "/api/health" and not self._identity_authorized():
+                self._send_json({"error": "authentication_required"}, 401)
+                return
             if parsed.path == "/ws/dashboard":
                 if not self._same_origin():
                     self._send_json({"error": "forbidden_origin"}, 403)
@@ -713,7 +775,7 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
             if parsed.path == "/api/wallet-registry":
                 self._send_json(build_identity_payload(
                     registry_path, risk_log_path, int(risk_settings.get("audit_retention_days", 30)),
-                    data_dir / "following-ids.json", intelligence_db,
+                    data_dir / "following-ids.json", intelligence_db, intelligence_settings, performance_db,
                 ))
                 return
             if parsed.path == "/api/wallet-management":

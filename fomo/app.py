@@ -72,6 +72,16 @@ def publish_fast_executor_config(cfg: dict[str, Any]) -> None:
         "fixedUsd": float(settings.get("fixed_usd", 0)),
         "minTargetBuyUsd": float(settings.get("min_target_buy_usd", 0)),
         "maxSignalAgeSeconds": float(settings.get("max_signal_age_seconds", 5)),
+        "sourcePolicies": {
+            "fomo_push": {
+                "maximumAgeMs": int(
+                    settings.get("source_policies", {}).get("fomo_push", {}).get(
+                        "maximum_age_ms", float(settings.get("max_signal_age_seconds", 5)) * 1000
+                    )
+                ),
+                "lateStatus": "dropped_late",
+            }
+        },
         "minMarketCapUsd": float(settings.get("min_market_cap_usd", 0)),
         "deferAssetChecks": bool(settings.get("defer_asset_checks", True)),
         "requireTradeIdInLive": bool(settings.get("require_trade_id_in_live", True)),
@@ -89,7 +99,13 @@ def publish_following_ids(following_ids: set[str]) -> None:
 
 
 def _persist_session_tokens(access: str, refresh: str) -> None:
-    """Persist Privy's rotated session without printing either secret."""
+    """Persist Privy's rotated session in the OS vault, with 0600 fallback."""
+    try:
+        keyring.set_password(KEYRING_SERVICE, "access_token", access)
+        keyring.set_password(KEYRING_SERVICE, "refresh_token", refresh)
+        return
+    except Exception:
+        logging.exception("系统凭据存储不可用；使用最小权限会话文件 fallback")
     env_path = SESSION_ENV_PATH
     env_path.parent.mkdir(parents=True, exist_ok=True)
     replacements = {
@@ -111,7 +127,9 @@ def _persist_session_tokens(access: str, refresh: str) -> None:
             output.append(f"{key}={value}")
     temp_path = env_path.with_name(".env.session.tmp")
     temp_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    os.chmod(temp_path, 0o600)
     os.replace(temp_path, env_path)
+    os.chmod(env_path, 0o600)
 
 
 def _jwt_payload(token: str) -> dict[str, Any]:
@@ -1129,15 +1147,31 @@ class PostTradeWorker:
 
 def paper_copy_trade(state: State, event: Event, cfg: dict[str, Any], portfolio: PortfolioLedger | None = None) -> dict[str, Any] | None:
     settings = cfg.get("copy_trading", {})
-    if not settings.get("enabled") or settings.get("mode") != "paper" or event.kind != "buy":
+    if not settings.get("enabled") or settings.get("mode") != "paper" or event.kind not in {"buy", "sell", "clear"}:
         return None
     decision_id = f"paper:{event.id}"
     if state.was_sent(decision_id) or (portfolio is not None and portfolio.has_event(event.id)):
         return None
 
+    if event.kind in {"sell", "clear"}:
+        full = str(cfg.get("portfolio", {}).get("paper_exit_mode") or "ignore") == "full_on_first_sell"
+        record = {
+            "recordedAt": datetime.now(timezone.utc).isoformat(), "eventId": event.id,
+            "sourceType": event.source_type, "status": "accepted" if full else "ignored_sell_policy",
+            "mode": "paper", "handle": event.handle, "userId": event.user_id or None,
+            "symbol": event.symbol, "networkId": event.network_id, "ca": event.ca,
+            "side": "sell", "paperSellRatio": 1.0 if full else 0.0,
+            "stage": "fomo_sell_mirror" if full else "fomo_sell_ignored",
+        }
+        record["durableEnqueueLatencyMs"] = enqueue_ndjson(
+            PROJECT_DIR / settings.get("log_path", "data/paper-orders.ndjson"), record,
+            int(settings.get("audit_retention_days", 30)), int(settings.get("audit_queue_max", 10_000)),
+        )
+        return record
+
     gate = evaluate_copy_buy(event, settings)
     age = gate.signal_age_seconds
-    reason = gate.status
+    reason = "accepted" if gate.accepted else gate.status
 
     local_day = datetime.now(ZoneInfo(cfg["timezone"])).strftime("%Y-%m-%d")
     daily_key = f"paper_spend:{local_day}"

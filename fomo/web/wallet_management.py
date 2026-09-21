@@ -24,6 +24,9 @@ SUPPORTED_CHAINS = {
 }
 VALID_KOL_STATUSES = {"active", "shadow-only", "revoked"}
 VALID_WATCH_STATUSES = {"active", "paused"}
+VALID_BUY_MODES = {"fixed_usd", "observed_ratio"}
+VALID_SELL_MODES = {"source_ratio", "fixed_ratio", "ignore"}
+VALID_CONFIRMATION_POLICIES = {"pending", "processed", "confirmed", "finalized"}
 SECRET_MARKERS = ("private", "secret", "mnemonic", "seed", "keystore")
 
 
@@ -200,6 +203,26 @@ def _normalize_watch(raw: Mapping[str, Any], existing: Mapping[str, Any] | None 
     max_cap = _number(filters.get("maxMarketCapUsd", raw.get("maxMarketCapUsd", 0)), "最高市值")
     if max_cap and max_cap < min_cap:
         raise WalletManagementError("最高市值不能低于最低市值")
+    buy_mode = str(raw.get("buyMode") or existing_record.get("buyMode") or "fixed_usd")
+    sell_mode = str(raw.get("sellMode") or existing_record.get("sellMode") or "source_ratio")
+    confirmation = str(
+        raw.get("confirmationPolicy") or existing_record.get("confirmationPolicy") or "confirmed"
+    )
+    if buy_mode not in VALID_BUY_MODES:
+        raise WalletManagementError("无效的买入模式")
+    if sell_mode not in VALID_SELL_MODES:
+        raise WalletManagementError("无效的卖出模式")
+    if confirmation not in VALID_CONFIRMATION_POLICIES:
+        raise WalletManagementError("无效的确认级别")
+    buy_ratio = _number(raw.get("buyRatio", existing_record.get("buyRatio", 1)), "买入比例")
+    sell_ratio = _number(raw.get("sellRatio", existing_record.get("sellRatio", 1)), "卖出比例")
+    if buy_ratio > 1 or sell_ratio > 1:
+        raise WalletManagementError("买卖比例必须在 0 到 1 之间")
+    token_filters = raw.get("tokenFilters", existing_record.get("tokenFilters", {}))
+    if not isinstance(token_filters, Mapping):
+        raise WalletManagementError("Token 过滤器必须是对象")
+    allow = list(dict.fromkeys(str(value).strip() for value in token_filters.get("allow", []) if str(value).strip()))
+    deny = list(dict.fromkeys(str(value).strip() for value in token_filters.get("deny", []) if str(value).strip()))
     now = _now()
     return {
         "id": str(existing_record.get("id") or raw.get("id") or "watch_" + uuid.uuid4().hex),
@@ -210,6 +233,19 @@ def _normalize_watch(raw: Mapping[str, Any], existing: Mapping[str, Any] | None 
         "linkedKolId": str(raw.get("linkedKolId") or "").strip(),
         "linkedHandle": str(raw.get("linkedHandle") or "").strip().lstrip("@"),
         "status": status,
+        "enabled": _boolean(raw.get("enabled"), status == "active"),
+        "chains": chain_ids,
+        "buyMode": buy_mode,
+        "buyRatio": buy_ratio,
+        "fixedUsd": _number(raw.get("fixedUsd", existing_record.get("fixedUsd", 10)), "固定买入金额"),
+        "maxUsd": _number(raw.get("maxUsd", existing_record.get("maxUsd", 10)), "最大买入金额"),
+        "sellMode": sell_mode,
+        "sellRatio": sell_ratio,
+        "confirmationPolicy": confirmation,
+        "minimumTradeUsd": _number(
+            raw.get("minimumTradeUsd", existing_record.get("minimumTradeUsd", minimum)), "最低交易金额"
+        ),
+        "tokenFilters": {"allow": allow, "deny": deny},
         "notifications": {
             "buy": _boolean(notifications.get("buy", raw.get("notifyBuy")), True),
             "sell": _boolean(notifications.get("sell", raw.get("notifySell")), True),

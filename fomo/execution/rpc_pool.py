@@ -402,6 +402,12 @@ class RpcHealthStore:
                 "degraded" if rows else "untested"
             )
             item = endpoint.public_dict()
+            wss_heartbeat_healthy = any(row["success"] and row["method"] == "wss_heartbeat" for row in rows)
+            subscription_fresh = any(row["success"] and row["method"] == "subscription_freshness" for row in rows)
+            simulation_capable = any(
+                row["success"] and row["method"] in {"eth_call", "simulateTransaction"} for row in rows
+            )
+            broadcast_capable = any(row["success"] and row["method"] == "broadcast_capability" for row in rows)
             item.update({
                 "status": status,
                 "samples": len(rows),
@@ -414,6 +420,10 @@ class RpcHealthStore:
                 "sampleAgeSeconds": round(sample_age, 1) if sample_age is not None else None,
                 "telemetryCurrent": telemetry_current,
                 "chainEnabled": chain_enabled,
+                "wssHeartbeatHealthy": wss_heartbeat_healthy,
+                "subscriptionFresh": subscription_fresh,
+                "simulationCapable": simulation_capable,
+                "broadcastCapable": broadcast_capable,
             })
             public.append(item)
 
@@ -423,11 +433,20 @@ class RpcHealthStore:
             if candidates:
                 best = min(candidates, key=lambda item: (item["p95LatencyMs"], item["priority"]))
                 selected[chain_id] = str(best["endpointId"])
+        real_time_failover = {
+            chain_id: len([
+                item for item in public if str(item["chainId"]) == chain_id and item["status"] == "healthy"
+                and item["wssHeartbeatHealthy"] and item["subscriptionFresh"]
+                and item["simulationCapable"] and item["broadcastCapable"]
+            ]) >= 2
+            for chain_id in {str(endpoint.chain_id) for endpoint in endpoints}
+        }
         return {
             **rpc_pool_readiness(cfg),
             "reachable": sum(1 for item in public if item["chainEnabled"] and item["httpConfigured"] and item["telemetryCurrent"] and item["successRate"] is not None and item["successRate"] > 0),
             "healthy": sum(1 for item in public if item["status"] == "healthy"),
             "selected": selected,
+            "realTimeFailoverReady": real_time_failover,
             "endpoints": public,
             "policy": {"sampleWindow": sample_window, "evaluationWindowSeconds": evaluation_seconds,
                        "maximumP95LatencyMs": max_p95, "maximumBlockLag": max_lag, "maximumSampleAgeSeconds": max_age},

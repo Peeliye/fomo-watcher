@@ -16,6 +16,10 @@ dashboard:
   # 远程绑定时必须同时配置这两个环境变量并设置 allowed_origins。
   admin_token_env: FOMO_DASHBOARD_ADMIN_TOKEN
   csrf_token_env: FOMO_DASHBOARD_CSRF_TOKEN
+  # 配置 public_hostname 或 trusted_proxies 时，即使 host=127.0.0.1 也强制认证。
+  public_hostname: ""
+  trusted_proxies: []
+  sso_identity_header: ""
 
 wallet_management:
   watchlist_path: watch-wallets.json
@@ -49,6 +53,16 @@ copy_trading:
   fixed_usd: 10
   min_target_buy_usd: 100
   max_signal_age_seconds: 5
+  source_policies:
+    fomo_push:
+      maximum_age_ms: 5000
+      late_status: dropped_late
+    wallet_rpc_evm:
+      maximum_age_ms: 2000
+      late_status: dropped_late
+    wallet_rpc_solana:
+      maximum_age_ms: 2000
+      late_status: dropped_late
   whitelist_max_age_seconds: 600
   min_market_cap_usd: 100000
   max_slippage_bps: 200
@@ -143,8 +157,8 @@ routing:
   maximum_price_impact_bps: 100
   maximum_output_sacrifice_bps: 30
   # 极速买入只等待一条可执行主路由；第二路报价在买后分析阶段完成。
-  minimum_independent_routes: 1
-  require_simulation: false
+  minimum_independent_routes: 2
+  require_simulation: true
   require_allowlisted_route: true
   require_scope_validation: true
   require_minimum_output: true

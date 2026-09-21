@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.fomo-watcher/schemas/trade-signal-envelope.v1.json",
+  "title": "TradeSignalEnvelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "signalId", "source", "sourceEventId", "observedAt", "sourceTimestamp",
+    "deliveryDelayMs", "chainId", "actorWallet", "kolId", "side", "tokenIn",
+    "tokenOut", "sourceAmount", "estimatedUsd", "txHash", "signature", "logIndex",
+    "instructionIndex", "confirmationLevel", "reorgKey", "decoderVersion", "rawPayloadHash"
+  ],
+  "properties": {
+    "signalId": {"type": "string", "minLength": 1},
+    "source": {"enum": ["fomo_push", "wallet_rpc_evm", "wallet_rpc_solana"]},
+    "sourceEventId": {"type": "string", "minLength": 1},
+    "observedAt": {"type": "string", "format": "date-time"},
+    "sourceTimestamp": {"type": "string", "format": "date-time"},
+    "deliveryDelayMs": {"type": "integer", "minimum": 0},
+    "chainId": {"type": "string", "minLength": 1},
+    "actorWallet": {"type": ["string", "null"]},
+    "kolId": {"type": ["string", "null"]},
+    "side": {"enum": ["buy", "sell", "unknown"]},
+    "tokenIn": {"type": "string"}, "tokenOut": {"type": "string"},
+    "sourceAmount": {"type": ["string", "null"], "pattern": "^[0-9]+(?:\\.[0-9]+)?$"},
+    "estimatedUsd": {"type": ["string", "null"], "pattern": "^[0-9]+(?:\\.[0-9]+)?$"},
+    "txHash": {"type": ["string", "null"]}, "signature": {"type": ["string", "null"]},
+    "logIndex": {"type": ["integer", "null"], "minimum": 0},
+    "instructionIndex": {"type": ["integer", "null"], "minimum": 0},
+    "confirmationLevel": {"enum": ["pending", "processed", "confirmed", "finalized"]},
+    "reorgKey": {"type": "string", "minLength": 1},
+    "decoderVersion": {"type": "string", "minLength": 1},
+    "rawPayloadHash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

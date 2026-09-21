@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { readFile, rename, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createNdjsonQueue, evaluateShadow } from "./fast-shadow.mjs";
+import { acquireSingletonLock } from "./process-lock.mjs";
+import { loadVaultAccessToken } from "./secret-store.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const envFile = resolve(root, ".env");
@@ -12,6 +14,7 @@ const statusFile = resolve(root, "data", "realtime-status.json");
 const shadowFile = resolve(root, "data", "shadow-executions.ndjson");
 const fastConfigFile = resolve(root, "data", "fast-executor-config.json");
 const followingFile = resolve(root, "data", "following-ids.json");
+const releaseWriterLock = await acquireSingletonLock(resolve(root, "data", "fomo-events-writer.lock"), "realtime");
 const configText = readFileSync(resolve(root, "config.yaml"), "utf8");
 const topicId = configText.match(/^realtime_topic_id:\s*["']?([^\s"']+)/m)?.[1] || "";
 if (!topicId) throw new Error("config.yaml 缺少 realtime_topic_id");
@@ -65,10 +68,10 @@ function tokenExpiration(token) {
 }
 
 function currentAccessToken() {
-  const candidates = [envFile, sessionFile].map(path => {
+  const candidates = [loadVaultAccessToken(root), ...[envFile, sessionFile].map(path => {
     try { return dotenv.parse(readFileSync(path, "utf8")).FOMO_ACCESS_TOKEN || ""; }
     catch { return ""; }
-  });
+  })];
   return candidates.sort((a, b) => tokenExpiration(b) - tokenExpiration(a))[0] || "";
 }
 
@@ -207,6 +210,7 @@ async function shutdown(signal) {
   const forced = setTimeout(() => process.exit(1), 5000);
   await Promise.allSettled([eventQueue.close(), shadowQueue.close()]);
   await flushStatus();
+  await releaseWriterLock();
   clearTimeout(forced);
   process.exit(0);
 }

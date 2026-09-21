@@ -2,7 +2,6 @@
 config.yaml
 data/
 sidecar/node_modules/
-sidecar/pnpm-lock.yaml
 __pycache__/
 *.pyc
 .pip-cache/

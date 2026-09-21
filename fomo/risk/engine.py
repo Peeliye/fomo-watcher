@@ -70,6 +70,9 @@ def normalize_wallet(chain_id: str, wallet: str) -> str:
 
 class SignalSource(str, Enum):
     FOMO = "fomo"
+    FOMO_PUSH = "fomo_push"
+    WALLET_RPC_EVM = "wallet_rpc_evm"
+    WALLET_RPC_SOLANA = "wallet_rpc_solana"
     EVM_PENDING = "evm_pending"
     SOLANA_PREPROCESSED = "solana_preprocessed"
     SOLANA_PROCESSED = "solana_processed"
@@ -107,7 +110,7 @@ class UnifiedSignal:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "UnifiedSignal":
-        required = ("signalId", "source", "observedAt", "chainId", "kolId", "wallet")
+        required = ("signalId", "source", "observedAt", "chainId")
         missing = [name for name in required if not str(data.get(name, "")).strip()]
         if missing:
             raise ValueError("missing required signal fields: " + ", ".join(missing))
@@ -126,6 +129,12 @@ class UnifiedSignal:
         signal_id = str(data["signalId"]).strip()
         if len(signal_id) > 256:
             raise ValueError("signalId is too long")
+        wallet_value = data.get("actorWallet") or data.get("wallet")
+        if not str(wallet_value or "").strip():
+            raise ValueError("missing required signal fields: actorWallet")
+        wallet_source = source in {SignalSource.WALLET_RPC_EVM, SignalSource.WALLET_RPC_SOLANA}
+        if not wallet_source and not str(data.get("kolId") or "").strip():
+            raise ValueError("missing required signal fields: kolId")
         return cls(
             signal_id=signal_id,
             source=source,
@@ -133,7 +142,7 @@ class UnifiedSignal:
             source_timestamp=parse_time(source_time, "sourceTimestamp") if source_time else None,
             chain_id=str(data["chainId"]),
             kol_id=str(data["kolId"]).strip(),
-            wallet=normalize_wallet(str(data["chainId"]), str(data["wallet"])),
+            wallet=normalize_wallet(str(data["chainId"]), str(wallet_value)),
             wallet_confidence=confidence,
             original_tx=str(data["originalTx"]).strip() if data.get("originalTx") else None,
             side=side,
@@ -507,8 +516,11 @@ class ReadOnlyRiskEngine:
             )
         )
 
-        entry = self.registry.resolve(signal.chain_id, signal.wallet)
-        if entry is None:
+        wallet_source = signal.source in {SignalSource.WALLET_RPC_EVM, SignalSource.WALLET_RPC_SOLANA}
+        entry = None if wallet_source else self.registry.resolve(signal.chain_id, signal.wallet)
+        if wallet_source:
+            checks.append(self._check("identity", CheckStatus.PASS, "wallet_source_actor_present"))
+        elif entry is None:
             checks.append(self._check("identity", CheckStatus.REJECT, "wallet_not_registered"))
         elif entry.kol_id != signal.kol_id:
             checks.append(self._check("identity", CheckStatus.REJECT, "wallet_kol_mismatch"))

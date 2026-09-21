@@ -16,12 +16,18 @@
   "signals": {
     "allowedSources": [
       "fomo",
+      "fomo_push",
+      "wallet_rpc_evm",
+      "wallet_rpc_solana",
       "evm_pending",
       "solana_preprocessed",
       "solana_processed"
     ],
     "maximumAgeMs": {
       "fomo": 2000,
+      "fomo_push": 5000,
+      "wallet_rpc_evm": 2000,
+      "wallet_rpc_solana": 2000,
       "evm_pending": 750,
       "solana_preprocessed": 250,
       "solana_processed": 800
@@ -37,8 +43,10 @@
     "maximumSlippageBps": 150,
     "maximumQuoteAgeMs": 750,
     "maximumQuoteDivergenceBps": 100,
-    "minimumIndependentQuotes": 1,
-    "requireSimulation": false,
+    "minimumIndependentQuotes": 2,
+    "requireFirmExecutableQuote": true,
+    "requireIndependentSanityPrice": true,
+    "requireSimulation": true,
     "copyOriginalCalldata": false,
     "allowSkipPreflight": false,
     "parallelBroadcastProviders": 2

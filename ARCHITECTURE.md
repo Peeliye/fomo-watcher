@@ -1,5 +1,39 @@
 # 项目架构
 
+## 来源隔离与共享执行边界
+
+```mermaid
+flowchart LR
+  F[Fomo WebSocket / REST] --> FA[FomoPushAdapter\n白名单 + 平台事件语义]
+  E[EVM RPC] --> EA[EvmWalletRpcAdapter\ncheckpoint + receipt/log + reorg]
+  S[Solana RPC] --> SA[SolanaWalletRpcAdapter\ncheckpoint + instruction + blockhash]
+  EA --> ED[EvmSwapDecoder]
+  SA --> SD[SolanaSwapDecoder]
+  FA --> T[TradeSignalEnvelope v1]
+  ED --> T
+  SD --> T
+  T --> FS[FomoCopyStrategy\n固定 USD / 迟到丢弃 / first-sell]
+  T --> WS[WalletCopyStrategy\n固定/比例/上限/卖出比例]
+  FS --> I[ExecutionIntent]
+  WS --> I
+  I --> R[事务资金预留 + 风控 + 路由]
+  R --> C[SharedExecutionCore]
+  C --> J[(execution journal)]
+  C -. live_armed=false .-> X[Builder / Signer / Broadcaster]
+  X --> Q[ReceiptTracker]
+  Q --> L[(ActualWalletPosition)]
+  Q --> A[(StrategyAllocationLot)]
+```
+
+`SharedExecutionCore` 只接收 `ExecutionIntent`，不包含 Fomo、handle 或 KOL
+平台字段。`linkedKolId` 仅用于钱包观察项的展示，不参与钱包 RPC 事件识别、
+去重或卖出策略。Fomo 与钱包使用带 source namespace 的不同 signal ID。
+
+真实执行能力必须在 capability registry 中注册并通过运行时 `self_check()`；
+环境变量、任意 reference 或 `ROUTE_*_ENABLED=true` 本身不构成 implemented/ready。
+最终交易安全校验解析实际序列化字节。当前仓库未注册真实 signer/broadcaster，
+`execution_control.live_armed` 的数据库约束仍固定为 0。
+
 ## 目录职责
 
 ```text
@@ -30,8 +64,9 @@ Privy/WebSocket 边车也不持有交易签名职责。交易秘密只允许由�
 ## 持久化边界
 
 - `state.sqlite3`：监控去重状态。
-- `portfolio.sqlite3`：持仓、成交、估值和日统计。
-- `execution.sqlite3`：执行意图状态机与只读锁。
+- `portfolio.sqlite3`：模拟持仓，以及链上事实仓 `ActualWalletPosition` 与策略分配子账 `StrategyAllocationLot`。
+- `execution.sqlite3`：执行状态机、原子资金预留、quote/simulation/serialized hash/receipt journal 和关闭的 live 锁。
+- `state.sqlite3`：Fomo inbox/outbox；钱包 RPC checkpoint 使用独立的 checkpoint store 契约。
 - `rpc-health.sqlite3`：RPC 样本与自动选择依据，不保存 URL。
 - `wallet-intelligence.sqlite3`：去重后的观察事件和行为画像输入，不保存密钥。
 - `verified-performance.sqlite3`：交易哈希证明的标准化成交、历史行情、社交身份及真实钱包业绩。
@@ -48,8 +83,9 @@ Privy/WebSocket 边车也不持有交易签名职责。交易秘密只允许由�
 完成来源钱包的买卖闭环、历史价格和资金流关联后，才允许生成胜率、已实现 PnL、回撤和
 “早期 Alpha”评分。画像默认 `observe_only`，不能直接授权真实交易。
 
-链上业绩层与 Feed 行为层物理隔离。只有具备交易哈希、成交数量、美元估值且来源置信度不低于
-0.8 的记录才能进入 `verified-performance.sqlite3`。系统按 FIFO 重建每个代币仓位，只有至少三个
+链上业绩层与 Feed 行为层物理隔离。导入文件的 `sourceConfidence` 仅作审计字段，不构成验证。
+只有 receipt 已验证、达到 confirmed/finalized、带可信索引器 checkpoint，且显式声明完整历史的记录
+才可进入 verified 口径。系统按 FIFO 重建每个钱包/代币仓位，只有至少三个
 已闭环代币才将钱包标记为 `performanceVerified`；否则胜率保持为空。峰值倍率、早期入场、峰值后
 暴跌和归零反弹均来自时间有序的历史市值观测，不从当前市值反推。
 

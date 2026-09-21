@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS verified_fills (
   fee_usd_micros INTEGER NOT NULL DEFAULT 0, price_usd TEXT NOT NULL,
   market_cap_usd_micros INTEGER, executed_at TEXT NOT NULL,
   source TEXT NOT NULL, source_confidence TEXT NOT NULL,
-  history_complete INTEGER NOT NULL DEFAULT 1, raw_payload_hash TEXT NOT NULL,
+  history_complete INTEGER NOT NULL DEFAULT 0, raw_payload_hash TEXT NOT NULL,
+  receipt_verified INTEGER NOT NULL DEFAULT 0,
+  finality TEXT NOT NULL DEFAULT '',
+  indexer_checkpoint TEXT NOT NULL DEFAULT '',
   UNIQUE(chain_id, tx_hash, instruction_index, token_address, side)
 );
 CREATE INDEX IF NOT EXISTS idx_verified_fills_kol_time
@@ -107,7 +110,7 @@ BEGIN UPDATE performance_stats SET social_count=social_count+1 WHERE singleton=1
 CREATE TRIGGER IF NOT EXISTS social_identities_stats_delete AFTER DELETE ON social_identities
 BEGIN UPDATE performance_stats SET social_count=social_count-1 WHERE singleton=1; END;
 """
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _decimal(value: Any) -> Decimal:
@@ -149,12 +152,12 @@ def canonical_address(chain_id: int, value: Any) -> str:
 
 
 def _inventory_status(*, history_complete: bool, orphan: bool, oversold: bool) -> str:
-    if not history_complete:
-        return "inventory_incomplete"
     if orphan:
         return "orphan_sell"
     if oversold:
         return "oversold"
+    if not history_complete:
+        return "inventory_incomplete"
     return "complete"
 
 
@@ -214,7 +217,10 @@ class VerifiedPerformanceStore:
         for name, definition in (
             ("wallet_key", "TEXT NOT NULL DEFAULT ''"),
             ("token_key", "TEXT NOT NULL DEFAULT ''"),
-            ("history_complete", "INTEGER NOT NULL DEFAULT 1"),
+            ("history_complete", "INTEGER NOT NULL DEFAULT 0"),
+            ("receipt_verified", "INTEGER NOT NULL DEFAULT 0"),
+            ("finality", "TEXT NOT NULL DEFAULT ''"),
+            ("indexer_checkpoint", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE verified_fills ADD COLUMN {name} {definition}")
@@ -268,10 +274,12 @@ class VerifiedPerformanceStore:
                 kol_id = str(row.get("kolId") or "").strip()
                 wallet_raw = str(row.get("wallet") or "").strip()
                 qty, gross = _decimal(row.get("tokenQuantity")), _decimal(row.get("grossUsd"))
-                confidence = _decimal(row.get("sourceConfidence", 1))
+                # sourceConfidence is retained for audit compatibility but is
+                # never accepted as chain verification evidence.
+                confidence = _decimal(row.get("sourceConfidence", 0))
                 if side not in {"buy", "sell"} or not tx_hash or not kol_id or not wallet_raw:
                     continue
-                if qty <= 0 or gross <= 0 or confidence < Decimal("0.8"):
+                if qty <= 0 or gross <= 0:
                     continue
                 chain_id = int(row.get("chainId") or 0)
                 token_raw = str(row.get("tokenAddress") or "").strip()
@@ -297,8 +305,9 @@ class VerifiedPerformanceStore:
                     (fill_id,tx_hash,instruction_index,kol_id,handle,wallet,wallet_key,chain_id,
                      token_address,token_key,symbol,side,token_quantity,gross_usd_micros,
                      fee_usd_micros,price_usd,market_cap_usd_micros,executed_at,
-                     source,source_confidence,history_complete,raw_payload_hash)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     source,source_confidence,history_complete,raw_payload_hash,
+                     receipt_verified,finality,indexer_checkpoint)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         fill_id, tx_hash, index, kol_id, str(row.get("handle") or "unknown"),
                         wallet_key, wallet_key, chain_id, token_key, token_key,
@@ -306,8 +315,11 @@ class VerifiedPerformanceStore:
                         _micros(row.get("feeUsd")), str(_decimal(row.get("priceUsd")) or gross / qty),
                         _micros(row.get("marketCapUsd")) if row.get("marketCapUsd") is not None else None,
                         executed_at, str(row.get("source") or "normalized_chain_indexer"), str(confidence),
-                        int(bool(row.get("historyComplete", row.get("inventoryComplete", True)))),
+                        int(bool(row.get("historyComplete", row.get("inventoryComplete", False)))),
                         _hash(row.get("rawPayloadHash") or tx_hash),
+                        int(bool(row.get("receiptVerified", False))),
+                        str(row.get("finality") or ""),
+                        str(row.get("indexerCheckpoint") or ""),
                     ),
                 )
                 inserted += cursor.rowcount
@@ -493,7 +505,13 @@ class VerifiedPerformanceStore:
             lots: deque[list[Decimal]] = deque()
             token_realized = Decimal(0)
             orphan = oversold = False
-            history_complete = all(bool(row["history_complete"]) for row in token_rows)
+            history_complete = all(
+                bool(row["history_complete"])
+                and bool(row["receipt_verified"])
+                and str(row["finality"]) in {"confirmed", "finalized"}
+                and bool(str(row["indexer_checkpoint"]))
+                for row in token_rows
+            )
             first_buy = next((row for row in token_rows if row["side"] == "buy"), None)
             for row in token_rows:
                 quantity = _decimal(row["token_quantity"])
@@ -624,7 +642,7 @@ class VerifiedPerformanceStore:
         )
         verified = historically_verified and data_fresh
         unrealized_verified = all_inventory_complete and (not has_open_inventory or all_marks_fresh)
-        aggregate_unrealized: Decimal | None = estimated_unrealized if unrealized_verified else None
+        aggregate_unrealized: Decimal | None = estimated_unrealized if (not has_open_inventory or all_marks_fresh) else None
         aggregate_total = realized + aggregate_unrealized if aggregate_unrealized is not None and all_inventory_complete else None
         roi = aggregate_total / total_buy if aggregate_total is not None and total_buy else None
         early_rate = sum(int(item["earlyEntry"]) for item in token_results) / max(1, len(token_results))
@@ -666,6 +684,8 @@ class VerifiedPerformanceStore:
             "earlyEntryRate": round(early_rate, 4), "reboundEntryRate": round(rebound_rate, 4),
             "earlyClosedWins": early_wins, "reboundClosedWins": rebound_wins,
             "historicallyVerified": historically_verified, "performanceVerified": verified,
+            "realizedVerified": all_inventory_complete,
+            "unrealizedVerified": unrealized_verified,
             "latestFillAt": str(rows[-1]["executed_at"]), "lastMarketObservedAt": latest_market_at,
             "marketAgeSeconds": data_age, "markStatus": mark_status, "inventoryStatus": inventory_status,
             "realizedVerificationStatus": realized_status,

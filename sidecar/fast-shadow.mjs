@@ -34,6 +34,9 @@ export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = D
   const allowedNetworks = new Set((config?.networkIds || []).map(Number));
   const ids = new Set((whitelist?.followingIds || []).map(String));
   const whitelistAgeMs = whitelist?.updatedAt ? nowMs - Number(whitelist.updatedAt) : Infinity;
+  const sourceMaximumAgeMs = Number(
+    config?.sourcePolicies?.fomo_push?.maximumAgeMs ?? Number(config.maxSignalAgeSeconds || 5) * 1000
+  );
 
   const sourceType = String(event.type || "").toLowerCase();
   const passiveEvent = ["transfer", "airdrop", "mint", "deposit", "receive", "token_deploy"]
@@ -47,7 +50,7 @@ export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = D
   else if (!allowedEvents.has(sourceType) || !activeBuyEvents.has(sourceType)) status = "unsupported_event_type";
   else if (!String(event.tokenAddress || "")) status = "missing_ca";
   else if (!allowedNetworks.has(networkId)) status = "unsupported_network";
-  else if (signalAgeMs === null || signalAgeMs > Number(config.maxSignalAgeSeconds || 5) * 1000) status = "stale_signal";
+  else if (signalAgeMs === null || signalAgeMs > sourceMaximumAgeMs) status = "dropped_late";
   else if (targetBuyUsd < Number(config.minTargetBuyUsd || 0)) status = "target_trade_too_small";
   else if (!marketCapUsd && config?.deferAssetChecks !== false) deferredChecks.push("missing_market_cap");
   else if (marketCapUsd < Number(config.minMarketCapUsd || 0) && config?.deferAssetChecks !== false) deferredChecks.push("market_cap_too_small");

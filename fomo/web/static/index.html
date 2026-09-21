@@ -549,7 +549,10 @@
       <section class="panel hidden" id="risk-view" role="tabpanel">
         <div class="identity-overview" aria-label="钱包身份登记概览">
           <div class="identity-stat"><span>当前关注 KOL · 人</span><strong id="identity-followed">—</strong></div>
-          <div class="identity-stat"><span>已形成画像 · 人</span><strong id="identity-profiled">—</strong></div>
+          <div class="identity-stat"><span>当前关注独立 KOL · 人</span><strong id="identity-followed">—</strong></div>
+          <div class="identity-stat"><span>已观察独立 KOL · 人</span><strong id="identity-observed">—</strong></div>
+          <div class="identity-stat"><span>已物化行为画像 · 份</span><strong id="identity-profiled">—</strong></div>
+          <div class="identity-stat"><span>样本充分画像 · 份</span><strong id="identity-sufficient">—</strong></div>
           <div class="identity-stat"><span>待登记独立 KOL · 人</span><strong id="identity-pending-kols">—</strong></div>
           <div class="identity-stat"><span>待登记 KOL×链 · 组合</span><strong id="identity-pending-pairs">—</strong></div>
           <div class="identity-stat"><span>有效钱包记录 · 条</span><strong id="identity-wallet-entries">—</strong></div>
@@ -759,7 +762,7 @@
 
   <script type="module">
     import {DashboardConsistency,lifecycleRefreshKeys} from '/assets/dashboard-consistency.mjs';
-    const statusLabels={accepted:'成功买入',eligible:'可进入报价',not_following:'非关注用户',following_whitelist_unavailable:'关注白名单不可用',disabled:'已关闭',not_buy:'非买入事件',passive_asset_event:'转账/空投已忽略',missing_ca:'缺少代币地址',missing_transaction_reference:'缺少原交易引用',target_trade_too_small:'目标金额过小',stale_signal:'信号过期',unsupported_event_type:'事件类型未启用',unsupported_network:'链未启用（历史）',daily_limit_reached:'每日限额',per_kol_daily_limit_reached:'KOL 日限额',per_token_limit_reached:'单币限额',maximum_open_positions_reached:'持仓数上限',risk_limit_reached:'触发风控限额',market_cap_too_small:'市值过小',missing_market_cap:'缺少市值',needs_identity:'待身份登记',needs_data:'待风控数据',rejected:'已拒绝',approved_for_shadow:'影子准入'};
+    const statusLabels={accepted:'成功买入',eligible:'可进入报价',not_following:'非关注用户',following_whitelist_unavailable:'关注白名单不可用',disabled:'已关闭',not_buy:'非买入事件',passive_asset_event:'转账/空投已忽略',missing_ca:'缺少代币地址',missing_transaction_reference:'缺少原交易引用',target_trade_too_small:'目标金额过小',stale_signal:'信号过期（旧口径）',dropped_late:'迟到丢弃',unsupported_event_type:'事件类型未启用',unsupported_network:'链未启用（历史）',daily_limit_reached:'每日限额',per_kol_daily_limit_reached:'KOL 日限额',per_token_limit_reached:'单币限额',maximum_open_positions_reached:'持仓数上限',risk_limit_reached:'触发风控限额',market_cap_too_small:'市值过小',missing_market_cap:'缺少市值',needs_identity:'待身份登记',needs_data:'待风控数据',rejected:'已拒绝',approved_for_shadow:'影子准入'};
     const reasonLabels={missing_kol_id:'缺少用户标识',missing_chain_id:'缺少链信息',wallet_not_registered:'钱包未登记',ambiguous_wallet_mapping:'同链钱包映射不唯一',asset_snapshot_required:'缺少资产快照',independent_quotes_required:'缺少独立报价',exposure_snapshot_required:'缺少敞口快照',health_snapshot_required:'缺少系统健康快照',exit_plan_required:'缺少退出计划',transaction_simulation_required:'缺少交易模拟',transaction_scope_invalid:'交易范围不安全',route_not_allowlisted:'路由未加入白名单',minimum_output_required:'缺少最低到账保护',signal_too_old:'信号过期',wallet_mapping_expired:'钱包映射已过期',wallet_confidence_too_low:'钱包置信度过低'};
     const styleLabels={pvp_short_term:'PVP 短线',whale_momentum:'鲸鱼 / 趋势',narrative_momentum:'叙事趋势',early_alpha:'早期 Alpha',pvp_verified:'已验证 PVP',rebound_specialist:'反弹型',whale_confirmation:'鲸鱼增强信号',unclassified:'待分类'};
     const intelFlagLabels={pnl_unverified:'PnL 未验证',concentrated_activity:'交易集中',high_frequency:'高频',ultra_low_cap_exposure:'低市值暴露高'};
@@ -808,10 +811,10 @@
     const matches=(row,status,chain,q)=>(status==='all'||(row.status||row.outcome)===status)&&(chain==='all'||String(row.networkId)===chain)&&(!q||`${row.handle} ${row.kolId} ${row.wallet} ${row.symbol} ${row.ca}`.toLowerCase().includes(q));
     function statusOptions(){
       const options=state.view==='signals'
-        ? [['all','全部结果'],['eligible','已通过，等待询价'],['not_following','未跟踪用户'],['stale_signal','已过有效期'],['unsupported_network','网络未启用（历史）'],['unsupported_event_type','事件类型未启用']]
+        ? [['all','全部结果'],['eligible','已通过，等待询价'],['not_following','未跟踪用户'],['dropped_late','迟到丢弃'],['unsupported_network','网络未启用（历史）'],['unsupported_event_type','事件类型未启用']]
         : state.view==='risk'
         ? [['all','全部判定'],['needs_identity','待关联钱包'],['needs_data','待补风控数据'],['rejected','风控拒绝'],['approved_for_shadow','影子模式通过']]
-        : [['all','全部状态'],['accepted','成功买入'],['target_trade_too_small','目标金额过小'],['stale_signal','信号过期'],['unsupported_network','链未启用（历史）'],['unsupported_event_type','事件类型未启用'],['daily_limit_reached','每日限额'],['per_kol_daily_limit_reached','KOL 日限额'],['per_token_limit_reached','单币限额'],['maximum_open_positions_reached','持仓数上限'],['risk_limit_reached','触发风控限额']];
+        : [['all','全部状态'],['accepted','成功买入'],['target_trade_too_small','目标金额过小'],['dropped_late','迟到丢弃'],['unsupported_network','链未启用（历史）'],['unsupported_event_type','事件类型未启用'],['daily_limit_reached','每日限额'],['per_kol_daily_limit_reached','KOL 日限额'],['per_token_limit_reached','单币限额'],['maximum_open_positions_reached','持仓数上限'],['risk_limit_reached','触发风控限额']];
       const old=$('status').value;
       $('status').innerHTML=options.map(([value,label])=>`<option value="${value}">${label}</option>`).join('');
       $('status').value=options.some(([value])=>value===old)?old:'all';
@@ -880,7 +883,10 @@
     function renderIdentity(){
       const identity=state.identity;
       $('identity-followed').textContent=Number(identity.followedKols||0).toLocaleString();
-      $('identity-profiled').textContent=Number(identity.profiledKols||0).toLocaleString();
+      $('identity-followed').textContent=Number(identity.currentFollowedUniqueKols||0).toLocaleString();
+      $('identity-observed').textContent=Number(identity.observedUniqueKols||0).toLocaleString();
+      $('identity-profiled').textContent=Number(identity.materializedProfiles||0).toLocaleString();
+      $('identity-sufficient').textContent=Number(identity.sufficientProfiles||0).toLocaleString();
       $('identity-pending-kols').textContent=Number(identity.pendingUniqueKols||0).toLocaleString();
       $('identity-pending-pairs').textContent=Number(identity.pendingKolChainPairs||0).toLocaleString();
       $('identity-wallet-entries').textContent=Number(identity.registeredWalletEntries||0).toLocaleString();
@@ -911,12 +917,14 @@
         ?`${verifiedFillCount.toLocaleString()} 笔链上成交 · ${marketObservationCount.toLocaleString()} 个独立行情 · ${socialIdentityCount.toLocaleString()} 个社交身份`
         :'尚未接入或尚无链上成交、独立行情与社交身份数据';
       $('performance-rows').innerHTML=(performance.profiles||[]).map(row=>{
-        const wallet=String(row.wallet||'');
+        const walletList=(row.wallets||[]).map(String),wallet=walletList.join(' · ');
+        const walletDisplay=walletList.length?walletList.map(value=>`<span class="chain mono" title="${esc(value)}">${esc(value.slice(0,6)+'…'+value.slice(-4))}</span>`).join(''):'<span class="chain">未登记</span>';
         const social=(row.socialIdentities||[]).map(item=>`${item.platform}: @${item.handle}`).join(' · ')||'未匹配';
         const performanceStatuses={verified:'链上验证',stale_verified_history:'历史闭环 · 行情不可验证',inventory_incomplete:'库存不完整',market_missing:'缺少独立行情',market_stale:'独立行情过期',insufficient_closed_round_trips:'闭环不足'};
         const status=performanceStatuses[row.performanceStatus]||'尚未验证';
         const ci=row.winRateConfidence95?` · ${(Number(row.winRateConfidence95[0])*100).toFixed(0)}–${(Number(row.winRateConfidence95[1])*100).toFixed(0)}%` : '';
-        return `<tr><td><span class="token">@${esc(handleText(row.handle))}<span class="chain mono" title="${esc(wallet)}">${esc(wallet?wallet.slice(0,6)+'…'+wallet.slice(-4):'未登记')}</span></span></td><td><span class="badge ${row.performanceVerified?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td class="num">${row.winRate==null?'—':(Number(row.winRate)*100).toFixed(1)+'%'+ci}</td><td class="num ${pnlClass(row.roi)}">${row.roi==null?'—':(Number(row.roi)*100).toFixed(2)+'%'}</td><td class="num negative">${row.maxDrawdownUsd==null?'—':money(row.maxDrawdownUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${row.realizedPnlUsd==null?'—':signedMoney(row.realizedPnlUsd)}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${row.unrealizedPnlUsd==null?'不可验证':signedMoney(row.unrealizedPnlUsd)}</td><td class="num">${Number(row.verifiedFills||0)} / ${Number(row.tokens||0)}</td><td class="num">${(Number(row.earlyEntryRate||0)*100).toFixed(1)}%</td><td class="num">${(Number(row.reboundEntryRate||0)*100).toFixed(1)}%</td><td>${esc(social)}</td><td><span class="badge ${row.performanceVerified?'good':''}">${status}</span><span class="chain">行情 ${esc(row.markStatus||'missing')} · 库存 ${esc(row.inventoryStatus||'unknown')}</span></td></tr>`;
+        const verification=`历史 ${row.historicallyVerified?'已验证':'未验证'} · 已实现 ${row.realizedVerified?'已验证':'未验证'} · 未实现 ${row.unrealizedVerified?'已验证':'未验证'} · 综合 ${row.performanceVerified?'已验证':'未验证'}`;
+        return `<tr><td><span class="token">@${esc(handleText(row.handle))}${walletDisplay}</span></td><td><span class="badge ${row.performanceVerified?'good':''}">${esc(styleLabels[row.primaryStyle]||row.primaryStyle)}</span></td><td class="num">${row.winRate==null?'—':(Number(row.winRate)*100).toFixed(1)+'%'+ci}</td><td class="num ${pnlClass(row.roi)}">${row.roi==null?'—':(Number(row.roi)*100).toFixed(2)+'%'}</td><td class="num negative">${row.maxDrawdownUsd==null?'—':money(row.maxDrawdownUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${row.realizedPnlUsd==null?'—':signedMoney(row.realizedPnlUsd)}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${row.unrealizedPnlUsd==null?'不可验证':signedMoney(row.unrealizedPnlUsd)}</td><td class="num">${Number(row.verifiedFills||0)} / ${Number(row.tokens||0)}</td><td class="num">${(Number(row.earlyEntryRate||0)*100).toFixed(1)}%</td><td class="num">${(Number(row.reboundEntryRate||0)*100).toFixed(1)}%</td><td>${esc(social)}</td><td><span class="badge ${row.performanceVerified?'good':''}">${status}</span><span class="chain">${verification}</span><span class="chain">行情 ${esc(row.markStatus||'missing')} · 库存 ${esc(row.inventoryStatus||'unknown')}</span></td></tr>`;
       }).join('')||'<tr><td colspan="12" class="empty">尚未接入或尚无标准化链上成交、独立行情与社交身份数据；当前不能称为“已验证”</td></tr>';
       bindCopy();
       $('visible').textContent=`${Number(intel.profiled||0)} 个观察画像 · ${Number(performance.verifiedProfiles||0)} 个真实业绩已验证`;

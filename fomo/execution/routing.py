@@ -131,9 +131,6 @@ def route_readiness(cfg: dict[str, Any]) -> dict[str, Any]:
             env_key = str(provider.get("api_key_env") or "")
             requires_key = bool(env_key)
             adapter_env = str(provider.get("adapter_env") or "")
-            adapter_configured = bool(
-                adapter_env and os.getenv(adapter_env, "").strip().lower() in {"1", "true", "yes"}
-            )
             output.append({
                 "name": str(provider.get("name") or "unknown"),
                 "kind": str(provider.get("kind") or "unknown"),
@@ -141,10 +138,24 @@ def route_readiness(cfg: dict[str, Any]) -> dict[str, Any]:
                 "apiKeyConfigured": not requires_key or bool(os.getenv(env_key, "").strip()),
                 "requiresRpc": bool(provider.get("requires_rpc", False)),
                 "adapterEnv": adapter_env or None,
-                "implemented": adapter_configured,
-                "ready": adapter_configured and (not requires_key or bool(os.getenv(env_key, "").strip())),
+                # Readiness is supplied only by a registered adapter self-check.
+                # Environment strings and arbitrary references are not executable proof.
+                "implemented": False,
+                "ready": False,
+                "selfCheck": "adapter_not_registered",
             })
-        chains.append({"chainId": int(chain_id) if str(chain_id).isdigit() else chain_id, "providers": output})
+        ready_count = sum(1 for item in output if item["ready"])
+        minimum = int(settings.get("minimum_independent_routes", 2))
+        live_blockers = []
+        if ready_count < minimum:
+            live_blockers.append("independent_executable_routes_required")
+        if str(chain_id) == "5042" and not bool(settings.get("arc_reliable_market_data", False)):
+            live_blockers.append("arc_reliable_market_data_required")
+        if str(chain_id) == "5042" and not bool(settings.get("arc_exit_route_ready", False)):
+            live_blockers.append("arc_exit_route_required")
+        chains.append({"chainId": int(chain_id) if str(chain_id).isdigit() else chain_id,
+                       "providers": output, "liveBlockers": live_blockers,
+                       "liveReady": not live_blockers})
     return {
         "mode": str(settings.get("mode", "shadow")), "readOnly": str(settings.get("mode", "shadow")) != "live",
         "crossChainForbidden": bool(settings.get("prohibit_cross_chain", True)),

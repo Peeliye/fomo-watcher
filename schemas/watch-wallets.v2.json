@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.fomo-watcher/schemas/watch-wallets.v2.json",
+  "type": "object",
+  "required": ["version", "wallets"],
+  "properties": {
+    "version": {"type": "integer", "minimum": 1},
+    "wallets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "name", "address", "enabled", "chains", "buyMode", "buyRatio", "fixedUsd", "maxUsd", "sellMode", "confirmationPolicy", "minimumTradeUsd", "tokenFilters"],
+        "properties": {
+          "id": {"type": "string"}, "name": {"type": "string"}, "address": {"type": "string"},
+          "enabled": {"type": "boolean"}, "chains": {"type": "array", "items": {"type": "string"}},
+          "buyMode": {"enum": ["fixed_usd", "observed_ratio"]},
+          "buyRatio": {"type": "number", "minimum": 0, "maximum": 1},
+          "fixedUsd": {"type": "number", "minimum": 0}, "maxUsd": {"type": "number", "minimum": 0},
+          "sellMode": {"enum": ["source_ratio", "fixed_ratio", "ignore"]},
+          "sellRatio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+          "confirmationPolicy": {"enum": ["pending", "processed", "confirmed", "finalized"]},
+          "minimumTradeUsd": {"type": "number", "minimum": 0},
+          "tokenFilters": {
+            "type": "object", "required": ["allow", "deny"],
+            "properties": {"allow": {"type": "array", "items": {"type": "string"}}, "deny": {"type": "array", "items": {"type": "string"}}}
+          },
+          "linkedKolId": {"type": "string"}
+        }
+      }
+    }
+  }
+}

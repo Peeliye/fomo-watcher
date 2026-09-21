@@ -6,6 +6,8 @@ SQLite WAL mode keeps watcher writes and dashboard reads independent.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -130,9 +132,64 @@ CREATE INDEX IF NOT EXISTS idx_positions_status ON portfolio_positions(account_i
 CREATE INDEX IF NOT EXISTS idx_positions_open_tokens
   ON portfolio_positions(account_id, status, chain_id, token_address, symbol);
 CREATE INDEX IF NOT EXISTS idx_daily_day ON portfolio_daily(account_id, local_day DESC);
+CREATE TABLE IF NOT EXISTS actual_wallet_positions (
+  account_id TEXT NOT NULL,
+  chain_id INTEGER NOT NULL,
+  token_address TEXT NOT NULL,
+  quantity TEXT NOT NULL,
+  last_receipt_id TEXT NOT NULL,
+  finality TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(account_id,chain_id,token_address)
+);
+CREATE TABLE IF NOT EXISTS strategy_allocation_lots (
+  lot_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  allocation_key TEXT NOT NULL,
+  chain_id INTEGER NOT NULL,
+  token_address TEXT NOT NULL,
+  acquired_quantity TEXT NOT NULL,
+  remaining_quantity TEXT NOT NULL,
+  cost_usd_micros INTEGER NOT NULL,
+  opened_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('open','closed','reversed')),
+  receipt_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_allocation_lots_fifo ON strategy_allocation_lots(
+  account_id,source,allocation_key,chain_id,token_address,status,opened_at,lot_id
+);
+CREATE TABLE IF NOT EXISTS chain_receipt_journal (
+  receipt_id TEXT PRIMARY KEY,
+  tx_hash TEXT NOT NULL,
+  instruction_index INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  chain_id INTEGER NOT NULL,
+  token_address TEXT NOT NULL,
+  token_delta TEXT NOT NULL,
+  native_delta TEXT NOT NULL,
+  gas_fee_usd_micros INTEGER NOT NULL,
+  dex_fee_usd_micros INTEGER NOT NULL,
+  finality TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('confirmed','failed','reorged')),
+  pre_state_json TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  UNIQUE(chain_id,tx_hash,instruction_index)
+);
+CREATE TABLE IF NOT EXISTS native_balance_snapshots (
+  account_id TEXT NOT NULL,
+  chain_id INTEGER NOT NULL,
+  reserve_usd TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  source TEXT NOT NULL,
+  PRIMARY KEY(account_id,chain_id,captured_at)
+);
+CREATE INDEX IF NOT EXISTS idx_native_balance_latest
+  ON native_balance_snapshots(account_id,chain_id,captured_at DESC);
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 class PortfolioLedger:
@@ -205,6 +262,144 @@ class PortfolioLedger:
     def close(self) -> None:
         with self._write_lock:
             self.db.close()
+
+    def record_native_balance_snapshot(self, chain_id: int, reserve_usd: Any,
+                                       captured_at: str, source: str) -> None:
+        reserve = _decimal(reserve_usd)
+        if reserve < 0 or not source:
+            raise ValueError("native balance snapshot requires non-negative reserve and source")
+        captured = _event_time(captured_at).isoformat()
+        with self._transaction():
+            self.db.execute(
+                "INSERT OR IGNORE INTO native_balance_snapshots VALUES(?,?,?,?,?)",
+                (self.account_id, int(chain_id), str(reserve), captured, str(source)),
+            )
+
+    def apply_chain_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Apply factual wallet delta and strategy allocation atomically.
+
+        Failed receipts are journaled without inventing fills. Partial fills use
+        the receipt's actual token delta and FIFO allocation quantities.
+        """
+        tx_hash = str(receipt.get("txHash") or receipt.get("signature") or "").strip()
+        chain_id = int(receipt.get("chainId") or 0)
+        instruction_index = int(receipt.get("instructionIndex") or receipt.get("logIndex") or 0)
+        account_id = str(receipt.get("accountId") or self.account_id)
+        token = _token_key(chain_id, str(receipt.get("tokenAddress") or "").strip())
+        finality = str(receipt.get("finality") or "")
+        status = str(receipt.get("status") or "").lower()
+        if not tx_hash or not chain_id or not token or finality not in {"confirmed", "finalized"}:
+            raise ValueError("verified receipt identity and finality are required")
+        if status not in {"confirmed", "failed"}:
+            raise ValueError("receipt status must be confirmed or failed")
+        receipt_id = hashlib.sha256(f"{chain_id}|{tx_hash}|{instruction_index}".encode()).hexdigest()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            existing = self.db.execute(
+                "SELECT status FROM chain_receipt_journal WHERE receipt_id=?", (receipt_id,)
+            ).fetchone()
+            if existing:
+                return {"receiptId": receipt_id, "status": str(existing["status"]), "duplicate": True}
+            position = self.db.execute(
+                "SELECT * FROM actual_wallet_positions WHERE account_id=? AND chain_id=? AND token_address=?",
+                (account_id, chain_id, token),
+            ).fetchone()
+            lots = self.db.execute(
+                "SELECT * FROM strategy_allocation_lots WHERE account_id=? AND chain_id=? AND token_address=?",
+                (account_id, chain_id, token),
+            ).fetchall()
+            pre_state = {"position": dict(position) if position else None, "lots": [dict(row) for row in lots]}
+            token_delta = _decimal(receipt.get("tokenDelta")) if status == "confirmed" else Decimal("0")
+            if status == "confirmed":
+                current = _decimal(position["quantity"] if position else 0)
+                next_quantity = current + token_delta
+                if next_quantity < 0:
+                    raise ValueError("receipt would make actual wallet balance negative")
+                self.db.execute(
+                    "INSERT INTO actual_wallet_positions VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,chain_id,token_address) "
+                    "DO UPDATE SET quantity=excluded.quantity,last_receipt_id=excluded.last_receipt_id,"
+                    "finality=excluded.finality,updated_at=excluded.updated_at",
+                    (account_id, chain_id, token, str(next_quantity), receipt_id, finality, now),
+                )
+                source = str(receipt.get("source") or "")
+                allocation_key = str(receipt.get("allocationKey") or "")
+                if source and allocation_key and token_delta > 0:
+                    lot_id = hashlib.sha256(f"{receipt_id}|{source}|{allocation_key}".encode()).hexdigest()
+                    self.db.execute(
+                        "INSERT INTO strategy_allocation_lots VALUES(?,?,?,?,?,?,?,?,?,?,'open',?)",
+                        (lot_id, account_id, source, allocation_key, chain_id, token, str(token_delta),
+                         str(token_delta), _micros(receipt.get("grossUsd")) + _micros(receipt.get("dexFeeUsd")),
+                         str(receipt.get("executedAt") or now), receipt_id),
+                    )
+                elif source and allocation_key and token_delta < 0:
+                    remaining = -token_delta
+                    fifo = self.db.execute(
+                        "SELECT lot_id,remaining_quantity FROM strategy_allocation_lots WHERE account_id=? AND source=? "
+                        "AND allocation_key=? AND chain_id=? AND token_address=? AND status='open' "
+                        "ORDER BY opened_at,lot_id",
+                        (account_id, source, allocation_key, chain_id, token),
+                    ).fetchall()
+                    available = sum(_decimal(row["remaining_quantity"]) for row in fifo)
+                    if available < remaining:
+                        raise ValueError("strategy allocation cannot sell more than allocated inventory")
+                    for lot in fifo:
+                        if remaining <= 0:
+                            break
+                        quantity = _decimal(lot["remaining_quantity"])
+                        consumed = min(quantity, remaining)
+                        left = quantity - consumed
+                        self.db.execute(
+                            "UPDATE strategy_allocation_lots SET remaining_quantity=?,status=? WHERE lot_id=?",
+                            (str(left), "closed" if left == 0 else "open", lot["lot_id"]),
+                        )
+                        remaining -= consumed
+            self.db.execute(
+                "INSERT INTO chain_receipt_journal VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (receipt_id, tx_hash, instruction_index, account_id, chain_id, token, str(token_delta),
+                 str(_decimal(receipt.get("nativeDelta"))), _micros(receipt.get("gasFeeUsd")),
+                 _micros(receipt.get("dexFeeUsd")), finality, status,
+                 json.dumps(pre_state, separators=(",", ":")),
+                 json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str), now),
+            )
+        return {"receiptId": receipt_id, "status": status, "duplicate": False}
+
+    def reverse_chain_receipt(self, receipt_id: str) -> dict[str, Any]:
+        """Restore the exact pre-receipt factual position and allocation lots."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            row = self.db.execute("SELECT * FROM chain_receipt_journal WHERE receipt_id=?", (receipt_id,)).fetchone()
+            if row is None:
+                raise ValueError("receipt does not exist")
+            if row["status"] == "reorged":
+                return {"receiptId": receipt_id, "duplicate": True, "status": "reorged"}
+            pre = json.loads(str(row["pre_state_json"]))
+            key = (row["account_id"], row["chain_id"], row["token_address"])
+            self.db.execute(
+                "DELETE FROM actual_wallet_positions WHERE account_id=? AND chain_id=? AND token_address=?", key
+            )
+            if pre["position"]:
+                position = pre["position"]
+                self.db.execute(
+                    "INSERT INTO actual_wallet_positions VALUES(?,?,?,?,?,?,?)",
+                    tuple(position[name] for name in (
+                        "account_id", "chain_id", "token_address", "quantity", "last_receipt_id",
+                        "finality", "updated_at",
+                    )),
+                )
+            self.db.execute(
+                "DELETE FROM strategy_allocation_lots WHERE account_id=? AND chain_id=? AND token_address=?", key
+            )
+            for lot in pre["lots"]:
+                columns = ("lot_id", "account_id", "source", "allocation_key", "chain_id", "token_address",
+                           "acquired_quantity", "remaining_quantity", "cost_usd_micros", "opened_at", "status", "receipt_id")
+                self.db.execute(
+                    "INSERT INTO strategy_allocation_lots VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    tuple(lot[name] for name in columns),
+                )
+            self.db.execute(
+                "UPDATE chain_receipt_journal SET status='reorged',recorded_at=? WHERE receipt_id=?", (now, receipt_id)
+            )
+        return {"receiptId": receipt_id, "duplicate": False, "status": "reorged"}
 
     def has_event(self, event_id: str) -> bool:
         with self._write_lock:
@@ -366,15 +561,15 @@ class PortfolioLedger:
         self._last_backup_day = day
         return destination
 
-    def exposure_snapshot(self, event: Any) -> ExposureSnapshot:
+    def exposure_snapshot(self, event: Any, maximum_balance_age_seconds: int = 120) -> ExposureSnapshot:
         with self._write_lock:
-            return self._exposure_snapshot_locked(event)
+            return self._exposure_snapshot_locked(event, maximum_balance_age_seconds)
 
-    def _exposure_snapshot_locked(self, event: Any) -> ExposureSnapshot:
+    def _exposure_snapshot_locked(self, event: Any, maximum_balance_age_seconds: int = 120) -> ExposureSnapshot:
         """Build authoritative pre-trade exposure from the durable ledger.
 
-        Native gas reserve stays zero until an RPC-backed balance provider is
-        configured, intentionally keeping that live-trading check closed.
+        Native gas reserve comes only from a fresh, sourced balance snapshot.
+        Missing/stale data uses -1 as an unavailable sentinel and fails risk.
         """
         now_local = datetime.now(self.timezone)
         day_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -405,13 +600,22 @@ class PortfolioLedger:
             "SELECT 1 FROM portfolio_positions WHERE account_id=? AND kol_id=? AND chain_id=? AND token_address=? AND status='open'",
             (self.account_id, kol_id, int(event.network_id or 0), str(event.ca or "")),
         ).fetchone() is not None
+        balance = self.db.execute(
+            "SELECT reserve_usd,captured_at FROM native_balance_snapshots WHERE account_id=? AND chain_id=? "
+            "ORDER BY captured_at DESC LIMIT 1", (self.account_id, int(event.network_id or 0)),
+        ).fetchone()
+        native_reserve = Decimal("-1")
+        if balance is not None:
+            age = max(0.0, (datetime.now(timezone.utc) - _event_time(balance["captured_at"])).total_seconds())
+            if age <= max(1, int(maximum_balance_age_seconds)):
+                native_reserve = _decimal(balance["reserve_usd"])
         return ExposureSnapshot(
             per_token_usd=Decimal(int(token_cost)) / MICROS,
             per_kol_daily_usd=Decimal(int(kol_daily)) / MICROS,
             global_daily_usd=Decimal(int(global_daily)) / MICROS,
             open_positions=len(rows),
             chain_exposure_percent=chain_percent,
-            native_gas_reserve_usd=Decimal("0"),
+            native_gas_reserve_usd=native_reserve,
             has_open_position=has_open_position,
         )
 
@@ -539,23 +743,34 @@ class PortfolioLedger:
             ).fetchone()
             if row is None:
                 result = {"status": "ignored", "reason": "no_open_paper_position", "eventId": event.id}
+            elif paper_decision is not None and paper_decision.get("status") != "accepted":
+                result = {"status": "ignored", "reason": str(paper_decision.get("status")), "eventId": event.id}
             elif price <= 0:
                 result = {"status": "needs_price", "reason": "missing_execution_price", "eventId": event.id}
             else:
-                quantity = _decimal(row["quantity"])
+                full_quantity = _decimal(row["quantity"])
+                ratio = min(Decimal("1"), max(Decimal("0"), _decimal(
+                    (paper_decision or {}).get("paperSellRatio", 1)
+                )))
+                quantity = full_quantity * ratio
                 cost = int(row["cost_basis_usd_micros"])
+                cost_sold = int((Decimal(cost) * ratio).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
                 gross = _micros(quantity * price)
-                pnl = gross - cost
+                pnl = gross - cost_sold
                 realized_total = int(row["realized_pnl_micros"]) + pnl
+                remaining_quantity = full_quantity - quantity
+                remaining_cost = cost - cost_sold
+                position_status = "closed" if remaining_quantity <= Decimal("0.000000000000000001") else "open"
                 self.db.execute(
-                    """UPDATE portfolio_positions SET quantity='0',cost_basis_usd_micros=0,realized_pnl_micros=?,
-                       last_trade_at=?,last_price_usd=?,last_mark_at=?,status='closed'
+                    """UPDATE portfolio_positions SET quantity=?,cost_basis_usd_micros=?,realized_pnl_micros=?,
+                       last_trade_at=?,last_price_usd=?,last_mark_at=?,status=?
                        WHERE account_id=? AND kol_id=? AND chain_id=? AND token_address=?""",
-                    (realized_total, executed_at.isoformat(), str(price), executed_at.isoformat(), *key),
+                    (str(remaining_quantity), remaining_cost, realized_total, executed_at.isoformat(), str(price),
+                     executed_at.isoformat(), position_status, *key),
                 )
                 self.db.execute(
                     "INSERT INTO portfolio_fills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (f"paper:{event.id}:sell", event.id, self.account_id, kol_id, event.handle, int(event.network_id), event.ca, event.symbol, "sell", str(quantity), str(price), gross, cost, pnl, 0, executed_at.isoformat(), "paper"),
+                    (f"paper:{event.id}:sell", event.id, self.account_id, kol_id, event.handle, int(event.network_id), event.ca, event.symbol, "sell", str(quantity), str(price), gross, cost_sold, pnl, 0, executed_at.isoformat(), "paper"),
                 )
                 self._daily_delta(self._day(executed_at), sell=gross, pnl=pnl, trades=1)
                 result = {"status": "filled", "side": "sell", "eventId": event.id, "quantity": str(quantity), "grossUsd": _usd(gross), "realizedPnlUsd": _usd(pnl)}
