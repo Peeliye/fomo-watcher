@@ -130,11 +130,11 @@
     .pager-actions button:disabled { opacity:.35; cursor:not-allowed; }
     .empty,.error { padding:54px 20px; text-align:center; color:var(--muted); }
     .error { color:var(--red); }
-    .identity-overview { display:grid; grid-template-columns:repeat(4,minmax(100px,1fr)); gap:0; border-bottom:1px solid var(--line); background:rgb(17 31 44 / 55%); }
-    .identity-stat { padding:12px 14px; border-right:1px solid var(--line); }
-    .identity-stat span { display:block; color:var(--muted); font-size:11px; letter-spacing:.04em; }
-    .identity-stat strong { display:block; margin-top:3px; font-size:18px; font-variant-numeric:tabular-nums; }
-    .identity-backlog { min-width:0; padding:9px 12px; grid-column:1/-1; border-top:1px solid var(--line); }
+    .identity-overview { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:1px; border-bottom:1px solid var(--line); background:var(--line); }
+    .identity-stat { display:flex; align-items:center; justify-content:space-between; gap:8px; min-width:0; min-height:42px; padding:8px 12px; background:var(--surface); }
+    .identity-stat span { min-width:0; overflow:hidden; color:var(--muted); font-size:11px; letter-spacing:.04em; text-overflow:ellipsis; white-space:nowrap; }
+    .identity-stat strong { flex:none; font-size:16px; font-variant-numeric:tabular-nums; }
+    .identity-backlog { min-width:0; padding:9px 12px; grid-column:1/-1; background:var(--surface); }
     .identity-backlog-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:7px; color:var(--muted); font-size:11px; }
     .backlog-list { display:flex; flex-wrap:nowrap; gap:6px; width:100%; min-width:0; max-width:100%; overflow-x:auto; overflow-y:hidden; padding:0 0 5px; scrollbar-width:thin; scrollbar-color:#30495d transparent; scroll-snap-type:x proximity; }
     .backlog-item { display:flex; flex:0 0 320px; align-items:center; gap:9px; width:320px; max-width:320px; min-height:34px; padding:6px 8px; border:1px solid var(--line); border-radius:0; color:inherit; background:var(--surface); overflow:hidden; cursor:pointer; font:inherit; text-align:left; scroll-snap-align:start; }
@@ -381,8 +381,7 @@
       .metric:nth-last-child(-n+2) { border-bottom:0; }
       .analysis-grid { grid-template-columns:1fr 1fr; }
       .analysis-card:last-child { grid-column:1/-1; }
-      .identity-overview { grid-template-columns:repeat(4,1fr); }
-      .identity-backlog { grid-column:1/-1; border-top:1px solid var(--line); }
+      .identity-overview { grid-template-columns:repeat(4,minmax(0,1fr)); }
       .backlog-list { max-width:100%; overflow-x:auto; overflow-y:hidden; }
       .portfolio-metrics { grid-template-columns:repeat(3,1fr); }
       .exit-policy-form { grid-template-columns:repeat(3,minmax(120px,1fr)); }
@@ -419,7 +418,6 @@
       .analysis-grid { grid-template-columns:1fr; }
       .analysis-card:last-child { grid-column:auto; }
       .identity-overview { grid-template-columns:repeat(2,1fr); }
-      .identity-stat:nth-child(even) { border-right:0; }
       .portfolio-metrics { grid-template-columns:repeat(2,1fr); }
       .exit-policy-form { grid-template-columns:1fr 1fr; }
       .portfolio-metric:nth-child(3) { border-right:1px solid var(--line); }
@@ -548,7 +546,6 @@
 
       <section class="panel hidden" id="risk-view" role="tabpanel">
         <div class="identity-overview" aria-label="钱包身份登记概览">
-          <div class="identity-stat"><span>当前关注 KOL · 人</span><strong id="identity-followed">—</strong></div>
           <div class="identity-stat"><span>当前关注独立 KOL · 人</span><strong id="identity-followed">—</strong></div>
           <div class="identity-stat"><span>已观察独立 KOL · 人</span><strong id="identity-observed">—</strong></div>
           <div class="identity-stat"><span>已物化行为画像 · 份</span><strong id="identity-profiled">—</strong></div>
@@ -882,7 +879,6 @@
     }
     function renderIdentity(){
       const identity=state.identity;
-      $('identity-followed').textContent=Number(identity.followedKols||0).toLocaleString();
       $('identity-followed').textContent=Number(identity.currentFollowedUniqueKols||0).toLocaleString();
       $('identity-observed').textContent=Number(identity.observedUniqueKols||0).toLocaleString();
       $('identity-profiled').textContent=Number(identity.materializedProfiles||0).toLocaleString();
