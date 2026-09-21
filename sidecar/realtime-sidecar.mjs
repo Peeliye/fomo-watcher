@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import { createNdjsonQueue, evaluateShadow } from "./fast-shadow.mjs";
 import { createSignalQueue } from "./signal-queue.mjs";
 import { acquireSingletonLock } from "./process-lock.mjs";
-import { loadVaultAccessToken } from "./secret-store.mjs";
+import { accessTokenExpiration, loadVaultAccessToken, selectNewestValidAccessToken } from "./secret-store.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const envFile = resolve(root, ".env");
@@ -65,19 +65,13 @@ async function refreshFastState() {
   }
 }
 
-function tokenExpiration(token) {
-  try { return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")).exp || 0; }
-  catch { return 0; }
-}
-
 function currentAccessToken() {
   const vaultToken = loadVaultAccessToken(root);
-  if (vaultToken) return vaultToken;
-  const candidates = [envFile, sessionFile].map(path => {
+  const candidates = [vaultToken, ...[envFile, sessionFile].map(path => {
     try { return dotenv.parse(readFileSync(path, "utf8")).FOMO_ACCESS_TOKEN || ""; }
     catch { return ""; }
-  });
-  return candidates.sort((a, b) => tokenExpiration(b) - tokenExpiration(a))[0] || "";
+  })];
+  return selectNewestValidAccessToken(candidates);
 }
 
 async function flushStatus() {
@@ -113,7 +107,7 @@ function status(extra = {}) {
 function sendChallenge() {
   const jwt = currentAccessToken();
   if (ws?.readyState === WebSocket.OPEN) {
-    activeTokenExpiration = tokenExpiration(jwt);
+    activeTokenExpiration = accessTokenExpiration(jwt);
     ws.send(JSON.stringify({ type: "challengeResponse", jwt }));
   }
 }
@@ -257,7 +251,7 @@ setInterval(() => {
     scheduleReconnect("stale-connection");
     return;
   }
-  const newestExpiration = tokenExpiration(currentAccessToken());
+  const newestExpiration = accessTokenExpiration(currentAccessToken());
   if (activeTokenExpiration && activeTokenExpiration * 1000 - now < 30000 && newestExpiration > activeTokenExpiration) {
     scheduleReconnect("token-rotated", true);
   }

@@ -8,6 +8,21 @@ function pythonExecutable(root) {
   return existsSync(windows) ? windows : existsSync(posix) ? posix : "python";
 }
 
+export function accessTokenExpiration(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(token).split(".")[1], "base64url").toString("utf8"));
+    const expiration = Number(payload.exp);
+    return Number.isSafeInteger(expiration) && expiration > 0 ? expiration : 0;
+  } catch { return 0; }
+}
+
+export function selectNewestValidAccessToken(tokens, nowSeconds = Math.floor(Date.now() / 1000)) {
+  return tokens.reduce((best, candidate) => {
+    const token = String(candidate || "").trim();
+    return accessTokenExpiration(token) > Math.max(nowSeconds, accessTokenExpiration(best)) ? token : best;
+  }, "");
+}
+
 export function loadVaultAccessToken(root) {
   const result = spawnSync(pythonExecutable(root), ["-m", "scripts.secret_store_bridge", "get-access"], {
     cwd: root, encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
