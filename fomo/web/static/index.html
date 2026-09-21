@@ -972,14 +972,13 @@
       $('pnl-open').textContent=Number(p.openPositions||0).toLocaleString()+' 个';
       [['pnl-cost',p.costBasisUsd],['pnl-value',p.marketValueUsd],['pnl-unrealized',p.unrealizedPnlUsd],['pnl-realized',p.realizedPnlUsd],['pnl-total',p.totalPnlUsd]].forEach(([id,value])=>{$(id).textContent=id==='pnl-cost'||id==='pnl-value'?money(value):signedMoney(value);$(id).className=id==='pnl-cost'||id==='pnl-value'?'':pnlClass(value)});
       const evm=(r.accounts||[]).find(x=>x.family==='evm'),sol=(r.accounts||[]).find(x=>x.family==='solana');
-      const rpcReady=(r.chains||[]).filter(x=>x.rpcConfigured).length,rpcTotal=(r.chains||[]).length;
-      const stageLabels={wallet_addresses:'等待地址',rpc:'等待 RPC',routing:'等待双路报价器',signer:'等待签名器',broadcaster:'等待广播开关',mode:'等待显式实盘模式',live_execution_ready:'实盘执行就绪'};
+      const stageLabels={wallet_addresses:'等待地址',rpc:'等待 RPC',routing:'等待双路报价器',signer:'等待签名器',broadcaster:'等待广播开关',mode:'等待显式实盘模式',live_lock:'实盘锁未授权',live_execution_ready:'实盘执行就绪'};
       const readyItem=(label,value,title='')=>`<div class="ready-item"><span>${esc(label)}</span><strong title="${esc(title||value)}">${esc(value)}</strong></div>`;
       const journal=state.journal,blocked=Number(journal.states?.blocked||0),control=journal.control||{};
       const routeChains=state.route.chains||[],routeProviders=routeChains.flatMap(x=>x.providers||[]),keyProviders=routeProviders.filter(x=>x.apiKeyEnv),routeKeys=keyProviders.filter(x=>x.apiKeyConfigured).length;
       const pool=state.rpc||{},rpcTitle=(pool.endpoints||[]).map(x=>`${x.chainId} ${x.provider}: ${x.status}`).join('\n');
       const funds=(state.wallet.balances||[]).map(x=>x.available?`${chainName(x.chainId)} ${Number(x.balance).toLocaleString(undefined,{maximumSignificantDigits:8})} ${x.symbol}`:`${chainName(x.chainId)} 查询失败`).join(' · ')||'待登记地址';
-      stableHTML('execution-readiness',readyItem('执行阶段',stageLabels[r.stage]||r.stage||'—')+readyItem('RPC 节点池',`可达 ${pool.reachable||0} · 已配置 ${pool.configured||0}/${pool.total||0} · ${pool.healthy||0} 交易级`,rpcTitle)+readyItem('极速路由',`${routeChains.length} 链 · Key ${routeKeys}/${keyProviders.length}`,`双路竞速；价差保护 ${state.route.maximumOutputSacrificeBps||0} bps`)+readyItem('执行锁',control.circuitBreakerTripped?`锁定 · ${blocked} 阻断`:'待命',control.breakerReason||''));
+      stableHTML('execution-readiness',readyItem('执行阶段',stageLabels[r.stage]||r.stage||'—')+readyItem('RPC 节点池',`可达 ${pool.reachable||0} · 已配置 ${pool.configured||0}/${pool.total||0} · ${pool.healthy||0} 身份/链头健康（非执行就绪）`,rpcTitle)+readyItem('极速路由',`${routeChains.length} 链 · Key ${routeKeys}/${keyProviders.length}`,`双路竞速；价差保护 ${state.route.maximumOutputSacrificeBps||0} bps`)+readyItem('执行锁',control.circuitBreakerTripped?`锁定 · ${blocked} 阻断`:'待命',control.breakerReason||''));
       stableHTML('position-rows',(p.positions||[]).length?p.positions.map(row=>{
         const status=row.status==='open'?(row.markStale?'行情过期':'持仓中'):'已平仓';
         const stage=row.status!=='open'?'已结束':row.exitStage==='principal_recovered'?'已出本 · 跟踪回撤':'止损 / 等待出本';

@@ -21,7 +21,7 @@ class SelfCheckingCapability(Protocol):
 
 class CapabilityRegistry:
     REQUIRED = (
-        "quote_adapter", "transaction_builder", "signer", "broadcaster",
+        "quote_adapter", "transaction_builder", "transaction_simulator", "signer", "broadcaster",
         "nonce_blockhash_manager", "receipt_tracker", "transaction_parser",
     )
 
@@ -37,11 +37,13 @@ class CapabilityRegistry:
         checks: dict[str, dict[str, Any]] = {}
         for name in self.REQUIRED:
             capability = self._items.get(name)
-            result = (
-                capability.self_check()
-                if capability is not None
-                else CapabilityStatus(name, False, False, "adapter_not_registered", {})
-            )
+            try:
+                result = (capability.self_check() if capability is not None
+                          else CapabilityStatus(name, False, False, "adapter_not_registered", {}))
+            except Exception as error:
+                result = CapabilityStatus(name, False, False, "self_check_failed", {"errorType": type(error).__name__})
+            if not isinstance(result, CapabilityStatus):
+                result = CapabilityStatus(name, False, False, "self_check_invalid_result", {})
             if result.name != name:
                 result = CapabilityStatus(name, result.implemented, False, "self_check_name_mismatch", {})
             checks[name] = asdict(result)

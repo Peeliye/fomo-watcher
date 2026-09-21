@@ -134,7 +134,36 @@ CREATE TABLE IF NOT EXISTS execution_artifacts (
   updated_at TEXT NOT NULL,
   FOREIGN KEY(intent_id) REFERENCES execution_jobs(intent_id)
 );
-PRAGMA user_version=4;
+CREATE TABLE IF NOT EXISTS execution_broadcast_attempts (
+  intent_id TEXT PRIMARY KEY,
+  tx_hash TEXT NOT NULL UNIQUE,
+  signed_tx_hash TEXT NOT NULL,
+  attempted_at TEXT NOT NULL,
+  FOREIGN KEY(intent_id) REFERENCES execution_jobs(intent_id)
+);
+CREATE TABLE IF NOT EXISTS execution_evm_nonces (
+  intent_id TEXT PRIMARY KEY, chain_id TEXT NOT NULL, account_id TEXT NOT NULL,
+  nonce INTEGER NOT NULL, tx_hash TEXT,
+  UNIQUE(chain_id,account_id,nonce),
+  FOREIGN KEY(intent_id) REFERENCES execution_jobs(intent_id)
+);
+CREATE TABLE IF NOT EXISTS execution_nonce_lease_events (
+  lease_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  intent_id TEXT NOT NULL, chain_id TEXT NOT NULL, account_id TEXT NOT NULL,
+  nonce INTEGER NOT NULL, action TEXT NOT NULL CHECK(action IN ('acquired','bound','released')),
+  tx_hash TEXT, reason TEXT NOT NULL, recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nonce_lease_events_intent ON execution_nonce_lease_events(intent_id,lease_event_id);
+CREATE TABLE IF NOT EXISTS execution_source_reorg_fences (
+  signal_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL,
+  reason TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_solana_blockhashes (
+  intent_id TEXT PRIMARY KEY, blockhash TEXT NOT NULL,
+  last_valid_block_height INTEGER NOT NULL, tx_hash TEXT,
+  FOREIGN KEY(intent_id) REFERENCES execution_jobs(intent_id)
+);
+PRAGMA user_version=7;
 """
 
 JOB_TRANSITIONS: dict[str, frozenset[str]] = {
@@ -162,13 +191,18 @@ class ExecutionJournal:
         self.db.row_factory = sqlite3.Row
         self._write_lock = threading.RLock()
         version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
-        if existed and version < 4:
+        if version > 7:
+            self.db.close()
+            raise ValueError("unsupported_execution_journal_schema")
+        if existed and version < 7:
             directory = self.path.parent / "backups"
             directory.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            target = sqlite3.connect(directory / f"{self.path.stem}.pre-v4.from-v{version}.{stamp}.sqlite3")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            target = sqlite3.connect(directory / f"{self.path.stem}.pre-v7.from-v{version}.{stamp}.sqlite3")
             try:
                 self.db.backup(target)
+                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError("execution migration backup integrity check failed")
             finally:
                 target.close()
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -205,6 +239,10 @@ class ExecutionJournal:
             raise ValueError("reservation amount must be non-negative")
         now = datetime.now(timezone.utc).isoformat()
         with self._transaction():
+            if self.db.execute(
+                "SELECT 1 FROM execution_source_reorg_fences WHERE signal_id=?", (signal_id,)
+            ).fetchone():
+                raise ValueError("source_signal_reorged")
             existing = self.db.execute(
                 "SELECT intent_id,state FROM execution_jobs WHERE signal_id=? OR intent_id=?", (signal_id, intent_id)
             ).fetchone()
@@ -235,7 +273,29 @@ class ExecutionJournal:
             )
         return {"intentId": intent_id, "state": "reserved", "duplicate": False}
 
+    def record_source_reorg(self, signal_id: str) -> None:
+        """Durably fence a reverted wallet signal before any further submission."""
+        if not signal_id:
+            raise ValueError("reorg_signal_id_required")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            self.db.execute(
+                "INSERT OR IGNORE INTO execution_source_reorg_fences VALUES(?,?,'wallet_source_reorg')",
+                (signal_id, now),
+            )
+            self.db.execute(
+                "UPDATE execution_control SET circuit_breaker_tripped=1,breaker_reason='wallet_source_reorg',"
+                "updated_at=? WHERE singleton=1", (now,),
+            )
+
+    def source_reorged(self, signal_id: str) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM execution_source_reorg_fences WHERE signal_id=?", (signal_id,)
+        ).fetchone() is not None
+
     def transition_job(self, intent_id: str, to_state: str, *, metadata: dict[str, Any] | None = None) -> None:
+        if to_state in {"submitted", "broadcast"}:
+            raise ValueError("submission transitions require a precommitted transaction hash")
         now = datetime.now(timezone.utc).isoformat()
         with self._transaction():
             row = self.db.execute("SELECT state FROM execution_jobs WHERE intent_id=?", (intent_id,)).fetchone()
@@ -265,26 +325,168 @@ class ExecutionJournal:
                      encoded["provider"], encoded["nonce_or_blockhash"], now),
                 )
 
-    def persist_broadcast(self, intent_id: str, tx_hash: str, provider: str,
-                          nonce_or_blockhash: str, serialized_tx_hash: str) -> dict[str, Any]:
-        """Persist tx hash before returning; repeat calls never rebroadcast an intent."""
+    def fail_unsubmitted_job(self, intent_id: str, *, reason: str) -> None:
+        """Release only a pre-broadcast reservation; an uncertain send needs reconciliation."""
+        if not reason:
+            raise ValueError("failure reason required")
         now = datetime.now(timezone.utc).isoformat()
         with self._transaction():
-            row = self.db.execute("SELECT state,tx_hash FROM execution_jobs WHERE intent_id=?", (intent_id,)).fetchone()
+            job = self.db.execute(
+                "SELECT state,tx_hash FROM execution_jobs WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if job is None or job["tx_hash"] or job["state"] not in {
+                "reserved", "quoted", "simulated", "built", "signed"
+            }:
+                raise ValueError("unsubmitted_job_required_for_release")
+            attempt = self.db.execute(
+                "SELECT 1 FROM execution_broadcast_attempts WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if attempt is not None:
+                raise ValueError("broadcast_attempt_may_have_reached_chain")
+            reservation = self.db.execute(
+                "SELECT account_id,amount_usd_micros,status FROM execution_reservations WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            if reservation is None or reservation["status"] != "active":
+                raise ValueError("active_reservation_required")
+            self.db.execute(
+                "UPDATE capital_accounts SET reserved_usd_micros=reserved_usd_micros-?,updated_at=? "
+                "WHERE account_id=? AND reserved_usd_micros>=?",
+                (reservation["amount_usd_micros"], now, reservation["account_id"],
+                 reservation["amount_usd_micros"]),
+            )
+            if self.db.execute("SELECT changes()").fetchone()[0] != 1:
+                raise ValueError("capital_reservation_inconsistent")
+            self.db.execute(
+                "UPDATE execution_reservations SET status='released',updated_at=? WHERE intent_id=?",
+                (now, intent_id),
+            )
+            nonce = self.db.execute(
+                "SELECT chain_id,account_id,nonce,tx_hash FROM execution_evm_nonces WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            if nonce is not None:
+                if nonce["tx_hash"]:
+                    raise ValueError("signed_nonce_requires_manual_reconciliation")
+                self.db.execute(
+                    "INSERT INTO execution_nonce_lease_events"
+                    "(intent_id,chain_id,account_id,nonce,action,tx_hash,reason,recorded_at) "
+                    "VALUES(?,?,?,?,'released',?,?,?)",
+                    (intent_id, nonce["chain_id"], nonce["account_id"], nonce["nonce"],
+                     nonce["tx_hash"], reason, now),
+                )
+                self.db.execute("DELETE FROM execution_evm_nonces WHERE intent_id=?", (intent_id,))
+            self.db.execute(
+                "UPDATE execution_jobs SET state='failed',updated_at=? WHERE intent_id=?", (now, intent_id)
+            )
+            self.db.execute(
+                "INSERT INTO execution_artifacts(intent_id,simulation_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(intent_id) DO UPDATE SET simulation_json=excluded.simulation_json,updated_at=excluded.updated_at",
+                (intent_id, json.dumps({"failureReason": reason}, separators=(",", ":")), now),
+            )
+
+    def claim_submission(self, intent_id: str, tx_hash: str, provider: str,
+                         nonce_or_blockhash: str, serialized_tx_hash: str) -> dict[str, Any]:
+        """Commit the signed transaction ID before any network broadcast.
+
+        A repeated claim is not permission to broadcast again. The caller must
+        recover by querying the chain for the persisted ID.
+        """
+        if not all((tx_hash, provider, nonce_or_blockhash)) or len(serialized_tx_hash) != 64:
+            raise ValueError("signed transaction identity and SHA-256 are required")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            row = self.db.execute(
+                "SELECT state,tx_hash,provider,nonce_or_blockhash,serialized_tx_hash "
+                "FROM execution_jobs WHERE intent_id=?", (intent_id,)
+            ).fetchone()
             if row is None:
                 raise ValueError("execution intent does not exist")
             if row["tx_hash"]:
                 if str(row["tx_hash"]) != tx_hash:
                     raise ValueError("intent already has a different transaction hash")
+                if (row["provider"], row["nonce_or_blockhash"], row["serialized_tx_hash"]) != (
+                    provider, nonce_or_blockhash, serialized_tx_hash
+                ):
+                    raise ValueError("existing submission identity mismatch")
                 return {"intentId": intent_id, "txHash": tx_hash, "duplicate": True}
-            if str(row["state"]) not in {"submitted", "replaced", "reorged"}:
-                raise ValueError("intent must be submitted before broadcast")
+            if str(row["state"]) != "signed":
+                raise ValueError("intent must be signed before submission claim")
+            if self.db.execute(
+                "SELECT 1 FROM execution_source_reorg_fences WHERE signal_id="
+                "(SELECT signal_id FROM execution_jobs WHERE intent_id=?)", (intent_id,),
+            ).fetchone():
+                raise ValueError("source_signal_reorged")
             self.db.execute(
-                "UPDATE execution_jobs SET state='broadcast',tx_hash=?,serialized_tx_hash=?,provider=?,"
+                "UPDATE execution_jobs SET state='submitted',tx_hash=?,serialized_tx_hash=?,provider=?,"
                 "nonce_or_blockhash=?,updated_at=? WHERE intent_id=?",
                 (tx_hash, serialized_tx_hash, provider, nonce_or_blockhash, now, intent_id),
             )
+            self.db.execute(
+                "INSERT INTO execution_artifacts(intent_id,serialized_tx_hash,provider,nonce_or_blockhash,updated_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(intent_id) DO UPDATE SET "
+                "serialized_tx_hash=excluded.serialized_tx_hash,provider=excluded.provider,"
+                "nonce_or_blockhash=excluded.nonce_or_blockhash,updated_at=excluded.updated_at",
+                (intent_id, serialized_tx_hash, provider, nonce_or_blockhash, now),
+            )
         return {"intentId": intent_id, "txHash": tx_hash, "duplicate": False}
+
+    def persist_broadcast(self, intent_id: str, tx_hash: str, provider: str,
+                          nonce_or_blockhash: str, serialized_tx_hash: str) -> dict[str, Any]:
+        """Mark a preclaimed submission broadcast; never create its hash here."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            row = self.db.execute(
+                "SELECT state,tx_hash,provider,nonce_or_blockhash,serialized_tx_hash "
+                "FROM execution_jobs WHERE intent_id=?", (intent_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("execution intent does not exist")
+            if (row["tx_hash"], row["provider"], row["nonce_or_blockhash"], row["serialized_tx_hash"]) != (
+                tx_hash, provider, nonce_or_blockhash, serialized_tx_hash
+            ):
+                raise ValueError("broadcast identity differs from precommitted submission")
+            if row["state"] == "broadcast":
+                return {"intentId": intent_id, "txHash": tx_hash, "duplicate": True}
+            if row["state"] != "submitted":
+                raise ValueError("intent must have a precommitted submission")
+            self.db.execute("UPDATE execution_jobs SET state='broadcast',updated_at=? WHERE intent_id=?",
+                            (now, intent_id))
+        return {"intentId": intent_id, "txHash": tx_hash, "duplicate": False}
+
+    def claim_broadcast_attempt(self, intent_id: str, tx_hash: str, signed_tx_hash: str) -> None:
+        """One durable attempt only, committed before the external RPC call.
+
+        If the process dies after this commit, recovery checks the receipt and
+        never sends the same intent again, even if the first send was uncertain.
+        """
+        if len(signed_tx_hash) != 64:
+            raise ValueError("signed transaction SHA-256 required")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            if self.db.execute(
+                "SELECT 1 FROM execution_source_reorg_fences WHERE signal_id="
+                "(SELECT signal_id FROM execution_jobs WHERE intent_id=?)", (intent_id,),
+            ).fetchone():
+                raise ValueError("source_signal_reorged")
+            control = self.db.execute(
+                "SELECT live_armed,circuit_breaker_tripped FROM execution_control WHERE singleton=1"
+            ).fetchone()
+            if control is None or not control["live_armed"] or control["circuit_breaker_tripped"]:
+                raise ValueError("live_execution_disabled")
+            row = self.db.execute(
+                "SELECT state,tx_hash,serialized_tx_hash FROM execution_jobs WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if (row is None or row["state"] != "submitted" or row["tx_hash"] != tx_hash
+                    or row["serialized_tx_hash"] != signed_tx_hash):
+                raise ValueError("precommitted_submission_required")
+            try:
+                self.db.execute(
+                    "INSERT INTO execution_broadcast_attempts VALUES(?,?,?,?)",
+                    (intent_id, tx_hash, signed_tx_hash, now),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError("broadcast_attempt_already_recorded") from error
 
     def recoverable_broadcasts(self) -> list[dict[str, Any]]:
         rows = self.db.execute(
@@ -292,6 +494,62 @@ class ExecutionJournal:
             "WHERE tx_hash IS NOT NULL AND state IN ('submitted','broadcast','replaced','reorged') ORDER BY updated_at"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def reconcile_job_receipt(self, intent_id: str, receipt: dict[str, Any]) -> None:
+        """Persist independently tracked finality without inventing fills/deltas.
+
+        Confirmed reservations remain held until receipt token deltas have been
+        reconciled to the actual-wallet ledger. A finalized failure releases
+        the reservation atomically. Reorgs retain the hold for investigation.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._transaction():
+            row = self.db.execute(
+                "SELECT state,tx_hash,chain_id FROM execution_jobs WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if row is None or not row["tx_hash"] or row["tx_hash"] != receipt.get("txHash"):
+                raise ValueError("receipt_job_identity_mismatch")
+            if str(row["chain_id"]) != str(receipt.get("chainId")):
+                raise ValueError("receipt_chain_mismatch")
+            status = str(receipt.get("status") or "")
+            finality = str(receipt.get("finality") or "")
+            if status == "reorged":
+                if row["state"] not in {"broadcast", "confirmed", "submitted", "reorged"}:
+                    raise ValueError("reorg_job_state_invalid")
+                target = "reorged"
+            elif status in {"confirmed", "failed"} and finality == "finalized":
+                if row["state"] not in {"broadcast", "submitted", "replaced", "reorged", status}:
+                    raise ValueError("receipt_job_state_invalid")
+                target = status
+            else:
+                raise ValueError("finalized_receipt_required")
+            if row["state"] == target:
+                return
+            self.db.execute("UPDATE execution_jobs SET state=?,updated_at=? WHERE intent_id=?", (target, now, intent_id))
+            self.db.execute(
+                "INSERT INTO execution_artifacts(intent_id,receipt_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(intent_id) DO UPDATE SET receipt_json=excluded.receipt_json,updated_at=excluded.updated_at",
+                (intent_id, json.dumps(receipt, separators=(",", ":")), now),
+            )
+            if target == "failed":
+                reservation = self.db.execute(
+                    "SELECT account_id,amount_usd_micros,status FROM execution_reservations WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if reservation is None or reservation["status"] != "active":
+                    raise ValueError("active_reservation_required")
+                self.db.execute(
+                    "UPDATE capital_accounts SET reserved_usd_micros=reserved_usd_micros-?,updated_at=? "
+                    "WHERE account_id=? AND reserved_usd_micros>=?",
+                    (reservation["amount_usd_micros"], now, reservation["account_id"],
+                     reservation["amount_usd_micros"]),
+                )
+                if self.db.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise ValueError("capital_reservation_inconsistent")
+                self.db.execute(
+                    "UPDATE execution_reservations SET status='released',updated_at=? WHERE intent_id=?",
+                    (now, intent_id),
+                )
 
     def close(self) -> None:
         self.db.close()

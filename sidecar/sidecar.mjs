@@ -78,7 +78,7 @@ const persistBrowserSession = async () => {
   } catch { tokenExpiresAt = null; }
   const storage = storeSessionTokens(root, sessionFile, tokens.access, tokens.refresh);
   status({ sessionStorage: storage.storedIn, diskFallback: storage.diskFallback });
-  return true;
+  return storage.storedIn !== "unavailable";
 };
 
 const accessSecondsRemaining = async () => page.evaluate(() => {

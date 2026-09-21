@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 from fomo.execution.fast_path import evaluate_copy_buy
 from fomo.signals import FomoCopyStrategy, FomoPushAdapter, WalletCopyStrategy
 from fomo.signals.envelope import TradeSignalEnvelope
-from fomo.watching import CheckpointStore, EvmSwapDecoder, EvmWalletRpcAdapter
+from fomo.watching import CheckpointStore, EvmSwapDecoder, EvmWalletRpcAdapter, enabled_wallets
 from fomo.watching.adapter import ChainCheckpoint
 
 
@@ -35,6 +36,17 @@ class Provider:
 
 
 class SignalArchitectureTests(unittest.TestCase):
+    def _wallet_signal(self, *, side: str = "buy", confirmation: str = "confirmed") -> TradeSignalEnvelope:
+        return TradeSignalEnvelope.create(
+            source="wallet_rpc_evm", source_event_id="event-1", observed_at="2026-09-21T00:00:01Z",
+            source_timestamp="2026-09-21T00:00:00Z", delivery_delay_ms=1000, chain_id="1",
+            actor_wallet="0x1111111111111111111111111111111111111111", kol_id=None, side=side,
+            token_in="USDC" if side == "buy" else "TOKEN",
+            token_out="TOKEN" if side == "buy" else "USDC", source_amount="5", estimated_usd="10",
+            tx_hash="0xabc", signature=None, log_index=0, instruction_index=None,
+            confirmation_level=confirmation, reorg_key="h1", decoder_version="test@1", raw_payload_hash="a" * 64,
+        )
+
     def test_envelope_is_immutable_and_source_dedupe_keys_are_distinct(self):
         values = dict(source_event_id="same", observed_at="2026-09-21T00:00:01Z",
                       source_timestamp="2026-09-21T00:00:00Z", delivery_delay_ms=1000,
@@ -58,6 +70,37 @@ class SignalArchitectureTests(unittest.TestCase):
         self.assertIsNotNone(FomoCopyStrategy(10).create_intent(fomo))
         with self.assertRaises(ValueError):
             WalletCopyStrategy({"fixedUsd": 10}).create_intent(fomo)
+
+    def test_wallet_watchlist_and_strategy_apply_per_wallet_policy(self):
+        address = "0x1111111111111111111111111111111111111111"
+        config = {
+            "address": address, "enabled": True, "chains": ["1"], "buyMode": "observed_ratio",
+            "buyRatio": 0.5, "fixedUsd": 2, "maxUsd": 4, "sellMode": "fixed_ratio",
+            "sellRatio": 0.25, "confirmationPolicy": "finalized", "minimumTradeUsd": 5,
+            "tokenFilters": {"allow": ["TOKEN"], "deny": []},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "watch-wallets.json"
+            path.write_text(json.dumps({"version": 1, "wallets": [config]}), encoding="utf-8")
+            self.assertEqual(enabled_wallets(path, "1")[0]["address"], address)
+            provider = Provider()
+            store = CheckpointStore(Path(directory) / "checkpoints.sqlite3")
+            adapter = EvmWalletRpcAdapter("evm-1", "1", provider,
+                EvmSwapDecoder({"usdc"}, {"0xrouter"}), store)
+            adapter.poll_configured(str(path))
+            self.assertEqual(provider.calls, 0)
+            store.close()
+        strategy = WalletCopyStrategy(config)
+        self.assertIsNone(strategy.create_intent(self._wallet_signal()))
+        buy = strategy.create_intent(self._wallet_signal(confirmation="finalized"))
+        assert buy is not None
+        self.assertEqual(buy.requested_usd, 4)
+        sell = strategy.create_intent(self._wallet_signal(side="sell", confirmation="finalized"))
+        assert sell is not None
+        self.assertEqual(sell.sell_ratio, 0.25)
+        self.assertIsNone(WalletCopyStrategy({**config, "enabled": False}).create_intent(self._wallet_signal(confirmation="finalized")))
+        self.assertIsNone(WalletCopyStrategy({**config, "sellMode": "source_ratio"}).create_intent(
+            self._wallet_signal(side="sell", confirmation="finalized")))
 
     def test_wallet_bootstraps_at_head_and_does_not_scan_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -86,13 +129,54 @@ class SignalArchitectureTests(unittest.TestCase):
                 "preBalances": {"USDC": 100, "TOKEN": 0}, "postBalances": {"USDC": 90, "TOKEN": 5},
             }]
             first = adapter.poll(["0xactor"])
+            # Until downstream acknowledges its durable write, a restart/retry
+            # must redeliver the same signal rather than losing it at checkpoint.
+            store.close()
+            store = CheckpointStore(Path(directory) / "checkpoints.sqlite3")
+            adapter = EvmWalletRpcAdapter("evm-1", "1", provider,
+                EvmSwapDecoder({"usdc"}, {"0xrouter"}), store)
+            retry = adapter.poll(["0xactor"])
+            self.assertEqual((len(first.events), len(retry.events)), (1, 1))
+            self.assertEqual(first.events[0].event_id, retry.events[0].event_id)
+            self.assertEqual(first.events[0].signal, retry.events[0].signal)
+            self.assertEqual(first.events[0].signal.source, "wallet_rpc_evm")
+            self.assertEqual(provider.calls, 1)
+            self.assertTrue(store.acknowledge("evm-1", f"signal:{first.events[0].event_id}"))
             duplicate = adapter.poll(["0xactor"])
-            self.assertEqual((len(first.events), len(duplicate.events)), (1, 0))
+            self.assertEqual(len(duplicate.events), 0)
             provider.hashes[101] = "fork101"
             provider.pending = []
             rollback = adapter.poll(["0xactor"])
             self.assertEqual(rollback.reverted_event_ids, (first.events[0].event_id,))
             store.close()
+            reopened = CheckpointStore(Path(directory) / "checkpoints.sqlite3")
+            replay = EvmWalletRpcAdapter("evm-1", "1", provider,
+                EvmSwapDecoder({"usdc"}, {"0xrouter"}), reopened).poll(["0xactor"])
+            self.assertEqual(replay.reverted_event_ids, rollback.reverted_event_ids)
+            self.assertEqual(reopened.load("evm-1", "1").block_number, 100)
+            self.assertTrue(reopened.acknowledge("evm-1", f"reorg:{first.events[0].event_id}"))
+            reopened.close()
+
+    def test_existing_checkpoint_database_is_backed_up_before_outbox_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoints.sqlite3"
+            legacy = sqlite3.connect(path)
+            legacy.execute("CREATE TABLE wallet_checkpoints(adapter_id TEXT, chain_id TEXT, cursor TEXT, "
+                           "block_number INTEGER, block_hash TEXT, updated_at TEXT, "
+                           "PRIMARY KEY(adapter_id,chain_id))")
+            legacy.execute("INSERT INTO wallet_checkpoints VALUES('evm-1','1','100',100,'h100','old')")
+            legacy.commit()
+            legacy.close()
+            store = CheckpointStore(path)
+            self.assertEqual(store.load("evm-1", "1").block_number, 100)
+            store.close()
+            backups = list((Path(directory) / "backups").glob("checkpoints.pre-outbox.*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            backup = sqlite3.connect(backups[0])
+            self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(backup.execute("SELECT cursor FROM wallet_checkpoints").fetchone()[0], "100")
+            self.assertIsNone(backup.execute("SELECT 1 FROM sqlite_master WHERE name='wallet_delivery_outbox'").fetchone())
+            backup.close()
 
     def test_evm_decoder_ignores_one_sided_transfer_and_decodes_swap(self):
         decoder = EvmSwapDecoder({"usdc"}, {"0xrouter"})

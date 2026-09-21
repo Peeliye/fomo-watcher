@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from .envelope import TradeSignalEnvelope
@@ -69,24 +69,68 @@ class WalletCopyStrategy:
             raise ValueError("WalletCopyStrategy accepts only wallet RPC signals")
         if not signal.actor_wallet or signal.side == "unknown":
             return None
-        minimum = _decimal(self.config.get("minimumTradeUsd"))
-        observed = _decimal(signal.estimated_usd)
-        if observed < minimum:
+        if self.config.get("enabled") is not True or self.config.get("status", "active") != "active":
+            return None
+        if signal.chain_id not in set(map(str, self.config.get("chains") or [])):
+            return None
+        address = str(self.config.get("address") or "")
+        same_address = (address == signal.actor_wallet if signal.source == "wallet_rpc_solana"
+                        else address.casefold() == signal.actor_wallet.casefold())
+        if not address or not same_address:
+            return None
+        level = signal.confirmation_level
+        required = str(self.config.get("confirmationPolicy") or "confirmed")
+        levels = ({"processed": 0, "confirmed": 1, "finalized": 2} if signal.source == "wallet_rpc_solana"
+                  else {"pending": 0, "confirmed": 1, "finalized": 2})
+        if level not in levels or required not in levels or levels[level] < max(1, levels[required]):
+            return None
+        asset = signal.token_out if signal.side == "buy" else signal.token_in
+        filters = self.config.get("tokenFilters") or {}
+        if not isinstance(filters, Mapping):
+            return None
+        if not isinstance(filters.get("allow", []), list) or not isinstance(filters.get("deny", []), list):
+            return None
+        normalize = (str if signal.source == "wallet_rpc_solana" else str.casefold)
+        allow = {normalize(str(value)) for value in filters.get("allow", [])}
+        deny = {normalize(str(value)) for value in filters.get("deny", [])}
+        if normalize(asset) in deny or (allow and normalize(asset) not in allow):
+            return None
+        try:
+            minimum = _decimal(self.config.get("minimumTradeUsd"))
+            observed = _decimal(signal.estimated_usd)
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if not observed.is_finite() or observed <= 0 or minimum < 0 or observed < minimum:
             return None
         if signal.side == "buy":
             mode = str(self.config.get("buyMode") or "fixed_usd")
-            requested = (
-                observed * _decimal(self.config.get("buyRatio"), "1")
-                if mode == "observed_ratio" else _decimal(self.config.get("fixedUsd"))
-            )
-            maximum = _decimal(self.config.get("maxUsd"))
-            if maximum > 0:
-                requested = min(requested, maximum)
+            if mode not in {"fixed_usd", "observed_ratio"}:
+                return None
+            try:
+                ratio = _decimal(self.config.get("buyRatio"), "1")
+                requested = observed * ratio if mode == "observed_ratio" else _decimal(self.config.get("fixedUsd"))
+                maximum = _decimal(self.config.get("maxUsd"))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            if mode == "observed_ratio" and (not ratio.is_finite() or not Decimal("0") < ratio <= Decimal("1")):
+                return None
+            if not requested.is_finite() or not maximum.is_finite() or requested <= 0 or maximum <= 0:
+                return None
+            requested = min(requested, maximum)
             sell_ratio = None
         else:
             requested = Decimal("0")
             mode = str(self.config.get("sellMode") or "source_ratio")
-            sell_ratio = _decimal(self.config.get("sellRatio"), "1") if mode == "fixed_ratio" else None
+            # A source_ratio requires the source wallet's pre/post position,
+            # which is not part of the normalized signal. Never assume full sell.
+            if mode != "fixed_ratio":
+                return None
+            try:
+                sell_ratio = _decimal(self.config.get("sellRatio"), "1")
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            if not sell_ratio.is_finite() or not Decimal("0") < sell_ratio <= Decimal("1"):
+                return None
         return ExecutionIntent(
             f"intent:{signal.signal_id}", signal.signal_id, signal.source, "wallet-copy-v1",
             f"wallet:{signal.chain_id}:{signal.actor_wallet}", signal.chain_id, signal.side,

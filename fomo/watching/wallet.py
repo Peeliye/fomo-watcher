@@ -12,6 +12,7 @@ from fomo.signals.envelope import TradeSignalEnvelope, raw_payload_hash
 from .adapter import AdapterBatch, AdapterHealth, ChainCheckpoint, NormalizedWatchEvent
 from .checkpoints import CheckpointStore
 from .decoder import SwapDecoder
+from .watchlist import enabled_wallets
 
 
 class WalletRpcProvider(Protocol):
@@ -38,6 +39,11 @@ class WalletRpcAdapter(ABC):
     @abstractmethod
     def _confirmation(self, transaction: Mapping[str, Any]) -> str: ...
 
+    def poll_configured(self, watchlist_path: str) -> AdapterBatch:
+        """Select only enabled wallets on this chain from watch-wallets.json."""
+        entries = enabled_wallets(watchlist_path, self.chain_id)
+        return self.poll([str(entry["address"]) for entry in entries])
+
     def poll(self, wallets: Sequence[str], checkpoint: ChainCheckpoint | None = None) -> AdapterBatch:
         current = checkpoint or self.store.load(self.adapter_id, self.chain_id)
         if current is None:
@@ -47,25 +53,42 @@ class WalletRpcAdapter(ABC):
         reverted: tuple[str, ...] = ()
         if current.block_number is not None and current.block_hash:
             canonical = self.provider.canonical_hash(current.block_number)
-            if canonical and canonical != current.block_hash:
+            if not canonical:
+                raise ValueError("canonical_checkpoint_hash_required")
+            if canonical != current.block_hash:
                 rewind_to = max(0, current.block_number - 1)
-                reverted = self.store.rollback_after(self.adapter_id, self.chain_id, rewind_to)
+                rewind_hash = self.provider.canonical_hash(rewind_to)
+                if not rewind_hash:
+                    raise ValueError("canonical_rewind_hash_required")
+                reverted = self.store.rollback_after(self.adapter_id, self.chain_id, rewind_to, rewind_hash)
                 current = ChainCheckpoint(self.chain_id, str(rewind_to), rewind_to,
-                                          self.provider.canonical_hash(rewind_to))
+                                          rewind_hash)
+        pending_events, pending_reverts = self.store.pending_deliveries(self.adapter_id, self.chain_id)
+        if pending_events or pending_reverts:
+            return AdapterBatch(pending_events, current, pending_reverts)
         raw_events, next_checkpoint = self.provider.events_after(current, wallets)
-        normalized: list[NormalizedWatchEvent] = []
-        durable: list[tuple[str, int | None, str | None]] = []
+        durable: list[tuple[NormalizedWatchEvent, int | None, str | None]] = []
+        allowed_wallets = ({value.casefold() for value in wallets} if self.source == "wallet_rpc_evm"
+                           else set(wallets))
         for transaction in raw_events:
             actor = str(transaction.get("actorWallet") or "")
-            if actor not in wallets:
+            actor_key = actor.casefold() if self.source == "wallet_rpc_evm" else actor
+            if actor_key not in allowed_wallets:
                 continue
             decoded = self.decoder.decode(transaction, actor)
             if decoded is None:
                 continue
+            event_height = transaction.get("blockNumber")
+            if event_height is None:
+                event_height = transaction.get("slot")
+            event_block_hash = str(transaction.get("blockHash") or "")
+            if event_height is None or (self.source == "wallet_rpc_evm" and not event_block_hash):
+                raise ValueError("confirmed_wallet_event_requires_block_position")
             reference, log_index, instruction_index = self._identity(transaction)
             index = instruction_index if instruction_index is not None else log_index or 0
+            reorg_key = event_block_hash or str(event_height)
             event_id = hashlib.sha256(
-                f"{self.source}\0{self.chain_id}\0{reference}\0{index}\0{actor}".encode()
+                f"{self.source}\0{self.chain_id}\0{reference}\0{index}\0{actor}\0{reorg_key}".encode()
             ).hexdigest()
             signal_event_id = f"sig:v1:{self.source}:" + hashlib.sha256(
                 f"{self.source}\0{event_id}".encode()
@@ -84,21 +107,22 @@ class WalletRpcAdapter(ABC):
                 signature=reference if self.source == "wallet_rpc_solana" else None,
                 log_index=log_index, instruction_index=instruction_index,
                 confirmation_level=self._confirmation(transaction),
-                reorg_key=str(transaction.get("blockHash") or transaction.get("slot") or reference),
+                reorg_key=reorg_key,
                 decoder_version=decoded.decoder_version, raw_payload_hash=raw_payload_hash(transaction),
             )
-            normalized.append(NormalizedWatchEvent(
+            event = NormalizedWatchEvent(
                 event_id=envelope.signal_id, chain_id=self.chain_id, wallet=actor,
                 kind=decoded.side, token_address=decoded.token_out if decoded.side == "buy" else decoded.token_in,
                 token_quantity=decoded.source_amount, usd_value_micros=(
                     int(float(decoded.estimated_usd) * 1_000_000) if decoded.estimated_usd else None
                 ), transaction_id=reference, instruction_index=index, observed_at=observed,
-            ))
-            durable.append((envelope.signal_id, transaction.get("blockNumber") or transaction.get("slot"),
-                            str(transaction.get("blockHash") or "") or None))
+                signal=envelope,
+            )
+            durable.append((event, int(event_height), event_block_hash or None))
             self.last_observed_at = observed
         self.store.commit_batch(self.adapter_id, next_checkpoint, durable)
-        return AdapterBatch(tuple(normalized), next_checkpoint, reverted)
+        pending_events, pending_reverts = self.store.pending_deliveries(self.adapter_id, self.chain_id)
+        return AdapterBatch(pending_events, next_checkpoint, pending_reverts or reverted)
 
     def health(self) -> AdapterHealth:
         if not self.last_observed_at:

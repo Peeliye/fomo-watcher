@@ -140,16 +140,16 @@ class RpcPoolTests(unittest.TestCase):
         endpoint = RpcEndpoint("1", "test", "primary", public_http_url="https://rpc.example/key")
         with (
             patch(
-                "fomo.execution.rpc_pool.validate_endpoint_url",
+                "fomo.watching.rpc_transport.validate_endpoint_url",
                 side_effect=[
                     (endpoint.resolved_http_url, frozenset({"93.184.216.34"})),
                     (endpoint.resolved_http_url, frozenset({"93.184.216.35"})),
                 ],
             ),
-            patch("fomo.execution.rpc_pool.cf.post") as post,
+            patch("fomo.watching.rpc_transport.cf.post") as post,
         ):
             result = probe_rpc_endpoint(endpoint)
-        self.assertEqual(result["error_code"], "dns_rebinding_rejected")
+        self.assertEqual(result["error_code"], "rpc_dns_rebinding_rejected")
         post.assert_not_called()
 
     def test_probe_rejects_redirect_without_following_it(self):
@@ -157,27 +157,32 @@ class RpcPoolTests(unittest.TestCase):
         response = Mock(status_code=302, primary_ip="93.184.216.34")
         with (
             patch(
-                "fomo.execution.rpc_pool.validate_endpoint_url",
+                "fomo.watching.rpc_transport.validate_endpoint_url",
                 return_value=(endpoint.resolved_http_url, frozenset({"93.184.216.34"})),
             ),
-            patch("fomo.execution.rpc_pool.cf.post", return_value=response) as post,
+            patch("fomo.watching.rpc_transport.cf.post", return_value=response) as post,
         ):
             result = probe_rpc_endpoint(endpoint)
-        self.assertEqual(result["error_code"], "redirect_rejected")
+        self.assertEqual(result["error_code"], "rpc_redirect_rejected")
         self.assertFalse(post.call_args.kwargs["allow_redirects"])
         self.assertEqual(post.call_args.kwargs["proxy"], "")
 
     def test_probe_prefers_ipv4_when_dns_returns_ipv4_and_ipv6(self):
         endpoint = RpcEndpoint("1", "test", "primary", public_http_url="https://rpc.example/key")
         addresses = frozenset({"2606:4700:10::1", "93.184.216.34"})
-        response = Mock(status_code=200, primary_ip="93.184.216.34")
-        response.json.return_value = {"result": "0x10"}
+        def response_for_method(_url, **kwargs):
+            method = kwargs["json"]["method"]
+            value = {"eth_chainId": "0x1", "eth_blockNumber": "0x10",
+                     "eth_getBlockByNumber": {"hash": "h16"}}[method]
+            response = Mock(status_code=200, primary_ip="93.184.216.34")
+            response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": value}
+            return response
         with (
             patch(
-                "fomo.execution.rpc_pool.validate_endpoint_url",
+                "fomo.watching.rpc_transport.validate_endpoint_url",
                 return_value=(endpoint.resolved_http_url, addresses),
             ),
-            patch("fomo.execution.rpc_pool.cf.post", return_value=response) as post,
+            patch("fomo.watching.rpc_transport.cf.post", side_effect=response_for_method) as post,
         ):
             result = probe_rpc_endpoint(endpoint)
         self.assertTrue(result["success"])

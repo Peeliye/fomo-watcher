@@ -4,3 +4,6 @@ tzdata>=2025.2
 keyring>=25.0,<26
 python-dotenv>=1.0,<2
 bip-utils>=2.9,<3
+coincurve>=21,<22
+PyNaCl>=1.6,<2
+pycryptodome>=3.23,<4

@@ -1,8 +1,9 @@
 import dotenv from "dotenv";
 import { readFileSync } from "node:fs";
-import { readFile, rename, stat, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { createNdjsonQueue, evaluateShadow } from "./fast-shadow.mjs";
+import { createSignalQueue } from "./signal-queue.mjs";
 import { acquireSingletonLock } from "./process-lock.mjs";
 import { loadVaultAccessToken } from "./secret-store.mjs";
 
@@ -14,10 +15,11 @@ const statusFile = resolve(root, "data", "realtime-status.json");
 const shadowFile = resolve(root, "data", "shadow-executions.ndjson");
 const fastConfigFile = resolve(root, "data", "fast-executor-config.json");
 const followingFile = resolve(root, "data", "following-ids.json");
-const releaseWriterLock = await acquireSingletonLock(resolve(root, "data", "fomo-events-writer.lock"), "realtime");
 const configText = readFileSync(resolve(root, "config.yaml"), "utf8");
 const topicId = configText.match(/^realtime_topic_id:\s*["']?([^\s"']+)/m)?.[1] || "";
 if (!topicId) throw new Error("config.yaml 缺少 realtime_topic_id");
+await mkdir(dirname(eventFile), { recursive: true });
+const releaseWriterLock = await acquireSingletonLock(resolve(root, "data", "fomo-events-writer.lock"), "realtime");
 
 let ws = null;
 let authenticated = false;
@@ -40,6 +42,7 @@ let statusExtra = {};
 let statusWrites = Promise.resolve();
 const eventQueue = createNdjsonQueue(eventFile, { maxQueue: 10_000, retentionDays: 30 });
 const shadowQueue = createNdjsonQueue(shadowFile, { maxQueue: 10_000, retentionDays: 30 });
+const signalQueue = createSignalQueue(resolve(root, "data", "signal-queue.sqlite3"));
 
 async function fileMtime(path) {
   try { return (await stat(path)).mtimeMs; } catch { return 0; }
@@ -68,10 +71,12 @@ function tokenExpiration(token) {
 }
 
 function currentAccessToken() {
-  const candidates = [loadVaultAccessToken(root), ...[envFile, sessionFile].map(path => {
+  const vaultToken = loadVaultAccessToken(root);
+  if (vaultToken) return vaultToken;
+  const candidates = [envFile, sessionFile].map(path => {
     try { return dotenv.parse(readFileSync(path, "utf8")).FOMO_ACCESS_TOKEN || ""; }
     catch { return ""; }
-  })];
+  });
   return candidates.sort((a, b) => tokenExpiration(b) - tokenExpiration(a))[0] || "";
 }
 
@@ -173,6 +178,13 @@ function connect() {
       const receivedAt = new Date().toISOString();
       const shadow = evaluateShadow(message.payload, receivedAt, fastConfig, following);
       shadow.decisionLatencyMs = Math.round(Number(process.hrtime.bigint() - ingressStarted) / 1000) / 1000;
+      try {
+        signalQueue.enqueueFomo(message.payload, receivedAt);
+      } catch {
+        status({ reason: "durable-signal-queue-error" });
+        if (ws === socket && ws.readyState === WebSocket.OPEN) ws.close(1013, "durable-queue-error");
+        return;
+      }
       const enqueueStarted = performance.now();
       const eventPersisted = eventQueue.enqueue({ receivedAt, payload: message.payload });
       shadow.durableEnqueueLatencyMs = Math.round((performance.now() - enqueueStarted) * 1000) / 1000;
@@ -209,6 +221,7 @@ async function shutdown(signal) {
   ws?.close();
   const forced = setTimeout(() => process.exit(1), 5000);
   await Promise.allSettled([eventQueue.close(), shadowQueue.close()]);
+  signalQueue.close();
   await flushStatus();
   await releaseWriterLock();
   clearTimeout(forced);

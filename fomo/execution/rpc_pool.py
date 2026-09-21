@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from math import ceil
@@ -17,13 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
-from urllib.parse import urlparse
-
-from curl_cffi import requests as cf
-from curl_cffi.const import CurlOpt
 
 from .networks import enabled_chain_ids
-from .url_safety import UnsafeEndpointError, validate_endpoint_url
 
 
 @dataclass(frozen=True)
@@ -108,51 +102,26 @@ def rpc_pool_readiness(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def probe_rpc_endpoint(endpoint: RpcEndpoint, timeout_seconds: float = 2.0) -> dict[str, Any]:
-    """Probe one endpoint without ever returning or persisting its URL."""
-    url = endpoint.resolved_http_url
-    if not url:
+    """Probe chain identity and head through the same guarded transport as execution."""
+    from fomo.watching.rpc_transport import FailoverJsonRpc, RpcUnavailable
+
+    if not endpoint.http_configured:
         return {"success": False, "latency_ms": None, "block_height": None, "error_code": "not_configured"}
     method = "getSlot" if endpoint.chain_id == "1399811149" else "eth_blockNumber"
     started = time.perf_counter()
     try:
-        url, first_addresses = validate_endpoint_url(url)
-        _, second_addresses = validate_endpoint_url(url)
-        if first_addresses != second_addresses:
-            return {"success": False, "latency_ms": None, "block_height": None,
-                    "error_code": "dns_rebinding_rejected"}
-        parsed = urlparse(url)
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        host = str(parsed.hostname)
-        # Multiple duplicate CURLOPT_RESOLVE entries for one host are not a
-        # fallback list: libcurl effectively uses the last one. Cloudflare
-        # returns both IPv4 and IPv6, so an IPv6 address could be selected on
-        # IPv4-only VPS hosts and make a healthy endpoint look unreachable.
-        ipv4_addresses = sorted(address for address in second_addresses if ":" not in address)
-        pinned_address = (ipv4_addresses or sorted(second_addresses))[0]
-        resolve = [f"{host}:{port}:{'[' + pinned_address + ']' if ':' in pinned_address else pinned_address}"]
-        response = cf.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": []},
-                           headers={"Accept": "application/json"}, timeout=timeout_seconds,
-                           impersonate="chrome", allow_redirects=False, proxy="",
-                           curl_options={CurlOpt.RESOLVE: resolve, CurlOpt.PROXY: ""})
-        latency_ms = (time.perf_counter() - started) * 1000
-        if response.primary_ip and response.primary_ip not in second_addresses:
-            return {"success": False, "latency_ms": latency_ms, "block_height": None,
-                    "error_code": "connected_address_mismatch"}
-        if 300 <= response.status_code < 400:
-            return {"success": False, "latency_ms": latency_ms, "block_height": None,
-                    "error_code": "redirect_rejected"}
-        if response.status_code >= 400:
-            return {"success": False, "latency_ms": latency_ms, "block_height": None,
-                    "error_code": f"http_{response.status_code}"}
-        result = response.json().get("result")
+        result = FailoverJsonRpc(endpoint.chain_id, [endpoint], timeout_seconds=timeout_seconds).call(method, [])
         height = int(result, 16) if isinstance(result, str) and result.startswith("0x") else int(result)
-        return {"success": True, "latency_ms": latency_ms, "block_height": height, "error_code": None}
-    except UnsafeEndpointError as error:
+        return {"success": True, "latency_ms": (time.perf_counter() - started) * 1000,
+                "block_height": height, "error_code": None, "identity_verified": True,
+                "execution_methods_verified": False, "broadcast_capability_verified": False}
+    except (OSError, ValueError, TypeError, RpcUnavailable) as error:
+        code = str(error).rsplit(":", 1)[-1]
+        if not code.startswith("rpc_"):
+            code = "rpc_probe_failed"
         return {"success": False, "latency_ms": (time.perf_counter() - started) * 1000,
-                "block_height": None, "error_code": str(error)}
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, cf.RequestsError) as error:
-        return {"success": False, "latency_ms": (time.perf_counter() - started) * 1000,
-                "block_height": None, "error_code": type(error).__name__}
+                "block_height": None, "error_code": code, "identity_verified": False,
+                "execution_methods_verified": False, "broadcast_capability_verified": False}
 
 
 def run_rpc_probe_cycle(project_dir: Path, cfg: dict[str, Any], samples: int = 3, timeout_seconds: float = 2.0) -> dict[str, Any]:

@@ -1,7 +1,7 @@
-"""Public-only multi-chain execution wallet and RPC readiness model.
+"""Multi-chain execution readiness; configuration strings are never proof.
 
-This module deliberately never loads private keys and never connects to RPC.
-It reports what configuration is still required before read-only RPC work.
+The default registry is inert. An explicitly supplied capability registry may
+perform RPC and OS credential-store self-checks, but never exposes secrets.
 """
 
 from __future__ import annotations
@@ -13,10 +13,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from curl_cffi import requests
 from ..risk.engine import chain_family, normalize_wallet
+from ..watching.rpc_transport import FailoverJsonRpc, RpcTransport
 from .capabilities import DEFAULT_CAPABILITY_REGISTRY, CapabilityRegistry
-from .rpc_pool import load_rpc_endpoints, rpc_pool_readiness
+from .journal import execution_snapshot
+from .rpc_pool import RpcEndpoint, load_rpc_endpoints, rpc_pool_readiness
 from .routing import route_readiness
 
 
@@ -27,36 +28,42 @@ CHAIN_NAMES = {
 NATIVE_SYMBOLS = {"1": "ETH", "56": "BNB", "4663": "ETH", "5042": "USDC", "8453": "ETH", "1399811149": "SOL"}
 
 
-def _native_balance(chain_id: str, address: str, url: str) -> dict[str, Any]:
+def _native_balance(chain_id: str, address: str, rpc: RpcTransport) -> dict[str, Any]:
     try:
         if chain_id == "1399811149":
-            body = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [address, {"commitment": "confirmed"}]}
-            value = int(requests.post(url, json=body, timeout=4).json()["result"]["value"])
+            result = rpc.call("getBalance", [address, {"commitment": "confirmed"}])
+            value = int(result["value"])
             amount = Decimal(value) / Decimal(10**9)
         else:
-            body = {"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "latest"]}
-            value = int(requests.post(url, json=body, timeout=4).json()["result"], 16)
+            result = rpc.call("eth_getBalance", [address, "latest"])
+            value = int(result, 16) if isinstance(result, str) and result.startswith("0x") else int(result)
             amount = Decimal(value) / Decimal(10**18)
-        return {"chainId": int(chain_id), "symbol": NATIVE_SYMBOLS[chain_id], "balance": format(amount, "f"), "available": True}
+        if value < 0:
+            raise ValueError("negative_native_balance")
+        return {"chainId": int(chain_id), "symbol": NATIVE_SYMBOLS[chain_id], "balance": format(amount, "f"),
+                "available": True, "rpcIdentityVerified": True, "executionReady": False}
     except Exception as error:
-        return {"chainId": int(chain_id), "symbol": NATIVE_SYMBOLS.get(chain_id), "balance": None, "available": False, "error": type(error).__name__}
+        return {"chainId": int(chain_id), "symbol": NATIVE_SYMBOLS.get(chain_id), "balance": None,
+                "available": False, "rpcIdentityVerified": False, "executionReady": False,
+                "error": type(error).__name__}
 
 
 def wallet_balance_snapshot(project_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     readiness = execution_readiness(project_dir, cfg)
-    pool_endpoints = {
-        str(endpoint.chain_id): endpoint.resolved_http_url
-        for endpoint in load_rpc_endpoints(cfg) if endpoint.http_configured
-    }
+    pool_endpoints = load_rpc_endpoints(cfg)
     jobs = []
     for chain in readiness["chains"]:
         chain_id, address = str(chain["chainId"]), chain.get("address")
-        url = os.getenv(str(chain.get("rpcEnv") or ""), "").strip() or pool_endpoints.get(chain_id, "")
-        if address and url:
-            jobs.append((chain_id, address, url))
+        endpoints = [item for item in pool_endpoints if item.chain_id == chain_id and item.http_configured]
+        env_key = str(chain.get("rpcEnv") or "")
+        if not endpoints and env_key and os.getenv(env_key, "").strip():
+            endpoints = [RpcEndpoint(chain_id, "legacy-config", "primary", http_env=env_key)]
+        if address and endpoints:
+            jobs.append((chain_id, address, FailoverJsonRpc(chain_id, endpoints)))
     with ThreadPoolExecutor(max_workers=min(6, max(1, len(jobs)))) as pool:
         balances = list(pool.map(lambda item: _native_balance(*item), jobs)) if jobs else []
-    return {"walletId": readiness["walletId"], "accounts": readiness["accounts"], "balances": balances, "nativeOnly": True}
+    return {"walletId": readiness["walletId"], "accounts": readiness["accounts"], "balances": balances,
+            "nativeOnly": True, "executionReady": False}
 
 
 def load_wallet_profile(path: str | Path) -> dict[str, Any]:
@@ -136,6 +143,7 @@ def execution_readiness(project_dir: Path, cfg: dict[str, Any],
             "accountId": candidates[0]["accountId"] if len(candidates) == 1 else None,
             "address": candidates[0]["address"] if len(candidates) == 1 else None,
             "rpcEnv": env_key or None, "rpcConfigured": rpc_configured,
+            "rpcProbeReachable": None, "rpcExecutionMethodsVerified": False,
             "rpcConfiguredEndpoints": sum(1 for item in pool_items if item["httpConfigured"]),
             "rpcTotalEndpoints": len(pool_items),
         })
@@ -152,10 +160,16 @@ def execution_readiness(project_dir: Path, cfg: dict[str, Any],
         blockers.append("signer_required")
     if not broadcaster_configured:
         blockers.append("broadcaster_required")
+    if not capability_status["ready"]:
+        blockers.append("execution_capabilities_required")
     if execution_mode != "live":
         blockers.append("execution_mode_not_live")
     if routes.get("mode") != "live":
         blockers.append("routing_mode_not_live")
+    control = execution_snapshot(project_dir / "data" / "execution.sqlite3", limit=1)["control"]
+    live_armed = bool(control.get("liveArmed")) and not bool(control.get("circuitBreakerTripped", True))
+    if not live_armed:
+        blockers.append("live_execution_lock_disabled")
     address_blocked = any(reason.startswith(("wallet_", "ambiguous_", "multiple_evm")) for reason in blockers)
     rpc_blocked = any(reason.startswith("rpc_required") for reason in blockers)
     route_blocked = any(reason.startswith("independent_route_adapters_required") for reason in blockers)
@@ -165,12 +179,15 @@ def execution_readiness(project_dir: Path, cfg: dict[str, Any],
         "routing" if route_blocked else
         "signer" if not signer_configured else
         "broadcaster" if not broadcaster_configured else
+        "capabilities" if not capability_status["ready"] else
         "mode" if execution_mode != "live" or routes.get("mode") != "live" else
+        "live_lock" if not live_armed else
         "live_execution_ready"
     )
     return {
         "walletId": str(profile.get("walletId") or "unconfigured"),
         "mode": execution_mode,
+        "liveArmed": live_armed,
         "stage": stage, "ready": stage == "live_execution_ready",
         "readOnly": stage != "live_execution_ready", "signerBackend": signer_backend, "signerConfigured": signer_configured,
         "broadcasterConfigured": broadcaster_configured,

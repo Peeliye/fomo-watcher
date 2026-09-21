@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -21,7 +21,16 @@ export function storeSessionTokens(root, sessionFile, access, refresh) {
     stdio: ["pipe", "ignore", "ignore"],
   });
   if (result.status === 0) return { storedIn: "system_secret_store", diskFallback: false };
+  // POSIX mode bits do not protect a file with Windows ACLs. Never write a
+  // refresh token to disk there when the credential store is unavailable.
+  if (process.platform === "win32") return { storedIn: "unavailable", diskFallback: false };
+  if (existsSync(sessionFile)) {
+    try { chmodSync(sessionFile, 0o600); }
+    catch { return { storedIn: "unavailable", diskFallback: false }; }
+  }
   writeFileSync(sessionFile, `FOMO_ACCESS_TOKEN=${access}\nFOMO_REFRESH_TOKEN=${refresh}\n`, { mode: 0o600 });
-  try { chmodSync(sessionFile, 0o600); } catch {}
+  try { chmodSync(sessionFile, 0o600); }
+  catch { return { storedIn: "unavailable", diskFallback: false }; }
+  if ((statSync(sessionFile).mode & 0o077) !== 0) return { storedIn: "unavailable", diskFallback: false };
   return { storedIn: "permission_restricted_disk_fallback", diskFallback: true };
 }

@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, Sequence
 
+from fomo.signals.envelope import TradeSignalEnvelope
+
 
 @dataclass(frozen=True)
 class ChainCheckpoint:
@@ -31,6 +33,7 @@ class NormalizedWatchEvent:
     transaction_id: str
     instruction_index: int
     observed_at: str
+    signal: TradeSignalEnvelope | None = None
 
 
 @dataclass(frozen=True)

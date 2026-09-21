@@ -31,8 +31,10 @@ flowchart LR
 
 真实执行能力必须在 capability registry 中注册并通过运行时 `self_check()`；
 环境变量、任意 reference 或 `ROUTE_*_ENABLED=true` 本身不构成 implemented/ready。
-最终交易安全校验解析实际序列化字节。当前仓库未注册真实 signer/broadcaster，
-`execution_control.live_armed` 的数据库约束仍固定为 0。
+最终交易安全校验解析实际序列化字节。已提供 EVM/Solana RPC 读取、系统凭据库签名、
+报价、构建、模拟、广播及 receipt 适配器，但默认执行服务未注册它们；当前 0x/Jupiter
+返回的交易格式尚未被严格 scope parser 完整支持，因此不得声称端到端实盘就绪。
+`execution_control.live_armed` 的数据库约束仍固定为 0。签名后的交易 ID 必须在任何网络广播前写入 journal 的 `submitted` 状态；崩溃恢复只查该 ID 的 receipt，不自动重播。
 
 ## 目录职责
 
@@ -61,13 +63,22 @@ Privy/WebSocket 边车也不持有交易签名职责。交易秘密只允许由�
 助记词可由 `scripts.wallet_vault` 写入当前操作系统用户的凭据管理器，项目文件和日志不得保存或显示它；
 存入凭据不代表 signer 已启用。
 
+Fomo refresh token 优先写入系统凭据库。旧的 `data/.fomo-session.env` 可由运维人员显式执行
+`python -m scripts.secret_store_bridge migrate-session` 导入；命令不打印 token，也不会自动删除旧文件。
+Windows 上凭据库不可用时不再落盘；POSIX 磁盘 fallback 必须是 0600。realtime 与 debug sidecar
+共用 `data/fomo-events-writer.lock`，不能同时写入事件文件。
+
 ## 持久化边界
 
 - `state.sqlite3`：监控去重状态。
 - `portfolio.sqlite3`：模拟持仓，以及链上事实仓 `ActualWalletPosition` 与策略分配子账 `StrategyAllocationLot`。
 - `execution.sqlite3`：执行状态机、原子资金预留、quote/simulation/serialized hash/receipt journal 和关闭的 live 锁。
+- 执行库升级到 v7 前先经 SQLite backup API 写入同目录 `backups/execution.pre-v7.from-vN.<UTC>.sqlite3` 并做 `integrity_check`。nonce 审计表记录 acquired/bound/released；未预提交且未绑定签名交易的失败租约才会与资金预留同事务释放。v7 还保存来源 reorg fence，在预提交和广播尝试前阻断。回滚时先停止所有写入进程，核对备份 `integrity_check=ok` 与 `user_version=N`，保存当前库供审计，再用该备份还原；不可只还原 `.sqlite3` 而让旧 WAL/SHM 继续写入。
+- `signal-queue.sqlite3`：Fomo Node 写入和钱包 Python 写入共享的持久化入口；单消费者租约和 source-namespaced signal ID 保证幂等。钱包 outbox 先入队、再 ack；reorg 待对账时暂停该链投递。
 - `state.sqlite3`：Fomo inbox/outbox；钱包 RPC checkpoint 使用独立的 checkpoint store 契约。
+- 钱包 checkpoint store：首次迁移旧库前保存经 `integrity_check` 验证的 `backups/*.pre-outbox.*.sqlite3`。checkpoint、事件 ID 和待交付 outbox 原子提交；下游持久化后按 `signal:<eventId>` 或 `reorg:<eventId>` ack。未 ack 项重启后重放。回滚时先停止写入者，再用备份还原原 SQLite 文件。
 - `rpc-health.sqlite3`：RPC 样本与自动选择依据，不保存 URL。
+- RPC 健康样本只证明链身份及链头探针；未证明模拟、广播或端到端执行。主备切换要验证链 ID/genesis、链头与已见区块哈希；一次性广播 RPC 失败不自动跨端点重发。
 - `wallet-intelligence.sqlite3`：去重后的观察事件和行为画像输入，不保存密钥。
 - `verified-performance.sqlite3`：交易哈希证明的标准化成交、历史行情、社交身份及真实钱包业绩。
 - `leaderboard.sqlite3`：每小时 24H 排行快照和北京时间自然日合并名单。
