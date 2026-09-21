@@ -674,6 +674,7 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                     self.connection.sendall(_websocket_text_frame({
                         "type": "ready", "keys": list(change_sources),
                         "serviceInstanceId": service_instance_id,
+                        "serviceStartedAt": service_started_at,
                         "generatedAt": datetime.now(timezone.utc).isoformat(),
                         "dataRevision": change_bus.revision,
                     }))

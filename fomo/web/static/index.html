@@ -768,7 +768,7 @@
     const amountThresholds={small:100,large:5000,largePosition:1000};
     const state={view:'signals',signalPage:1,orderPage:1,riskPage:1,rankMode:'participants',rankExpandedUser:'',rankDetailDate:'',rankDetails:{},apiFailures:{},apiSuccess:{},rankOverview:{},rankCurrent:[],rankParticipants:[],rankHistory:{records:[]},status:{health:{},modes:{},alerts:[]},orders:{orders:[],chainNames:{},statuses:{},acceptedChains:{},total:0,accepted:0,acceptedUsd:0},shadow:{executions:[],statuses:{},eligible:0},risk:{decisions:[],outcomes:{},blockers:{},total:0},identity:{wallets:[],backlog:[],registered:0,pending:0,expired:0,revoked:0,registryVersion:1},management:{kolWallets:[],watchWallets:[],chainNames:{},trackingStatus:'awaiting_rpc_stream_adapter'},rpcManagement:{configured:0,total:0,reachable:0,healthy:0,endpoints:[],policy:{}},intelligence:{profiles:[],totalEvents:0,profiled:0,sufficientBehaviorSamples:0,performanceVerified:false},performance:{profiles:[],verifiedFills:0,marketObservations:0,profiled:0,verifiedProfiles:0,performanceVerified:false},portfolio:{positions:[],fills:[],daily:[],openPositions:0},readiness:{accounts:[],chains:[],blockers:[],stage:'wallet_addresses'},wallet:{balances:[]},journal:{total:0,states:{},control:{liveArmed:false,circuitBreakerTripped:true},intents:[]},route:{chains:[],mode:'shadow'},rpc:{configured:0,total:0,healthy:0,endpoints:[]}};
     state.staleApis=new Set();
-    const consistency=new DashboardConsistency();let reloadScheduled=false;
+    const consistency=new DashboardConsistency();
     const $=id=>document.getElementById(id);
     const esc=value=>String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     const guidPattern=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -790,6 +790,9 @@
     function stableRows(id,items,keyFor,render,empty){
       const body=$(id),existing=new Map([...body.querySelectorAll(':scope > tr[data-key]')].map(row=>[row.dataset.key,row]));
       if(!items.length){stableHTML(id,empty);return}
+      const scroller=id==='signal-rows'&&body.closest('.table-wrap');
+      const anchor=scroller&&scroller.scrollTop>4?[...existing.values()].find(row=>row.getBoundingClientRect().bottom>scroller.getBoundingClientRect().top):null;
+      const anchorTop=anchor?.getBoundingClientRect().top;
       const template=document.createElement('template'),desired=[];
       items.forEach((item,index)=>{
         const key=String(keyFor(item,index));template.innerHTML=render(item).trim();const fresh=template.content.firstElementChild;fresh.dataset.key=key;
@@ -797,6 +800,7 @@
       });
       desired.forEach((row,index)=>{const current=body.children[index];if(current!==row)body.insertBefore(row,current||null)});
       while(body.children.length>desired.length)body.lastElementChild.remove();
+      if(anchor?.isConnected)scroller.scrollTop+=anchor.getBoundingClientRect().top-anchorTop;
     }
     function amountMarkup(value,{position=false}={}){
       const number=Number(value||0),formatted=money(number);
@@ -1090,15 +1094,15 @@
     }
     async function readApi(url){
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),7000);
-      try{const response=await fetch(url,{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);const payload=await response.json();return {payload,meta:{serviceInstanceId:response.headers.get('X-Fomo-Service-Instance')||payload?.serviceInstanceId,generatedAt:response.headers.get('X-Fomo-Generated-At')||payload?.generatedAt,dataRevision:response.headers.get('X-Fomo-Data-Revision')||payload?.dataRevision}}}finally{clearTimeout(timer)}
+      try{const response=await fetch(url,{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);const payload=await response.json();return {payload,meta:{serviceInstanceId:response.headers.get('X-Fomo-Service-Instance')||payload?.serviceInstanceId,serviceStartedAt:payload?.serviceStartedAt,generatedAt:response.headers.get('X-Fomo-Generated-At')||payload?.generatedAt,dataRevision:response.headers.get('X-Fomo-Data-Revision')||payload?.dataRevision}}}finally{clearTimeout(timer)}
     }
     function acceptApiResult(key,result,assign){
-      if(result.status==='fulfilled'){const envelope=result.value,check=consistency.observe(key,envelope.meta,envelope.payload);state.apiFailures[key]=0;state.apiSuccess[key]=true;if(check.stale)state.staleApis.add(key);else state.staleApis.delete(key);if(check.reload&&!reloadScheduled){reloadScheduled=true;location.reload()}assign(envelope.payload);return true}
+      if(result.status==='fulfilled'){const envelope=result.value,check=consistency.observe(key,envelope.meta,envelope.payload);if(check.discard)return false;state.apiFailures[key]=0;state.apiSuccess[key]=true;if(check.stale)state.staleApis.add(key);else state.staleApis.delete(key);assign(envelope.payload);if(check.resync)queueRefresh(lifecycleRefreshKeys(state.view,'websocket_open'));return true}
       state.apiFailures[key]=(state.apiFailures[key]||0)+1;state.staleApis.add(key);console.warn(`[${key}] API 第 ${state.apiFailures[key]} 次连续失败`,result.reason);return false;
     }
     function apiUnavailable(key){return (state.apiFailures[key]||0)>=3}
     function showConfirmedApiError(view){
-      const config={signals:['shadow','signal-rows',10,'实时信号'],orders:['orders','order-rows',10,'模拟订单'],risk:['risk','risk-rows',10,'风控'],intelligence:['intelligence','intelligence-rows',11,'画像'],portfolio:['portfolio','position-rows',12,'PnL'],wallets:['management','kol-wallet-rows',7,'钱包管理'],rpcmanager:['rpcManagement','rpc-manager-rows',9,'RPC 管理']};
+      const config={signals:['shadow','signal-rows',11,'实时信号'],orders:['orders','order-rows',10,'模拟订单'],risk:['risk','risk-rows',10,'风控'],intelligence:['intelligence','intelligence-rows',11,'画像'],portfolio:['portfolio','position-rows',12,'PnL'],wallets:['management','kol-wallet-rows',7,'钱包管理'],rpcmanager:['rpcManagement','rpc-manager-rows',9,'RPC 管理']};
       const item=config[view];if(!item||!apiUnavailable(item[0]))return;$(item[1]).innerHTML=`<tr><td colspan="${item[2]}" class="error">${item[3]} API 已连续 3 次无法连接，请确认监控程序正在运行</td></tr>`;
     }
     async function loadRankData(){
@@ -1193,7 +1197,7 @@
       if(!selected.length)return;
       if(refreshInFlight){selected.forEach(key=>pendingRefresh.add(key));return}refreshInFlight=true;
       try{
-        const results=await Promise.allSettled(selected.map(key=>readApi(apiSpecs[key]))),applied=new Set();results.forEach((result,index)=>{const key=selected[index];acceptApiResult(key,result,value=>state[key]=value);if(result.status==='fulfilled')applied.add(key)});
+      const results=await Promise.allSettled(selected.map(key=>readApi(apiSpecs[key]))),applied=new Set();results.forEach((result,index)=>{const key=selected[index];if(acceptApiResult(key,result,value=>state[key]=value))applied.add(key)});
         const {orders,status,shadow:fast,risk,identity,management,intelligence,performance,portfolio,readiness,wallet,journal,route,rpc}=state;
         if(applied.has('shadow')){$('shadow-eligible').textContent=fast.eligible.toLocaleString()+' 条';$('shadow-latency').childNodes[0].nodeValue=fast.averageDecisionLatencyMs==null?'—':Number(fast.averageDecisionLatencyMs).toFixed(3)+' ms';const latencyValues=fast.executions.map(x=>Number(x.decisionLatencyMs)).filter(Number.isFinite);$('shadow-p95').textContent=latencyValues.length?'P95 '+percentile(latencyValues,.95).toFixed(3):'';$('latest-signal').textContent=fast.executions[0]?.recordedAt?'最近 '+time(fast.executions[0].recordedAt):''}
         if(applied.has('orders')){$('accepted').textContent=orders.accepted.toLocaleString()+' 笔';$('accepted-usd').textContent=money(orders.acceptedUsd);$('total').childNodes[0].nodeValue=orders.total.toLocaleString()+' 条'}
@@ -1208,7 +1212,7 @@
     function connectDashboardPush(){
       const protocol=location.protocol==='https:'?'wss:':'ws:';pushSocket=new WebSocket(`${protocol}//${location.host}/ws/dashboard`);
       pushSocket.addEventListener('open',()=>{pushRetryMs=1000;queueRefresh(lifecycleRefreshKeys(state.view,'websocket_open'))});
-      pushSocket.addEventListener('message',event=>{try{const message=JSON.parse(event.data);if(message.type==='ready'){const check=consistency.observe('websocket',message,{});if(check.reload&&!reloadScheduled){reloadScheduled=true;location.reload()}}if(message.type==='invalidate')queueRefresh(message.keys)}catch(error){console.warn('忽略无法解析的面板推送',error)}});
+      pushSocket.addEventListener('message',event=>{try{const message=JSON.parse(event.data);if(message.type==='ready'){const check=consistency.observe('websocket',message,{});if(check.resync)queueRefresh(lifecycleRefreshKeys(state.view,'websocket_open'))}if(message.type==='invalidate')queueRefresh(message.keys)}catch(error){console.warn('忽略无法解析的面板推送',error)}});
       pushSocket.addEventListener('close',()=>{setTimeout(connectDashboardPush,pushRetryMs);pushRetryMs=Math.min(30000,pushRetryMs*2)});
       pushSocket.addEventListener('error',()=>pushSocket.close());
     }
@@ -1319,8 +1323,8 @@
     resetKolForm();resetWatchForm();updateImportGuide();
     setView(new URL(location.href).searchParams.get('view')||'signals',{push:false});
     refresh().finally(connectDashboardPush);
-    setInterval(()=>{if(!pushSocket||pushSocket.readyState!==WebSocket.OPEN)refresh()},15000);
-    setInterval(()=>refresh(),300000);
+    setInterval(()=>{if(!pushSocket||pushSocket.readyState!==WebSocket.OPEN)refresh(lifecycleRefreshKeys(state.view,'websocket_open'))},15000);
+    setInterval(()=>refresh(lifecycleRefreshKeys(state.view,'websocket_open')),300000);
   </script>
 </body>
 </html>
