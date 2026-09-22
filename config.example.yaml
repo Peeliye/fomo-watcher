@@ -134,6 +134,8 @@ portfolio:
   enabled: true
   account_id: paper-main
   database: data/portfolio.sqlite3
+  # initial_balance_usd: 200
+  # paper_asset_allocations_usd: {ETH: 100, SOL: 100}
   paper_exit_mode: full_on_first_sell
   mark_stale_seconds: 300
   daily_backup: true

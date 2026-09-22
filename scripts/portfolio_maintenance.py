@@ -24,7 +24,10 @@ def _accepted_paper_event_ids(path: Path | None) -> set[str]:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
             event_id = str(row.get("eventId") or "").strip() if isinstance(row, dict) else ""
-            if event_id and row.get("status") == "accepted":
+            side = str(row.get("side") or "").casefold() if isinstance(row, dict) else ""
+            source_type = str(row.get("sourceType") or "").casefold() if isinstance(row, dict) else ""
+            if (event_id and row.get("status") == "accepted" and side != "sell"
+                    and source_type not in {"swap_sell", "single_user_sell"}):
                 accepted.add(event_id)
     return accepted
 

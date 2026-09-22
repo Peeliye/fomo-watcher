@@ -483,6 +483,36 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
     portfolio_db = configured_portfolio_db if configured_portfolio_db.is_absolute() else project_dir / configured_portfolio_db
     portfolio_account = str(portfolio_settings.get("account_id", "paper-main"))
     portfolio_mark_stale = int(portfolio_settings.get("mark_stale_seconds", 300))
+    portfolio_initial_balance = portfolio_settings.get("initial_balance_usd")
+    portfolio_asset_allocations = portfolio_settings.get("paper_asset_allocations_usd") or {}
+    native_price_cache: dict[str, float] = {}
+    native_price_lock = threading.Lock()
+    native_price_next_refresh = 0.0
+    def paper_native_prices() -> dict[str, float]:
+        nonlocal native_price_next_refresh
+        if not os.getenv("PYTH_API_KEY") or not portfolio_asset_allocations:
+            return {}
+        with native_price_lock:
+            cached = dict(native_price_cache)
+            if time.monotonic() < native_price_next_refresh:
+                return cached
+            native_price_next_refresh = time.monotonic() + 60
+        def refresh() -> None:
+            from ..execution.market_evidence import PythHermesPriceAdapter, approved_feed_id
+            for asset, chain_id in (("ETH", 1), ("SOL", 1399811149)):
+                if asset not in portfolio_asset_allocations:
+                    continue
+                try:
+                    observation = PythHermesPriceAdapter(
+                        chain_id=chain_id, asset=asset, feed_id=approved_feed_id(asset)
+                    ).latest()
+                    with native_price_lock:
+                        native_price_cache[asset] = float(observation.price_usd)
+                except Exception:
+                    with native_price_lock:
+                        native_price_cache.pop(asset, None)
+        threading.Thread(target=refresh, name="paper-native-price-refresh", daemon=True).start()
+        return cached
     configured_exit_policy = Path(str(portfolio_settings.get("exit_policy_path", "data/exit-policy.json")))
     exit_policy_path = configured_exit_policy if configured_exit_policy.is_absolute() else project_dir / configured_exit_policy
     exit_policy_store = ExitPolicyStore(exit_policy_path, portfolio_settings.get("exit_strategy"))
@@ -704,8 +734,8 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 self.end_headers()
                 self._write_content(content)
                 return
-            if parsed.path == "/assets/dashboard-consistency.mjs":
-                module_path = html_path.parent / "dashboard-consistency.mjs"
+            if parsed.path in {"/assets/dashboard-consistency.mjs", "/assets/daily-pnl-chart.mjs"}:
+                module_path = html_path.parent / parsed.path.rsplit("/", 1)[-1]
                 try:
                     content = module_path.read_bytes()
                 except OSError:
@@ -828,7 +858,9 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                     limit = int(query.get("limit", ["200"])[0])
                 except ValueError:
                     limit = 200
-                payload = portfolio_snapshot(portfolio_db, portfolio_account, limit, portfolio_mark_stale)
+                payload = portfolio_snapshot(portfolio_db, portfolio_account, limit, portfolio_mark_stale,
+                                             portfolio_initial_balance, portfolio_asset_allocations,
+                                             paper_native_prices())
                 payload["exitPolicy"] = exit_policy_store.read()
                 self._send_json(payload)
                 return

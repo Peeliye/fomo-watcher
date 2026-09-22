@@ -10,7 +10,7 @@ import os
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Literal, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Protocol
 from urllib.parse import urlparse
 
 from curl_cffi import requests as cf
@@ -21,6 +21,26 @@ from fomo.signals.strategy import ExecutionIntent
 
 from .capabilities import CapabilityStatus
 from .interfaces import ExecutableQuote
+from .zero_x_calldata import inspect_allowance_holder_settler
+
+if TYPE_CHECKING:
+    from .market_evidence import PythHermesPriceAdapter
+    from .pool_prices import EvmV2PoolPriceCache
+
+
+def _price_source_ready(adapter: object | None) -> bool:
+    if adapter is None:
+        return False
+    from .market_evidence import PythHermesPriceAdapter
+    from .pool_prices import EvmV2PoolPriceCache
+    if type(adapter) is PythHermesPriceAdapter:
+        return type(adapter.transport) is PinnedApiTransport and adapter.self_check().ready
+    if type(adapter) is EvmV2PoolPriceCache:
+        return adapter.self_check().ready
+    return False
+
+
+ALLOWANCE_HOLDER_CANCUN = "0x0000000000001ff3684f28c67538d4d072c22734"
 
 
 class ApiTransport(Protocol):
@@ -61,9 +81,11 @@ class PinnedApiTransport:
 class _RecentQuote:
     def __init__(self) -> None:
         self.last_verified_at_ms = 0
+        self.market_price_verified = False
 
     def _status(self, name: str, configured: bool) -> CapabilityStatus:
-        ready = configured and self.last_verified_at_ms > 0 and 0 <= int(time.time() * 1000) - self.last_verified_at_ms <= 30_000
+        ready = (configured and self.market_price_verified and self.last_verified_at_ms > 0
+                 and 0 <= int(time.time() * 1000) - self.last_verified_at_ms <= 5_000)
         return CapabilityStatus(name, True, ready, "ok" if ready else "recent_verified_quote_required", {})
 
 
@@ -71,33 +93,47 @@ class ZeroXQuoteAdapter(_RecentQuote):
     URL = "https://api.0x.org/swap/allowance-holder/quote"
 
     def __init__(self, *, chain_id: int, wallet: str, input_decimals: int,
-                 input_usd_price: Decimal, price_observed_at_ms: int,
+                 input_usd_price: Decimal | None = None, price_observed_at_ms: int = 0,
+                 price_adapter: PythHermesPriceAdapter | EvmV2PoolPriceCache | None = None,
                  api_key_env: str = "ZEROX_API_KEY", slippage_bps: int = 100,
                  transport: ApiTransport | None = None) -> None:
         super().__init__()
         self.chain_id = int(chain_id)
         self.wallet = wallet
         self.input_decimals = input_decimals
-        self.input_usd_price = Decimal(input_usd_price)
+        self.input_usd_price = Decimal(input_usd_price) if input_usd_price is not None else Decimal(0)
         self.price_observed_at_ms = price_observed_at_ms
+        self.price_adapter = price_adapter
         self.api_key_env = api_key_env
         self.slippage_bps = slippage_bps
         self.transport = transport or PinnedApiTransport()
 
     def self_check(self) -> CapabilityStatus:
-        return self._status("quote_adapter", bool(os.getenv(self.api_key_env, "")))
+        return self._status("quote_adapter", bool(os.getenv(self.api_key_env, ""))
+                            and type(self.transport) is PinnedApiTransport)
 
     def quote(self, intent: ExecutionIntent) -> tuple[ExecutableQuote, ...]:
         now_ms = int(time.time() * 1000)
-        if (intent.side != "buy" or str(intent.chain_id) != str(self.chain_id)
-                or not 0 <= now_ms - self.price_observed_at_ms <= 5000
-                or self.input_usd_price <= 0 or not 0 <= self.input_decimals <= 30
+        if intent.side != "buy" or str(intent.chain_id) != str(self.chain_id):
+            raise ValueError("quote_input_or_sanity_price_invalid")
+        input_price = self.input_usd_price
+        price_observed_at_ms = self.price_observed_at_ms
+        observed = None
+        if self.price_adapter is not None:
+            from .market_evidence import quote_input_price
+            observed = quote_input_price(self.price_adapter, chain_id=self.chain_id,
+                                         token_in=intent.token_in, decimals=self.input_decimals)
+            input_price = observed.price_usd
+            price_observed_at_ms = observed.fetched_at_ms if observed.pool_id else observed.published_at_ms
+            now_ms = int(time.time() * 1000)
+        if (not 0 <= now_ms - price_observed_at_ms <= 5000
+                or input_price <= 0 or not 0 <= self.input_decimals <= 30
                 or not 0 <= self.slippage_bps <= 500):
             raise ValueError("quote_input_or_sanity_price_invalid")
         key = os.getenv(self.api_key_env, "")
         if not key:
             raise ValueError("route_api_credential_unavailable")
-        amount = int((intent.requested_usd / self.input_usd_price * Decimal(10**self.input_decimals))
+        amount = int((intent.requested_usd / input_price * Decimal(10**self.input_decimals))
                      .to_integral_value(rounding=ROUND_DOWN))
         if amount <= 0:
             raise ValueError("quote_input_amount_zero")
@@ -123,42 +159,79 @@ class ZeroXQuoteAdapter(_RecentQuote):
         target = str(transaction.get("to") or "")
         if not target or not transaction.get("data") or not transaction.get("gas"):
             raise ValueError("zero_x_transaction_incomplete")
+        # The v2 AllowanceHolder response is not a legacy V2-router call. This
+        # structural check is deliberately narrower than a full action audit;
+        # the EVM builder continues to reject this route until P01 is complete.
+        try:
+            call = inspect_allowance_holder_settler(bytes.fromhex(str(transaction["data"]).removeprefix("0x")))
+        except (TypeError, ValueError) as error:
+            raise ValueError("zero_x_transaction_format_unverified") from error
+        if (target.lower() != ALLOWANCE_HOLDER_CANCUN or call.operator != call.settler
+                or call.sell_token != intent.token_in.lower() or call.sell_amount != amount
+                or call.buy_token != intent.token_out.lower() or call.recipient != self.wallet.lower()
+                or call.minimum_buy_amount < minimum or int(transaction.get("value") or 0) != 0):
+            raise ValueError("zero_x_transaction_scope_mismatch")
         self.last_verified_at_ms = now_ms
+        self.market_price_verified = _price_source_ready(self.price_adapter)
+        execution_payload = {**transaction, "from": self.wallet}
+        if observed is not None:
+            execution_payload["inputPriceProof"] = {
+                "source": observed.source, "feedId": observed.feed_id,
+                "priceUsd": str(observed.price_usd),
+                "publishedAtMs": price_observed_at_ms,
+                "payloadSha256": observed.payload_sha256,
+                "poolId": observed.pool_id, "blockHash": observed.block_hash,
+            }
         return (ExecutableQuote("0x_allowance_holder", str(buy_amount), str(minimum),
                                 datetime.now(timezone.utc).isoformat(), str(impact * 100), True,
-                                (target,), {**transaction, "from": self.wallet}),)
+                                (target, call.settler), execution_payload),)
 
 
 class JupiterQuoteAdapter(_RecentQuote):
     QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
     SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 
-    def __init__(self, *, wallet: str, input_decimals: int, input_usd_price: Decimal,
-                 price_observed_at_ms: int, api_key_env: str = "JUPITER_API_KEY",
+    def __init__(self, *, wallet: str, input_decimals: int, input_usd_price: Decimal | None = None,
+                 price_observed_at_ms: int = 0,
+                 price_adapter: PythHermesPriceAdapter | EvmV2PoolPriceCache | None = None,
+                 api_key_env: str = "JUPITER_API_KEY",
                  slippage_bps: int = 100, transport: ApiTransport | None = None) -> None:
         super().__init__()
         self.wallet = wallet
         self.input_decimals = input_decimals
-        self.input_usd_price = Decimal(input_usd_price)
+        self.input_usd_price = Decimal(input_usd_price) if input_usd_price is not None else Decimal(0)
         self.price_observed_at_ms = price_observed_at_ms
+        self.price_adapter = price_adapter
         self.api_key_env = api_key_env
         self.slippage_bps = slippage_bps
         self.transport = transport or PinnedApiTransport()
 
     def self_check(self) -> CapabilityStatus:
-        return self._status("quote_adapter", bool(os.getenv(self.api_key_env, "")))
+        return self._status("quote_adapter", bool(os.getenv(self.api_key_env, ""))
+                            and type(self.transport) is PinnedApiTransport)
 
     def quote(self, intent: ExecutionIntent) -> tuple[ExecutableQuote, ...]:
         now_ms = int(time.time() * 1000)
-        if (intent.side != "buy" or str(intent.chain_id) != "1399811149"
-                or not 0 <= now_ms - self.price_observed_at_ms <= 5000
-                or self.input_usd_price <= 0 or not 0 <= self.input_decimals <= 30
+        if intent.side != "buy" or str(intent.chain_id) != "1399811149":
+            raise ValueError("quote_input_or_sanity_price_invalid")
+        input_price = self.input_usd_price
+        price_observed_at_ms = self.price_observed_at_ms
+        observed = None
+        if self.price_adapter is not None:
+            from .market_evidence import quote_input_price
+            observed = quote_input_price(self.price_adapter, chain_id="1399811149",
+                                         token_in=intent.token_in, decimals=self.input_decimals)
+            input_price = observed.price_usd
+            price_observed_at_ms = observed.fetched_at_ms if observed.pool_id else observed.published_at_ms
+            now_ms = int(time.time() * 1000)
+        if (not 0 <= now_ms - price_observed_at_ms <= 5000
+                or input_price <= 0 or not 0 <= self.input_decimals <= 30
                 or not 0 <= self.slippage_bps <= 500):
             raise ValueError("quote_input_or_sanity_price_invalid")
         key = os.getenv(self.api_key_env, "")
         if not key:
             raise ValueError("route_api_credential_unavailable")
-        amount = int((intent.requested_usd / self.input_usd_price * Decimal(10**self.input_decimals))
+        amount = int((intent.requested_usd / input_price * Decimal(10**self.input_decimals))
                      .to_integral_value(rounding=ROUND_DOWN))
         if amount <= 0:
             raise ValueError("quote_input_amount_zero")
@@ -184,8 +257,18 @@ class JupiterQuoteAdapter(_RecentQuote):
         if not serialized or int(swap.get("lastValidBlockHeight") or 0) <= 0:
             raise ValueError("jupiter_swap_transaction_missing")
         self.last_verified_at_ms = now_ms
+        self.market_price_verified = _price_source_ready(self.price_adapter)
+        execution_payload = {"base64UnsignedTransaction": serialized,
+                             "lastValidBlockHeight": swap["lastValidBlockHeight"]}
+        if observed is not None:
+            execution_payload["inputPriceProof"] = {
+                "source": observed.source, "feedId": observed.feed_id,
+                "priceUsd": str(observed.price_usd),
+                "publishedAtMs": price_observed_at_ms,
+                "payloadSha256": observed.payload_sha256,
+                "poolId": observed.pool_id, "blockHash": observed.block_hash,
+            }
         return (ExecutableQuote("jupiter_metis", str(output), str(minimum),
                                 datetime.now(timezone.utc).isoformat(), str(impact * 100), True,
                                 tuple(str(step.get("swapInfo", {}).get("ammKey")) for step in quote.get("routePlan") or []),
-                                {"base64UnsignedTransaction": serialized,
-                                 "lastValidBlockHeight": swap["lastValidBlockHeight"]}),)
+                                execution_payload),)

@@ -8,7 +8,7 @@ otherwise every signal remains blocked. A claimed hash is never sent twice.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from typing import Mapping, Protocol
 
@@ -21,6 +21,7 @@ from .interfaces import (Broadcaster, ExecutableQuote, NonceBlockhashManager,
                          QuoteAdapter, ReceiptTracker, Signer, TransactionBuilder, TransactionParser,
                          TransactionSimulator)
 from .journal import ExecutionJournal
+from .market_evidence import MarketEvidenceFacts
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,12 +37,25 @@ class RiskEvidenceProvider(Protocol):
                quote: ExecutableQuote, simulation: Mapping[str, object]) -> tuple[PreflightEvidence, ScopeLimits]: ...
 
 
+class MarketFundingEvidence(Protocol):
+    market: MarketEvidenceFacts
+    minimum_gas_reserve_usd: Decimal
+
+
+class MarketEvidenceProvider(Protocol):
+    def self_check(self) -> CapabilityStatus: ...
+    def assess(self, intent: ExecutionIntent, quote: ExecutableQuote,
+               parsed_signed_scope: Mapping[str, object],
+               signed_transaction: bytes) -> MarketFundingEvidence: ...
+
+
 class ExecutionCoordinator:
     def __init__(self, journal: ExecutionJournal, *, quote_adapter: QuoteAdapter,
                  builder: TransactionBuilder, simulator: TransactionSimulator,
                  signer: Signer, broadcaster: Broadcaster, nonce_manager: NonceBlockhashManager,
                  parser: TransactionParser, receipt_tracker: ReceiptTracker,
-                 risk_evidence: RiskEvidenceProvider) -> None:
+                 risk_evidence: RiskEvidenceProvider,
+                 market_evidence: MarketEvidenceProvider) -> None:
         self.journal = journal
         self.quote_adapter = quote_adapter
         self.builder = builder
@@ -52,6 +66,7 @@ class ExecutionCoordinator:
         self.parser = parser
         self.receipt_tracker = receipt_tracker
         self.risk_evidence = risk_evidence
+        self.market_evidence = market_evidence
 
     def _control_ready(self) -> bool:
         row = self.journal.db.execute(
@@ -69,8 +84,10 @@ class ExecutionCoordinator:
         ):
             registry.register(name, adapter)
         risk = self.risk_evidence.self_check()
+        market = self.market_evidence.self_check()
         return (registry.status()["ready"] and risk.name == "risk_evidence"
-                and risk.implemented and risk.ready)
+                and risk.implemented and risk.ready and market.name == "market_evidence"
+                and market.implemented and market.ready)
 
     def execute(self, intent: ExecutionIntent, signal: TradeSignalEnvelope) -> Mapping[str, object]:
         if intent.signal_id != signal.signal_id or not self._control_ready():
@@ -94,9 +111,6 @@ class ExecutionCoordinator:
                 raise ValueError("simulation_not_proven")
             self.journal.transition_job(intent.intent_id, "simulated", metadata={"simulation": dict(simulation)})
             evidence, limits = self.risk_evidence.assess(intent, signal, quote, simulation)
-            allowed, blockers = SharedExecutionCore().preflight(intent, evidence)
-            if not allowed:
-                raise ValueError("preflight_rejected:" + ",".join(blockers))
             if not limits.wallet or limits.maximum_input_units <= 0 or not limits.trusted_targets:
                 raise ValueError("scope_limits_missing")
             self.journal.transition_job(intent.intent_id, "built", metadata={
@@ -111,6 +125,17 @@ class ExecutionCoordinator:
             )
             if not scope.valid or str(parsed.get("tokenIn") or "").casefold() != intent.token_in.casefold():
                 raise ValueError("signed_transaction_scope_rejected")
+            funding = self.market_evidence.assess(intent, quote, parsed, signed)
+            evidence = replace(
+                evidence, balance_fresh=funding.market.balance_fresh,
+                gas_reserve_usd=funding.market.native_gas_reserve_usd,
+                minimum_gas_reserve_usd=funding.minimum_gas_reserve_usd,
+                quote_fresh=funding.market.quote_fresh,
+                independent_sanity_price_count=funding.market.independent_sanity_price_count,
+            )
+            allowed, blockers = SharedExecutionCore().preflight(intent, evidence)
+            if not allowed:
+                raise ValueError("preflight_rejected:" + ",".join(blockers))
             self.journal.transition_job(intent.intent_id, "signed", metadata={"serializedTxHash": digest})
             tx_hash = self.broadcaster.transaction_id(signed)
             if hashlib.sha256(signed).hexdigest() != digest:

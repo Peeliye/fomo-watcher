@@ -10,11 +10,12 @@ from fomo.signals.strategy import ExecutionIntent
 
 from .capabilities import CapabilityRegistry
 from .chain_managers import EvmNonceManager, SolanaBlockhashManager
-from .coordinator import ExecutionCoordinator, RiskEvidenceProvider
+from .coordinator import ExecutionCoordinator, MarketEvidenceProvider, RiskEvidenceProvider
 from .evm_transaction import EvmEip1559Builder, EvmTransactionParser, VaultEvmSigner
 from .interfaces import (Broadcaster, NonceBlockhashManager, QuoteAdapter, ReceiptTracker,
                          Signer, TransactionBuilder, TransactionParser, TransactionSimulator)
 from .journal import ExecutionJournal
+from .market_evidence import EvmMarketEvidenceProvider, SolanaMarketEvidenceProvider
 from .quote_adapters import JupiterQuoteAdapter, ZeroXQuoteAdapter
 from .rpc_adapters import EvmReceiptTracker, EvmRpcBroadcaster, SolanaReceiptTracker, SolanaRpcBroadcaster
 from .simulators import EvmTransactionSimulator, SolanaTransactionSimulator
@@ -32,6 +33,7 @@ class ChainAdapters:
     parser: TransactionParser
     receipt_tracker: ReceiptTracker
     risk_evidence: RiskEvidenceProvider | None
+    market_evidence: MarketEvidenceProvider | None = None
 
 
 class ExecutionAssembly:
@@ -51,12 +53,14 @@ class ExecutionAssembly:
                     and type(item.simulator) is SolanaTransactionSimulator
                     and type(item.signer) is VaultSolanaSigner and type(item.broadcaster) is SolanaRpcBroadcaster
                     and type(item.nonce_manager) is SolanaBlockhashManager
-                    and type(item.parser) is SolanaLegacyParser and type(item.receipt_tracker) is SolanaReceiptTracker)
+                    and type(item.parser) is SolanaLegacyParser and type(item.receipt_tracker) is SolanaReceiptTracker
+                    and type(item.market_evidence) is SolanaMarketEvidenceProvider)
         if chain_id in {"1", "56", "8453", "4663", "5042"}:
             return (type(item.quote) is ZeroXQuoteAdapter and type(item.builder) is EvmEip1559Builder
                     and type(item.simulator) is EvmTransactionSimulator and type(item.signer) is VaultEvmSigner
                     and type(item.broadcaster) is EvmRpcBroadcaster and type(item.nonce_manager) is EvmNonceManager
-                    and type(item.parser) is EvmTransactionParser and type(item.receipt_tracker) is EvmReceiptTracker)
+                    and type(item.parser) is EvmTransactionParser and type(item.receipt_tracker) is EvmReceiptTracker
+                    and type(item.market_evidence) is EvmMarketEvidenceProvider)
         return False
 
     def chain_status(self, chain_id: str) -> dict[str, Any]:
@@ -94,6 +98,12 @@ class ExecutionAssembly:
             risk = None
         if risk is None or risk.name != "risk_evidence" or not risk.implemented or not risk.ready:
             blockers.append("risk_evidence_provider_unavailable")
+        try:
+            market = item.market_evidence.self_check() if item.market_evidence is not None else None
+        except Exception:
+            market = None
+        if market is None or market.name != "market_evidence" or not market.implemented or not market.ready:
+            blockers.append("market_evidence_provider_unavailable")
         control = self.journal.db.execute(
             "SELECT live_armed,circuit_breaker_tripped FROM execution_control WHERE singleton=1"
         ).fetchone()
@@ -107,9 +117,10 @@ class ExecutionAssembly:
         if not self.chain_status(intent.chain_id)["ready"]:
             raise ValueError("execution_chain_not_ready")
         item = self._chains[intent.chain_id]
-        assert item.risk_evidence is not None
+        assert item.risk_evidence is not None and item.market_evidence is not None
         return ExecutionCoordinator(
             self.journal, quote_adapter=item.quote, builder=item.builder, simulator=item.simulator,
             signer=item.signer, broadcaster=item.broadcaster, nonce_manager=item.nonce_manager,
-            parser=item.parser, receipt_tracker=item.receipt_tracker, risk_evidence=item.risk_evidence,
+            parser=item.parser, receipt_tracker=item.receipt_tracker,
+            risk_evidence=item.risk_evidence, market_evidence=item.market_evidence,
         ).execute(intent, signal)

@@ -12,6 +12,75 @@ from fomo.portfolio.exit_policy import ExitPolicyError, ExitPolicyStore
 
 
 class PortfolioLedgerTests(unittest.TestCase):
+    def test_split_paper_budgets_use_all_fills_and_estimate_native_units(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portfolio.sqlite3"
+            ledger = PortfolioLedger(path, "UTC")
+            for index, (chain, spend) in enumerate(((4663, 10), (1399811149, 20), (4663, 5))):
+                event = Event(id=f"split-buy-{index}", kind="buy", handle="alice", user_id="kol-1",
+                              created_at=datetime.now(timezone.utc).isoformat(), network_id=chain,
+                              ca=f"0x{index + 1:040x}" if chain == 4663 else "So11111111111111111111111111111111111111112",
+                              symbol="MEME", price=1)
+                ledger.apply_event(event, {"status": "accepted", "paperBuyUsd": spend})
+            ledger.close()
+            snapshot = portfolio_snapshot(path, limit=1, initial_balance_usd=200,
+                                          paper_asset_allocations_usd={"ETH": 100, "SOL": 100},
+                                          native_prices_usd={"ETH": 2000, "SOL": 100})
+        balances = {row["asset"]: row for row in snapshot["paperAssetBalances"]}
+        self.assertEqual(snapshot["initialBalanceUsd"], 200)
+        self.assertEqual(len(snapshot["fills"]), 1)
+        self.assertEqual(balances["ETH"]["remainingUsd"], 85)
+        self.assertEqual(balances["ETH"]["estimatedNativeRemaining"], .0425)
+        self.assertEqual(balances["SOL"]["remainingUsd"], 80)
+        self.assertEqual(balances["SOL"]["estimatedNativeRemaining"], .8)
+        self.assertTrue(balances["SOL"]["isEstimate"])
+
+    def test_split_paper_budgets_do_not_invent_native_units_without_price(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = portfolio_snapshot(Path(directory) / "missing.sqlite3", initial_balance_usd=200,
+                                          paper_asset_allocations_usd={"ETH": 100, "SOL": 100})
+        self.assertEqual([row["remainingUsd"] for row in snapshot["paperAssetBalances"]], [100, 100])
+        self.assertTrue(all(row["estimatedNativeRemaining"] is None for row in snapshot["paperAssetBalances"]))
+
+    def test_simulated_cash_and_equity_follow_fills_and_market_marks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portfolio.sqlite3"
+            ledger = PortfolioLedger(path, "UTC")
+            event = Event(id="equity-buy", kind="buy", handle="alice", user_id="kol-1",
+                          created_at=datetime.now(timezone.utc).isoformat(), network_id=1,
+                          ca="0x1111111111111111111111111111111111111111", symbol="MEME", price=1)
+            ledger.apply_event(event, {"status": "accepted", "paperBuyUsd": 10})
+            ledger.update_market_marks([{"chainId": 1, "tokenAddress": event.ca, "priceUsd": 1.5,
+                                         "capturedAt": datetime.now(timezone.utc).isoformat()}])
+            ledger.close()
+            snapshot = portfolio_snapshot(path, initial_balance_usd=100)
+            unconfigured = portfolio_snapshot(path)
+        self.assertEqual(snapshot["initialBalanceUsd"], 100)
+        self.assertEqual(snapshot["cashBalanceUsd"], 90)
+        self.assertEqual(snapshot["marketValueUsd"], 15)
+        self.assertEqual(snapshot["equityUsd"], 105)
+        self.assertEqual(snapshot["daily"][0]["dailyPnlChangeUsd"], 5)
+        self.assertEqual(snapshot["daily"][0]["equityUsd"], 105)
+        self.assertFalse(unconfigured["balanceConfigured"])
+        self.assertIsNone(unconfigured["equityUsd"])
+
+    def test_daily_equity_uses_historical_cash_flows_not_latest_mark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portfolio.sqlite3"
+            ledger = PortfolioLedger(path, "UTC")
+            ledger.db.executemany(
+                """INSERT INTO portfolio_daily(local_day,account_id,buy_usd_micros,sell_usd_micros,
+                       fee_usd_micros,market_value_usd_micros) VALUES(?,?,?,?,?,?)""",
+                [("2026-09-19", "paper-main", 100_000_000, 0, 0, 110_000_000),
+                 ("2026-09-20", "paper-main", 20_000_000, 50_000_000, 1_000_000, 95_000_000),
+                 ("2026-09-21", "paper-main", 0, 0, 0, 80_000_000)],
+            )
+            ledger.close()
+            rows = list(reversed(portfolio_snapshot(path, initial_balance_usd=1000)["daily"]))
+        self.assertEqual([row["cashBalanceUsd"] for row in rows], [900, 929, 929])
+        self.assertEqual([row["equityUsd"] for row in rows], [1010, 1024, 1009])
+        self.assertEqual([row["dailyPnlChangeUsd"] for row in rows], [10, 14, -15])
+
     def test_stop_loss_closes_position_and_records_reason(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "portfolio.sqlite3"

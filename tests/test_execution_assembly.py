@@ -33,6 +33,7 @@ class ExecutionAssemblyTests(unittest.TestCase):
             self.assertFalse(status["ready"])
             self.assertIn("unaudited_or_fake_adapter_type", status["blockers"])
             self.assertIn("final_transaction_route_format_unverified", status["blockers"])
+            self.assertIn("market_evidence_provider_unavailable", status["blockers"])
             self.assertIn("live_disabled_or_circuit_open", status["blockers"])
             journal.close()
 

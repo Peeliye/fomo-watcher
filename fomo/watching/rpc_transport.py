@@ -47,14 +47,19 @@ def _quantity(value: Any) -> int:
 class FailoverJsonRpc:
     def __init__(self, chain_id: str, endpoints: Sequence[RpcEndpoint], *, timeout_seconds: float = 3.0,
                  identity_ttl_seconds: float = 2.0, maximum_lag_blocks: int = 4,
-                 requester: RpcRequest | None = None) -> None:
+                 requester: RpcRequest | None = None,
+                 previous_header_fallback: bool = False,
+                 pin_health_during_view: bool = False) -> None:
         self.chain_id = str(chain_id)
         self.endpoints = sorted((endpoint for endpoint in endpoints if endpoint.chain_id == self.chain_id),
                                 key=lambda endpoint: (endpoint.priority, endpoint.provider))
         self.timeout_seconds = timeout_seconds
         self.identity_ttl_seconds = max(0.1, identity_ttl_seconds)
         self.maximum_lag_blocks = max(0, maximum_lag_blocks)
+        self.previous_header_fallback = previous_header_fallback and self.chain_id == "8453"
+        self.pin_health_during_view = pin_health_during_view and self.chain_id == "8453"
         self._requester = requester or self._http_request
+        self.uses_network_transport = requester is None
         self._health: dict[str, _Health] = {}
         self._highest_height = -1
         self._pending_nonces: dict[str, int] = {}
@@ -62,6 +67,11 @@ class FailoverJsonRpc:
         self._thread = threading.local()
         self.last_provider: str | None = None
         self.last_diagnostic = "not_probed"
+        self.last_request_method: str | None = None
+        self.last_block_tagged = False
+        self.last_http_status: int | None = None
+        self.last_provider_error_code: int | None = None
+        self.last_transport_error_type: str | None = None
 
     def _http_request(self, endpoint: RpcEndpoint, method: str, params: Sequence[Any]) -> Any:
         url, first = validate_endpoint_url(endpoint.resolved_http_url)
@@ -73,12 +83,17 @@ class FailoverJsonRpc:
         addresses = sorted(address for address in second if ":" not in address)
         address = (addresses or sorted(second))[0]
         pinned = f"[{address}]" if ":" in address else address
-        response = cf.post(
-            url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)},
-            headers={"Accept": "application/json"}, timeout=self.timeout_seconds,
-            allow_redirects=False, proxy="",
-            curl_options={CurlOpt.RESOLVE: [f"{parsed.hostname}:{port}:{pinned}"], CurlOpt.PROXY: ""},
-        )
+        try:
+            response = cf.post(
+                url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)},
+                headers={"Accept": "application/json"}, timeout=self.timeout_seconds,
+                allow_redirects=False, proxy="",
+                curl_options={CurlOpt.RESOLVE: [f"{parsed.hostname}:{port}:{pinned}"], CurlOpt.PROXY: ""},
+            )
+        except cf.RequestsError as error:
+            self.last_transport_error_type = type(error).__name__
+            raise
+        self.last_http_status = int(response.status_code)
         if response.primary_ip and response.primary_ip not in second:
             raise ValueError("rpc_connected_address_mismatch")
         if 300 <= response.status_code < 400:
@@ -88,11 +103,23 @@ class FailoverJsonRpc:
         body = response.json()
         if not isinstance(body, dict) or body.get("id") != 1 or body.get("jsonrpc") != "2.0":
             raise ValueError("rpc_response_invalid")
-        if body.get("error") is not None or "result" not in body:
+        rpc_error = body.get("error")
+        if isinstance(rpc_error, dict) and type(rpc_error.get("code")) is int:
+            self.last_provider_error_code = rpc_error["code"]
+        if rpc_error is not None or "result" not in body:
             raise ValueError("rpc_method_unavailable")
         return body["result"]
 
     def _request(self, endpoint: RpcEndpoint, method: str, params: Sequence[Any]) -> Any:
+        self.last_request_method = method
+        self.last_block_tagged = (
+            method in {"eth_call", "eth_getCode"} and len(params) >= 2
+            and isinstance(params[1], str) and params[1].startswith("0x")
+        ) or (method == "eth_getBlockByNumber" and bool(params)
+              and isinstance(params[0], str) and params[0].startswith("0x"))
+        self.last_http_status = None
+        self.last_provider_error_code = None
+        self.last_transport_error_type = None
         return self._requester(endpoint, method, params)
 
     def _block_hash(self, endpoint: RpcEndpoint, height: int) -> str:
@@ -108,6 +135,9 @@ class FailoverJsonRpc:
     def _probe(self, endpoint: RpcEndpoint, *, force: bool = False) -> _Health:
         cached = self._health.get(endpoint.endpoint_id)
         now = time.monotonic()
+        if (self.pin_health_during_view and cached and getattr(self._thread, "view_open", False)
+                and getattr(self._thread, "pinned_endpoint", None) == endpoint.endpoint_id):
+            return cached
         if not force and cached and now - cached.checked_at <= self.identity_ttl_seconds:
             return cached
         if self.chain_id == "1399811149":
@@ -124,7 +154,16 @@ class FailoverJsonRpc:
             if str(_quantity(self._request(endpoint, "eth_chainId", []))) != self.chain_id:
                 raise ValueError("rpc_wrong_chain")
             height = _quantity(self._request(endpoint, "eth_blockNumber", []))
-            block_hash = self._block_hash(endpoint, height)
+            if self.previous_header_fallback and height > 1:
+                try:
+                    block_hash = self._block_hash(endpoint, height)
+                except (OSError, ValueError, cf.RequestsError):
+                    block_hash = ""
+                if not block_hash:
+                    height -= 1
+                    block_hash = self._block_hash(endpoint, height)
+            else:
+                block_hash = self._block_hash(endpoint, height)
         if height <= 0 or not block_hash:
             raise ValueError("rpc_head_invalid")
         health = _Health(now, height, block_hash)

@@ -788,13 +788,59 @@ def portfolio_snapshot(
     account_id: str = "paper-main",
     limit: int = 200,
     mark_stale_seconds: int = 300,
+    initial_balance_usd: Any | None = None,
+    paper_asset_allocations_usd: dict[str, Any] | None = None,
+    native_prices_usd: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    initial_micros: int | None = None
+    if initial_balance_usd is not None:
+        initial_value = Decimal(str(initial_balance_usd))
+        if not initial_value.is_finite() or initial_value < 0:
+            raise ValueError("initial_balance_usd must be a non-negative finite amount")
+        initial_micros = _micros(initial_value)
+    allocations: dict[str, int] = {}
+    for asset, amount in (paper_asset_allocations_usd or {}).items():
+        symbol = str(asset).upper()
+        if symbol not in {"ETH", "SOL"}:
+            raise ValueError("unsupported paper asset allocation")
+        value = Decimal(str(amount))
+        if not value.is_finite() or value < 0:
+            raise ValueError("paper asset allocation must be non-negative and finite")
+        allocations[symbol] = _micros(value)
+    if allocations and initial_micros is not None and sum(allocations.values()) != initial_micros:
+        raise ValueError("paper asset allocations must equal initial balance")
+    prices: dict[str, Decimal] = {}
+    for asset, amount in (native_prices_usd or {}).items():
+        value = Decimal(str(amount))
+        if str(asset).upper() in allocations and value.is_finite() and value > 0:
+            prices[str(asset).upper()] = value
+    chain_assets = {1: "ETH", 4663: "ETH", 8453: "ETH", 1399811149: "SOL"}
+    def asset_balances(flow_rows: list[Any]) -> list[dict[str, Any]]:
+        flows = {asset: 0 for asset in allocations}
+        for row in flow_rows:
+            asset = chain_assets.get(int(row["chain_id"]))
+            if asset in flows:
+                flows[asset] += int(row["sell_usd_micros"]) - int(row["buy_usd_micros"]) - int(row["fee_usd_micros"])
+        result = []
+        for asset, starting in allocations.items():
+            remaining = starting + flows[asset]
+            price = prices.get(asset)
+            result.append({"asset": asset, "initialUsd": _usd(starting), "remainingUsd": _usd(remaining),
+                           "referencePriceUsd": float(price) if price is not None else None,
+                           "estimatedNativeRemaining": float(Decimal(remaining) / Decimal(1_000_000) / price) if price is not None else None,
+                           "isEstimate": True})
+        return result
     db_path = Path(path)
     empty = {"accountId": account_id, "source": "paper_portfolio_simulation",
              "asOf": datetime.now(timezone.utc).isoformat(), "freshness": "no_data",
              "verificationStatus": "simulated_not_live", "openPositions": 0,
              "costBasisUsd": 0, "marketValueUsd": 0, "unrealizedPnlUsd": 0,
-             "realizedPnlUsd": 0, "totalPnlUsd": 0, "positions": [], "fills": [], "daily": []}
+             "realizedPnlUsd": 0, "totalPnlUsd": 0, "positions": [], "fills": [], "daily": [],
+             "balanceConfigured": initial_micros is not None,
+             "initialBalanceUsd": _usd(initial_micros) if initial_micros is not None else None,
+             "cashBalanceUsd": _usd(initial_micros) if initial_micros is not None else None,
+             "equityUsd": _usd(initial_micros) if initial_micros is not None else None,
+             "paperAssetBalances": asset_balances([])}
     if not db_path.exists():
         return empty
     db = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
@@ -814,10 +860,22 @@ def portfolio_snapshot(
             "SELECT * FROM portfolio_fills WHERE account_id=? ORDER BY executed_at DESC,fill_id DESC LIMIT ?",
             (account_id, max(1, min(int(limit), 1000))),
         ).fetchall()
-        daily = db.execute(
-            "SELECT * FROM portfolio_daily WHERE account_id=? ORDER BY local_day DESC LIMIT 90",
+        asset_flows = db.execute(
+            """SELECT chain_id,
+                      SUM(CASE WHEN side='buy' THEN gross_usd_micros ELSE 0 END) AS buy_usd_micros,
+                      SUM(CASE WHEN side='sell' THEN gross_usd_micros ELSE 0 END) AS sell_usd_micros,
+                      SUM(fee_usd_micros) AS fee_usd_micros
+               FROM portfolio_fills WHERE account_id=? GROUP BY chain_id""",
             (account_id,),
         ).fetchall()
+        daily_with_baseline = db.execute(
+            """SELECT *, SUM(sell_usd_micros-buy_usd_micros-fee_usd_micros)
+                     OVER (PARTITION BY account_id ORDER BY local_day
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cash_delta_micros
+               FROM portfolio_daily WHERE account_id=? ORDER BY local_day DESC LIMIT 91""",
+            (account_id,),
+        ).fetchall()
+        daily = daily_with_baseline[:90]
         cycle_fills: list[sqlite3.Row] = []
         position_keys = [(str(row["kol_id"]), int(row["chain_id"]), str(row["token_address"])) for row in positions]
         for start in range(0, len(position_keys), 250):
@@ -905,13 +963,27 @@ def portfolio_snapshot(
         "realizedPnlUsd": _usd(row["realized_pnl_micros"]), "feeUsd": _usd(row["fee_usd_micros"]),
         "executedAt": row["executed_at"], "mode": row["mode"], "reason": reason_by_event.get(row["event_id"], ""),
     } for row in fills]
+    previous_equity_delta = (
+        int(daily_with_baseline[90]["cash_delta_micros"]) + int(daily_with_baseline[90]["market_value_usd_micros"])
+        if len(daily_with_baseline) > 90 else 0
+    )
+    daily_change_micros: dict[str, int] = {}
+    for row in reversed(daily):
+        equity_delta = int(row["cash_delta_micros"]) + int(row["market_value_usd_micros"])
+        daily_change_micros[row["local_day"]] = equity_delta - previous_equity_delta
+        previous_equity_delta = equity_delta
     output_daily = [{
         "day": row["local_day"], "buyUsd": _usd(row["buy_usd_micros"]), "sellUsd": _usd(row["sell_usd_micros"]),
         "realizedPnlUsd": _usd(row["realized_pnl_micros"]), "unrealizedPnlUsd": _usd(row["unrealized_pnl_micros"]),
         "totalPnlUsd": _usd(int(row["realized_pnl_micros"]) + int(row["unrealized_pnl_micros"])),
         "marketValueUsd": _usd(row["market_value_usd_micros"]), "feesUsd": _usd(row["fee_usd_micros"]),
         "trades": row["trades"], "snapshotAt": row["snapshot_at"],
+        "dailyPnlChangeUsd": _usd(daily_change_micros[row["local_day"]]),
+        "cashBalanceUsd": _usd(initial_micros + int(row["cash_delta_micros"])) if initial_micros is not None else None,
+        "equityUsd": _usd(initial_micros + int(row["cash_delta_micros"]) + int(row["market_value_usd_micros"])) if initial_micros is not None else None,
     } for row in daily]
+    cash_delta_micros = int(daily[0]["cash_delta_micros"]) if daily else 0
+    cash_micros = initial_micros + cash_delta_micros if initial_micros is not None else None
     return {
         "accountId": account_id, "openPositions": open_count,
         "source": "paper_portfolio_simulation", "asOf": now.isoformat(),
@@ -919,6 +991,11 @@ def portfolio_snapshot(
         "costBasisUsd": _usd(cost_total), "marketValueUsd": _usd(market_total),
         "unrealizedPnlUsd": _usd(unrealized_total), "realizedPnlUsd": _usd(realized_total),
         "totalPnlUsd": _usd(unrealized_total + realized_total),
+        "balanceConfigured": initial_micros is not None,
+        "initialBalanceUsd": _usd(initial_micros) if initial_micros is not None else None,
+        "cashBalanceUsd": _usd(cash_micros) if cash_micros is not None else None,
+        "equityUsd": _usd(cash_micros + market_total) if cash_micros is not None else None,
+        "paperAssetBalances": asset_balances(asset_flows),
         "positions": output_positions, "fills": output_fills, "daily": output_daily,
     }
 

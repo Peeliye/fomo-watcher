@@ -50,6 +50,8 @@ class EvmTransactionTests(unittest.TestCase):
         )
         self.assertTrue(scope.valid)
         self.assertEqual(parsed["nonce"], 7)
+        self.assertEqual(parsed["gasLimit"], 200_000)
+        self.assertEqual(parsed["maxFeePerGasWei"], 2_000_000_000)
         self.assertEqual(len(digest), 64)
         with self.assertRaises(ValueError):
             parser.parse(signed[:-1] + bytes([signed[-1] ^ 1]))

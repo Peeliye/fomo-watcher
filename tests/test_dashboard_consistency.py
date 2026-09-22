@@ -53,6 +53,39 @@ class DashboardConsistencyTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_daily_pnl_chart_module_is_served(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = start_dashboard(Path(directory), {"dashboard": {"enabled": True, "host": "127.0.0.1", "port": 0}})
+            self.assertIsNotNone(server)
+            assert server is not None
+            try:
+                port = int(server.server_address[1])
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/assets/daily-pnl-chart.mjs", timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn("text/javascript", response.headers["Content-Type"])
+                    self.assertIn(b"recentDailyPnl", response.read())
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_portfolio_api_exposes_only_configured_paper_balance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = start_dashboard(Path(directory), {"dashboard": {"enabled": True, "host": "127.0.0.1", "port": 0},
+                                                       "portfolio": {"initial_balance_usd": 1000}})
+            self.assertIsNotNone(server)
+            assert server is not None
+            try:
+                port = int(server.server_address[1])
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/portfolio", timeout=5) as response:
+                    payload = json.load(response)
+                self.assertTrue(payload["balanceConfigured"])
+                self.assertEqual(payload["cashBalanceUsd"], 1000)
+                self.assertEqual(payload["equityUsd"], 1000)
+                self.assertNotIn("balances", payload)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_identity_units_are_separate_and_sourced(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

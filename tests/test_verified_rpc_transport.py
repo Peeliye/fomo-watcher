@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import time
 from typing import Any, Sequence
+from unittest.mock import patch
 
 from fomo.execution.rpc_pool import RpcEndpoint
 from fomo.watching.rpc_transport import FailoverJsonRpc, RpcUnavailable, SOLANA_MAINNET_GENESIS
@@ -48,6 +49,66 @@ def endpoints(chain: str = "1") -> list[RpcEndpoint]:
 
 
 class VerifiedRpcTransportTests(unittest.TestCase):
+    def test_http_failure_keeps_safe_method_status_and_block_tag(self) -> None:
+        class Response:
+            primary_ip = "1.1.1.1"
+            status_code = 429
+
+        endpoint = endpoints("8453")[0]
+        rpc = FailoverJsonRpc("8453", [endpoint])
+        with (patch("fomo.watching.rpc_transport.validate_endpoint_url",
+                    return_value=("https://secret.invalid/key", frozenset({"1.1.1.1"}))),
+              patch("fomo.watching.rpc_transport.cf.post", return_value=Response())):
+            with self.assertRaisesRegex(ValueError, "rpc_http_status_invalid"):
+                rpc._request(endpoint, "eth_getCode", ["0x" + "11" * 20, "0x64"])
+        self.assertEqual(rpc.last_request_method, "eth_getCode")
+        self.assertTrue(rpc.last_block_tagged)
+        self.assertEqual(rpc.last_http_status, 429)
+        self.assertIsNone(rpc.last_provider_error_code)
+
+    def test_base_view_caches_chain_identity_after_header_is_pinned(self) -> None:
+        fixture = RpcFixture()
+        fixture.chains["primary"] = 8453
+        endpoint = endpoints("8453")[:1]
+        rpc = FailoverJsonRpc("8453", endpoint, requester=fixture.request,
+                              identity_ttl_seconds=0.1,
+                              pin_health_during_view=True)
+        with rpc.consistent_view():
+            self.assertEqual(rpc.call("eth_getTransactionReceipt", ["0xtest"]),
+                             {"transactionHash": "0xtest"})
+            time.sleep(0.12)
+            self.assertEqual(rpc.call("eth_getTransactionReceipt", ["0xtest"]),
+                             {"transactionHash": "0xtest"})
+        self.assertEqual(fixture.calls.count(("primary", "eth_chainId")), 1)
+        self.assertEqual(fixture.calls.count(("primary", "eth_blockNumber")), 1)
+
+    def test_base_probe_identity_falls_back_one_header_without_transactions(self) -> None:
+        calls = []
+
+        def request(endpoint: RpcEndpoint, method: str, params: Sequence[Any]) -> Any:
+            calls.append((method, list(params)))
+            if method == "eth_chainId":
+                return "0x2105"
+            if method == "eth_blockNumber":
+                return "0x64"
+            if method == "eth_getBlockByNumber":
+                self.assertIs(params[1], False)
+                if params[0] == "0x64":
+                    raise OSError("temporary header failure")
+                return {"hash": "0x" + "ab" * 32}
+            if method == "eth_getCode":
+                return "0x6000"
+            raise AssertionError(method)
+
+        endpoint = RpcEndpoint("8453", "fixture", "primary",
+                               public_http_url="https://example.com")
+        rpc = FailoverJsonRpc("8453", [endpoint], requester=request,
+                              previous_header_fallback=True)
+        self.assertEqual(rpc.call("eth_getCode", ["0x" + "11" * 20, "0x63"]), "0x6000")
+        self.assertEqual(rpc._health[endpoint.endpoint_id].height, 99)
+        self.assertEqual([params[0] for method, params in calls
+                          if method == "eth_getBlockByNumber"], ["0x64", "0x63"])
+
     def test_wrong_chain_backup_never_serves_nonce_or_receipt(self) -> None:
         for method, params in (("eth_getTransactionCount", ["0xwallet", "pending"]),
                                ("eth_getTransactionReceipt", ["0xtest"]),

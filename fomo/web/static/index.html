@@ -185,14 +185,37 @@
     .intelligence-table th:nth-child(6),.intelligence-table th:nth-child(7),.intelligence-table th:nth-child(8) { width:125px; }
     .intelligence-table th:nth-child(9),.intelligence-table th:nth-child(10) { width:92px; }
     .intelligence-table td:last-child { line-height:1.6; }
-    .daily-grid { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(310px,.6fr); gap:12px; }
+    .daily-grid { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(320px,.65fr); gap:12px; }
     .daily-grid .table-wrap { min-height:230px; max-height:340px; }
     .daily-grid table { min-width:760px; }
-    .pnl-bars { padding:14px; }
-    .pnl-bar-row { display:grid; grid-template-columns:84px 1fr 88px; gap:9px; align-items:center; margin:11px 0; }
-    .pnl-bar-track { position:relative; height:8px; border-radius:0; background:var(--raised); overflow:hidden; }
-    .pnl-bar-fill { position:absolute; top:0; bottom:0; left:50%; width:var(--pnl-width); transform:scaleX(var(--pnl-dir)); transform-origin:left; border-radius:0; background:var(--green); transition:width 300ms linear; }
-    .pnl-bar-fill.negative { background:var(--red); }
+    .pnl-chart { position:relative; min-width:0; padding:10px 12px 12px; }
+    .pnl-chart-summary { display:flex; flex-wrap:wrap; gap:5px 18px; padding:0 0 7px 51px; color:var(--muted); font-size:10px; }
+    .pnl-chart-summary b { color:var(--text); font-weight:700; }
+    .pnl-chart-summary .funding-shortfall b { color:var(--red); }
+    .pnl-chart-legend { display:flex; align-items:center; gap:16px; margin:0 0 4px 51px; color:var(--muted); font-size:10px; }
+    .pnl-chart-legend span { display:inline-flex; align-items:center; gap:6px; }
+    .pnl-chart-legend i { width:8px; height:8px; border-radius:50%; background:#78a6ff; }
+    .pnl-chart-legend .loss i { background:#ffc080; }
+    .pnl-chart-viewport { width:100%; height:300px; overflow-x:auto; scrollbar-color:#30495d transparent; }
+    .pnl-chart-viewport .empty { display:grid; min-height:300px; place-items:center; padding:20px; }
+    .pnl-chart-svg { display:block; height:300px; }
+    .pnl-chart-grid { stroke:#26313e; stroke-width:1; }
+    .pnl-chart-grid.zero { stroke:#647988; stroke-dasharray:4 5; }
+    .pnl-chart-axis { fill:#8399a5; font:10px "Space Mono",monospace; }
+    .pnl-chart-line { fill:none; stroke:#8c9ca2; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .pnl-point { cursor:pointer; }
+    .pnl-hit { fill:transparent; }
+    .pnl-bubble { fill:#78a6ff; stroke:#142132; stroke-width:2; transform-box:fill-box; transform-origin:center; animation:pnl-breathe 3.8s ease-in-out infinite alternate; transition:transform 160ms ease,stroke-width 160ms ease; }
+    .pnl-point.loss .pnl-bubble { fill:#ffc080; animation-delay:-1.8s; }
+    .pnl-point:hover .pnl-bubble,.pnl-point:focus-visible .pnl-bubble,.pnl-point.selected .pnl-bubble { animation-play-state:paused; transform:scale(1.2); stroke-width:3; }
+    .pnl-point:focus-visible { outline:none; }
+    .pnl-chart-tooltip { position:absolute; z-index:4; width:234px; padding:10px 12px; border:1px solid #496275; background:#0b141e; box-shadow:0 12px 30px rgb(0 0 0 / 35%); opacity:0; visibility:hidden; transform:translateY(5px); transition:opacity 150ms ease,transform 150ms ease,visibility 150ms; pointer-events:none; font-size:11px; }
+    .pnl-chart-tooltip.visible { opacity:1; visibility:visible; transform:translateY(0); }
+    .pnl-chart-tooltip strong { display:block; margin-bottom:6px; color:var(--text); font-size:12px; }
+    .pnl-chart-tooltip div { display:flex; justify-content:space-between; gap:10px; margin-top:3px; color:var(--muted); }
+    .pnl-chart-tooltip b { color:var(--text); font-weight:650; }
+    @keyframes pnl-breathe { from { opacity:.82; } to { opacity:1; } }
+    @media (prefers-reduced-motion:reduce) { .pnl-bubble { animation:none; } .pnl-chart-tooltip { transition:none; } }
     .stale { color:var(--amber); }
     .wallet-manager { display:grid; gap:12px; margin-top:14px; }
     .manager-grid { display:grid; grid-template-columns:minmax(360px,.7fr) minmax(620px,1.3fr); gap:12px; }
@@ -617,8 +640,8 @@
           </div>
         </section>
         <div class="daily-grid">
+          <section class="panel"><div class="portfolio-section-head"><h2 id="daily-chart-title">模拟账户净值走势</h2><span id="daily-chart-range">最近 15 天 · 气泡表示当日盈亏</span></div><div class="pnl-chart" id="daily-chart"><div class="pnl-chart-summary" id="daily-chart-summary"></div><div class="pnl-chart-legend"><span><i></i>盈利</span><span class="loss"><i></i>亏损</span></div><div class="pnl-chart-viewport" id="daily-chart-viewport"><div id="daily-chart-graphic"><div class="empty">正在载入趋势…</div></div></div><div class="pnl-chart-tooltip" id="daily-chart-tooltip" role="tooltip"></div></div></section>
           <section class="panel portfolio-table"><div class="portfolio-section-head"><h2>日统计</h2><span>Asia/Shanghai 自然日</span></div><div class="table-wrap"><table><thead><tr><th>日期</th><th class="num">买入</th><th class="num">卖出</th><th class="num">已实现</th><th class="num">未实现</th><th class="num">总盈亏</th><th class="num">期末价值</th><th class="num">成交</th></tr></thead><tbody id="daily-rows"></tbody></table></div></section>
-          <section class="panel"><div class="portfolio-section-head"><h2>每日盈亏走势</h2><span>绿色盈利 / 红色亏损</span></div><div class="pnl-bars" id="daily-bars"></div></section>
         </div>
         <section class="panel portfolio-table"><div class="portfolio-section-head"><h2>最近模拟成交</h2><span>目前按信号价记账；接入 RPC 后替换为链上回执</span></div><div class="table-wrap"><table><thead><tr><th>成交时间</th><th>方向</th><th>KOL</th><th>代币 / 链</th><th class="num">价格</th><th class="num">金额</th><th class="num">实现盈亏</th><th>模式</th></tr></thead><tbody id="fill-rows"></tbody></table></div></section>
         <section class="panel portfolio-table"><div class="portfolio-section-head"><h2>执行意图审计</h2><span>持久化状态机 · 当前只读锁定</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>状态</th><th>KOL</th><th>代币 / 链</th><th>方向</th><th class="num">目标金额</th><th>风险结果</th><th>首要阻断项</th></tr></thead><tbody id="intent-rows"></tbody></table></div></section>
@@ -759,6 +782,7 @@
 
   <script type="module">
     import {DashboardConsistency,lifecycleRefreshKeys} from '/assets/dashboard-consistency.mjs';
+    import {recentDailyPnl,dailyPnlGeometry} from '/assets/daily-pnl-chart.mjs';
     const statusLabels={accepted:'成功买入',eligible:'可进入报价',not_following:'非关注用户',following_whitelist_unavailable:'关注白名单不可用',disabled:'已关闭',not_buy:'非买入事件',passive_asset_event:'转账/空投已忽略',missing_ca:'缺少代币地址',missing_transaction_reference:'缺少原交易引用',target_trade_too_small:'目标金额过小',stale_signal:'信号过期（旧口径）',dropped_late:'迟到丢弃',unsupported_event_type:'事件类型未启用',unsupported_network:'链未启用（历史）',daily_limit_reached:'每日限额',per_kol_daily_limit_reached:'KOL 日限额',per_token_limit_reached:'单币限额',maximum_open_positions_reached:'持仓数上限',risk_limit_reached:'触发风控限额',market_cap_too_small:'市值过小',missing_market_cap:'缺少市值',needs_identity:'待身份登记',needs_data:'待风控数据',rejected:'已拒绝',approved_for_shadow:'影子准入'};
     const reasonLabels={missing_kol_id:'缺少用户标识',missing_chain_id:'缺少链信息',wallet_not_registered:'钱包未登记',ambiguous_wallet_mapping:'同链钱包映射不唯一',asset_snapshot_required:'缺少资产快照',independent_quotes_required:'缺少独立报价',exposure_snapshot_required:'缺少敞口快照',health_snapshot_required:'缺少系统健康快照',exit_plan_required:'缺少退出计划',transaction_simulation_required:'缺少交易模拟',transaction_scope_invalid:'交易范围不安全',route_not_allowlisted:'路由未加入白名单',minimum_output_required:'缺少最低到账保护',signal_too_old:'信号过期',wallet_mapping_expired:'钱包映射已过期',wallet_confidence_too_low:'钱包置信度过低'};
     const styleLabels={pvp_short_term:'PVP 短线',whale_momentum:'鲸鱼 / 趋势',narrative_momentum:'叙事趋势',early_alpha:'早期 Alpha',pvp_verified:'已验证 PVP',rebound_specialist:'反弹型',whale_confirmation:'鲸鱼增强信号',unclassified:'待分类'};
@@ -963,6 +987,47 @@
       stableRows('rpc-rows',rpc.endpoints||[],row=>`${row.chainId}|${row.provider}|${row.role}`,row=>`<tr><td>${esc(chainName(row.chainId))}</td><td>${esc(row.provider)}</td><td>${esc(row.role)}</td><td>${row.httpConfigured?'已配置':'未配置'}</td><td><span class="badge ${row.status==='healthy'?'good':''}">${esc(rpcStatus[row.status]||row.status)}</span></td><td class="num">${row.successRate==null?'—':(Number(row.successRate)*100).toFixed(1)+'%'}</td><td class="num">${row.p95LatencyMs==null?'—':Number(row.p95LatencyMs).toFixed(0)+' ms'}</td><td class="num">${row.blockLag==null?'—':row.blockLag}</td><td>${esc(time(row.lastSampleAt))}</td></tr>`,'<tr><td colspan="9" class="empty">暂无 RPC 配置</td></tr>');
       $('visible').textContent=`分析 ${state.orders.total.toLocaleString()} 条决策`;
     }
+    let dailyTrendRows=[],dailyTrendPoints=[],dailyTrendIsEquity=false,pnlPinnedDay='';
+    const axisPnl=value=>`${value<0?'−':''}$${compact(Math.abs(value))}`;
+    function renderDailyPnlChart(){
+      const portfolio=state.portfolio;
+      dailyTrendIsEquity=Boolean(portfolio.balanceConfigured);
+      const sourceRows=dailyTrendIsEquity?portfolio.daily:(portfolio.daily||[]).map(row=>({...row,equityUsd:row.totalPnlUsd,dailyPnlChangeUsd:row.totalPnlUsd}));
+      dailyTrendRows=recentDailyPnl(sourceRows,15);
+      $('daily-chart-title').textContent=dailyTrendIsEquity?'模拟账户净值走势':'每日盈亏走势';
+      $('daily-chart-range').textContent=`${dailyTrendRows.length===15?'最近 15':`已有 ${dailyTrendRows.length}`} 个有记录日 · ${dailyTrendIsEquity?'气泡表示当日盈亏':'待设置模拟本金'}`;
+      const paperAssetSummary=(portfolio.paperAssetBalances||[]).map(row=>{
+        const amount=row.estimatedNativeRemaining==null?'—（待获取币价）':`≈ ${Number(row.estimatedNativeRemaining).toFixed(6)} ${esc(row.asset)}`;
+        return `<span class="${Number(row.remainingUsd)<0?'funding-shortfall':''}" title="模拟额度按成交美元金额记账；币数按当前币价折算，仅供估算，并非链上钱包余额。">${esc(row.asset)} 额度剩余 <b>${money(row.remainingUsd)}</b> · ${amount}</span>`;
+      }).join('');
+      stableHTML('daily-chart-summary',dailyTrendIsEquity
+        ? `<span>模拟本金 <b>${money(portfolio.initialBalanceUsd)}</b>（U 等值）</span>${paperAssetSummary}<span class="${Number(portfolio.cashBalanceUsd)<0?'funding-shortfall':''}">可用现金 <b>${money(portfolio.cashBalanceUsd)}</b></span><span>当前净值 <b>${money(portfolio.equityUsd)}</b></span>${Number(portfolio.cashBalanceUsd)<0?'<span class="funding-shortfall">历史买入超出设定本金</span>':''}`
+        : '<span>尚未设置模拟本金，暂显示原有盈亏曲线；不会把持仓价值冒充账户余额。</span>');
+      if(!dailyTrendRows.length){dailyTrendPoints=[];stableHTML('daily-chart-graphic','<div class="empty">暂无每日交易与持仓快照</div>');$('daily-chart-tooltip').classList.remove('visible');return}
+      const width=Math.max(640,$('daily-chart-viewport').clientWidth),height=300;
+      const geometry=dailyPnlGeometry(dailyTrendRows,width,height);
+      dailyTrendPoints=geometry.points;
+      if(pnlPinnedDay&&!dailyTrendRows.some(row=>row.day===pnlPinnedDay))pnlPinnedDay='';
+      const grid=geometry.ticks.map(tick=>`<g><line class="pnl-chart-grid${Math.abs(tick.value)<1e-9?' zero':''}" x1="${geometry.margin.left}" x2="${width-geometry.margin.right}" y1="${tick.y.toFixed(2)}" y2="${tick.y.toFixed(2)}"/><text class="pnl-chart-axis" x="${geometry.margin.left-10}" y="${(tick.y+3).toFixed(2)}" text-anchor="end">${esc(axisPnl(tick.value))}</text></g>`).join('');
+      const path=geometry.points.map((point,index)=>`${index?'L':'M'}${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ');
+      const labels=geometry.points.map(point=>`<text class="pnl-chart-axis" x="${point.x.toFixed(2)}" y="${height-12}" text-anchor="middle">${esc(point.day.slice(5))}</text>`).join('');
+      const bubbles=geometry.points.map((point,index)=>{const detail=dailyTrendIsEquity?`净值 ${money(point.equityUsd)}，当日盈亏 ${signedMoney(point.dailyPnlChangeUsd)}`:`总盈亏 ${signedMoney(point.equityUsd)}`;return `<g class="pnl-point${point.dailyPnlChangeUsd<0?' loss':''}${point.day===pnlPinnedDay?' selected':''}" data-pnl-index="${index}" tabindex="0" role="button" aria-label="${esc(`${point.day}，${detail}，查看明细`)}" transform="translate(${point.x.toFixed(2)} ${point.y.toFixed(2)})"><title>${esc(`${point.day} · ${detail}`)}</title><circle class="pnl-hit" r="${Math.max(22,point.radius+6).toFixed(2)}"/><circle class="pnl-bubble" r="${point.radius.toFixed(2)}"/></g>`}).join('');
+      stableHTML('daily-chart-graphic',`<svg class="pnl-chart-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="group" aria-label="最近每日${dailyTrendIsEquity?'模拟账户净值':'总盈亏'}气泡折线图"><text class="pnl-chart-axis" x="14" y="18">${dailyTrendIsEquity?'净值':'盈亏'} USD</text>${grid}${geometry.min<0&&geometry.max>0?`<line class="pnl-chart-grid zero" x1="${geometry.margin.left}" x2="${width-geometry.margin.right}" y1="${(geometry.margin.top+geometry.max/(geometry.max-geometry.min)*geometry.plotHeight).toFixed(2)}" y2="${(geometry.margin.top+geometry.max/(geometry.max-geometry.min)*geometry.plotHeight).toFixed(2)}"/>`:''}<path class="pnl-chart-line" d="${path}"/>${labels}${bubbles}</svg>`);
+      if(pnlPinnedDay)showDailyPnlTooltip(dailyTrendRows.findIndex(row=>row.day===pnlPinnedDay));
+      else $('daily-chart-tooltip').classList.remove('visible');
+    }
+    function showDailyPnlTooltip(index){
+      const point=dailyTrendPoints[index];if(!point)return;
+      const tip=$('daily-chart-tooltip'),viewport=$('daily-chart-viewport'),chart=$('daily-chart');
+      tip.innerHTML=dailyTrendIsEquity
+        ? `<strong>${esc(point.day)} · 净值 ${money(point.equityUsd)}</strong><div><span>当日盈亏</span><b class="${pnlClass(point.dailyPnlChangeUsd)}">${signedMoney(point.dailyPnlChangeUsd)}</b></div><div><span>可用现金</span><b>${money(point.cashBalanceUsd)}</b></div><div><span>持仓价值</span><b>${money(point.marketValueUsd)}</b></div><div><span>已实现 / 未实现</span><b>${signedMoney(point.realizedPnlUsd)} / ${signedMoney(point.unrealizedPnlUsd)}</b></div><div><span>成交</span><b>${Number(point.trades||0)} 笔</b></div>`
+        : `<strong>${esc(point.day)} · 总盈亏 ${signedMoney(point.totalPnlUsd)}</strong><div><span>已实现</span><b>${signedMoney(point.realizedPnlUsd)}</b></div><div><span>未实现快照</span><b>${signedMoney(point.unrealizedPnlUsd)}</b></div><div><span>持仓价值（非余额）</span><b>${money(point.marketValueUsd)}</b></div>`;
+      tip.style.left=`${Math.max(8,Math.min(chart.clientWidth-tip.offsetWidth-8,point.x-viewport.scrollLeft-100))}px`;
+      const top=point.y>tip.offsetHeight+30?point.y-tip.offsetHeight-10:point.y+12;
+      tip.style.top=`${viewport.offsetTop+Math.max(4,Math.min(300-tip.offsetHeight-8,top))}px`;
+      tip.classList.add('visible');
+    }
+    function hideDailyPnlTooltip(){if(!pnlPinnedDay)$('daily-chart-tooltip').classList.remove('visible')}
     function renderPortfolio(){
       const p=state.portfolio,r=state.readiness;
       const policy=p.exitPolicy||{};
@@ -998,8 +1063,7 @@
         return `<tr><td>${esc(time(row.firstBoughtAt))}</td><td>@${esc(handleText(row.handle))}</td><td><span class="token">${esc(row.symbol||'—')}<span class="chain">${esc(chainName(row.networkId))}</span></span></td><td><span class="badge ${row.status==='open'&&!row.markStale?'good':''} ${row.markStale?'stale':''}">${status}</span></td><td class="num mono">${esc(compact(row.quantity))}</td><td class="num">${costMarkup}</td><td class="num">${valueMarkup}</td><td class="num">${cycleReturnMarkup}</td><td class="num">${historyMarkup}</td><td><span class="exit-stage">${esc(stage)}<small>${esc(planDetail)}</small></span></td><td class="num">${price(row.lastPriceUsd)}${row.markStale?'<br><span class="stale">'+Math.floor(Number(row.markAgeSeconds)/60)+'m 前</span>':''}</td><td>${actionMarkup(row)}</td></tr>`;
       }).join(''):'<tr><td colspan="12" class="empty">暂无模拟持仓</td></tr>');
       stableHTML('daily-rows',(p.daily||[]).length?p.daily.map(row=>`<tr><td>${esc(row.day)}</td><td class="num">${money(row.buyUsd)}</td><td class="num">${money(row.sellUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${signedMoney(row.realizedPnlUsd)}</td><td class="num ${pnlClass(row.unrealizedPnlUsd)}">${signedMoney(row.unrealizedPnlUsd)}</td><td class="num ${pnlClass(row.totalPnlUsd)}">${signedMoney(row.totalPnlUsd)}</td><td class="num">${money(row.marketValueUsd)}</td><td class="num">${Number(row.trades||0)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">暂无日统计</td></tr>');
-      const days=(p.daily||[]).slice(0,14).reverse(),maxPnl=Math.max(1,...days.map(x=>Math.abs(Number(x.totalPnlUsd||0))));
-      stableHTML('daily-bars',days.length?days.map(row=>{const value=Number(row.totalPnlUsd||0),width=Math.max(1,Math.abs(value)/maxPnl*48);return `<div class="pnl-bar-row"><span>${esc(row.day.slice(5))}</span><div class="pnl-bar-track"><i class="pnl-bar-fill ${value<0?'negative':''}" style="--pnl-width:${width}%;--pnl-dir:${value<0?-1:1}"></i></div><strong class="num ${pnlClass(value)}">${signedMoney(value)}</strong></div>`}).join(''):'<div class="empty">暂无趋势</div>');
+      renderDailyPnlChart();
       const exitReasons={stop_loss:'止损',principal_recovery:'出本',trailing_stop:'回撤止盈',max_holding_time:'到期退出'};
       stableHTML('fill-rows',(p.fills||[]).slice(0,60).map(row=>`<tr><td>${esc(time(row.executedAt))}</td><td><span class="badge ${row.side==='buy'?'good':''}">${row.side==='buy'?'买入':'卖出'}${exitReasons[row.reason]?' · '+exitReasons[row.reason]:''}</span></td><td>@${esc(handleText(row.handle))}</td><td><span class="token">${esc(row.symbol||'—')}<span class="chain">${esc(chainName(row.networkId))}</span></span></td><td class="num">${price(row.priceUsd)}</td><td class="num">${money(row.grossUsd)}</td><td class="num ${pnlClass(row.realizedPnlUsd)}">${signedMoney(row.realizedPnlUsd)}</td><td>${esc(row.mode||'paper')}</td></tr>`).join('')||'<tr><td colspan="8" class="empty">暂无模拟成交</td></tr>');
       stableHTML('intent-rows',(journal.intents||[]).slice(0,80).map(row=>`<tr><td>${esc(time(row.createdAt))}</td><td><span class="badge ${row.state==='shadow_ready'?'good':''}">${row.state==='shadow_ready'?'影子就绪':'已阻断'}</span></td><td>@${esc(handleText(row.handle))}</td><td><span class="token">${esc(row.symbol||'—')}<span class="chain">${esc(chainName(row.networkId))}</span></span></td><td>${row.side==='buy'?'买入':row.side==='sell'?'卖出':esc(row.side)}</td><td class="num">${money(row.requestedUsd)}</td><td>${esc(statusLabels[row.riskOutcome]||row.riskOutcome)}</td><td title="${esc((row.blockers||[]).join(', '))}">${esc(reasonLabels[row.blockers?.[0]]||row.blockers?.[0]||'无')}</td></tr>`).join('')||'<tr><td colspan="8" class="empty">新交易信号到达后会生成执行意图</td></tr>');
@@ -1219,6 +1283,15 @@
     document.querySelectorAll('[role="tab"]').forEach(tab=>tab.addEventListener('click',()=>setView(tab.dataset.view)));
     document.querySelectorAll('.side-link').forEach(link=>link.addEventListener('click',()=>setView(link.dataset.target)));
     window.addEventListener('resize',updateTabIndicator);
+    let dailyChartResizeFrame=0;
+    window.addEventListener('resize',()=>{if(state.view==='portfolio'){cancelAnimationFrame(dailyChartResizeFrame);dailyChartResizeFrame=requestAnimationFrame(renderDailyPnlChart)}});
+    $('daily-chart-graphic').addEventListener('pointerover',event=>{const point=event.target.closest?.('[data-pnl-index]');if(point)showDailyPnlTooltip(Number(point.dataset.pnlIndex))});
+    $('daily-chart-graphic').addEventListener('pointerout',event=>{const point=event.target.closest?.('[data-pnl-index]');if(point&&!point.contains(event.relatedTarget))hideDailyPnlTooltip()});
+    $('daily-chart-graphic').addEventListener('focusin',event=>{const point=event.target.closest?.('[data-pnl-index]');if(point)showDailyPnlTooltip(Number(point.dataset.pnlIndex))});
+    $('daily-chart-graphic').addEventListener('focusout',hideDailyPnlTooltip);
+    $('daily-chart-graphic').addEventListener('click',event=>{const point=event.target.closest?.('[data-pnl-index]');if(!point)return;const day=dailyTrendPoints[Number(point.dataset.pnlIndex)]?.day;pnlPinnedDay=pnlPinnedDay===day?'':day;document.querySelectorAll('.pnl-point').forEach(node=>node.classList.toggle('selected',dailyTrendPoints[Number(node.dataset.pnlIndex)]?.day===pnlPinnedDay));if(pnlPinnedDay)showDailyPnlTooltip(Number(point.dataset.pnlIndex));else $('daily-chart-tooltip').classList.remove('visible')});
+    $('daily-chart-graphic').addEventListener('keydown',event=>{if(event.key==='Escape'){pnlPinnedDay='';$('daily-chart-tooltip').classList.remove('visible');document.querySelectorAll('.pnl-point.selected').forEach(node=>node.classList.remove('selected'))}else if((event.key==='Enter'||event.key===' ')&&event.target.closest?.('[data-pnl-index]')){event.preventDefault();event.target.dispatchEvent(new MouseEvent('click',{bubbles:true}))}});
+    $('daily-chart-viewport').addEventListener('scroll',()=>{pnlPinnedDay='';$('daily-chart-tooltip').classList.remove('visible')});
     document.addEventListener('visibilitychange',()=>{const keys=lifecycleRefreshKeys(state.view,'visibilitychange',document.visibilityState);if(keys.length)queueRefresh(keys)});
     ['status','chain'].forEach(id=>$(id).addEventListener('change',()=>{state.signalPage=1;state.orderPage=1;state.riskPage=1;renderCurrent()}));
     $('search').addEventListener('input',()=>{state.signalPage=1;state.orderPage=1;state.riskPage=1;renderCurrent()});

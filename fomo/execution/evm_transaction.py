@@ -297,5 +297,7 @@ class EvmTransactionParser:
             "chainId": str(fields.chain_id), "wallet": wallet, "tokenOut": swap["path"][-1],
             "sellAmount": str(swap["amountIn"]), "minimumOutputAmount": str(swap["minimumOut"]),
             "targets": [target], "operations": ["swap"], "approvals": [],
-            "nonce": fields.nonce, "deadline": swap["deadline"], "tokenIn": swap["path"][0],
+            "nonce": fields.nonce, "gasLimit": fields.gas_limit,
+            "maxFeePerGasWei": fields.maximum_fee,
+            "deadline": swap["deadline"], "tokenIn": swap["path"][0],
         }

@@ -77,7 +77,8 @@ class PortfolioMaintenanceTests(unittest.TestCase):
             ledger.close()
             orders.write_text(
                 '{"eventId":"missing","status":"accepted"}\n'
-                '{"eventId":"failed","status":"accepted"}\n',
+                '{"eventId":"failed","status":"accepted"}\n'
+                '{"eventId":"sell","status":"accepted","side":"sell","sourceType":"swap_sell"}\n',
                 encoding="utf-8",
             )
             db = sqlite3.connect(path)
