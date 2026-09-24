@@ -32,14 +32,51 @@ class WatcherTests(unittest.TestCase):
             log_path = Path(directory) / "orders.ndjson"
             log_path.write_text(
                 '{"recordedAt":"2026-09-09T10:00:00Z","status":"accepted","networkId":4663,"paperBuyUsd":10}\n'
-                '{"recordedAt":"2026-09-09T10:01:00Z","status":"target_trade_too_small","networkId":1399811149,"paperBuyUsd":0}\n',
+                '{"recordedAt":"2026-09-09T10:01:00Z","status":"target_trade_too_small","networkId":1399811149,"paperBuyUsd":0}\n'
+                '{"recordedAt":"2026-09-09T10:02:00Z","status":"accepted","side":"sell","networkId":1399811149}\n'
+                '{"recordedAt":"2026-09-09T10:03:00Z","status":"accepted","side":"buy","networkId":4663,"paperBuyUsd":0}\n',
                 encoding="utf-8",
             )
             payload = build_dashboard_payload(log_path)
-            self.assertEqual(payload["total"], 2)
+            self.assertEqual(payload["total"], 4)
             self.assertEqual(payload["accepted"], 1)
             self.assertEqual(payload["acceptedUsd"], 10)
-            self.assertEqual(payload["orders"][0]["status"], "target_trade_too_small")
+            self.assertEqual(payload["orders"][0]["paperBuyUsd"], 0)
+
+    def test_dashboard_resolves_sell_status_from_portfolio(self):
+        from datetime import datetime, timezone
+        from fomo.portfolio.ledger import PortfolioLedger
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "portfolio.sqlite3"
+            ledger = PortfolioLedger(database, "Asia/Shanghai")
+            event = Event(
+                id="sell-without-position", kind="sell", handle="alice",
+                created_at=datetime.now(timezone.utc).isoformat(), symbol="MEME",
+                ca="So11111111111111111111111111111111111111112",
+                network_id=1399811149, amount_usd=3886.08,
+                market_cap=25_533_800, price=0.027,
+            )
+            result = ledger.apply_event(event, {
+                "status": "sell_requested", "side": "sell", "paperSellRatio": 1.0,
+            })
+            self.assertEqual(result["reason"], "no_open_paper_position")
+            ledger.close()
+            log_path = root / "orders.ndjson"
+            log_path.write_text(
+                '{"recordedAt":"2026-09-09T10:00:00Z","eventId":"sell-without-position",'
+                '"status":"sell_requested","side":"sell","targetSellUsd":3886.08,'
+                '"marketCapUsd":25533800,"networkId":1399811149}\n',
+                encoding="utf-8",
+            )
+            payload = build_dashboard_payload(
+                log_path, portfolio_database=database, portfolio_account="paper-main"
+            )
+            self.assertEqual(payload["accepted"], 0)
+            self.assertEqual(payload["acceptedUsd"], 0)
+            self.assertEqual(payload["orders"][0]["status"], "no_open_paper_position")
+            self.assertEqual(payload["orders"][0]["paperSellUsd"], 0)
 
     def test_dashboard_aggregates_shadow_latency(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -233,6 +270,36 @@ class WatcherTests(unittest.TestCase):
             decision = paper_copy_trade(state, event, cfg)
             self.assertEqual(decision["status"], "accepted")
             self.assertEqual(decision["networkId"], 1399811149)
+            state.db.close()
+
+    def test_paper_sell_is_not_reported_as_successful_buy(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(str(Path(directory) / "state.sqlite3"))
+            cfg = {
+                "timezone": "Asia/Shanghai",
+                "portfolio": {"paper_exit_mode": "full_on_first_sell"},
+                "copy_trading": {
+                    "enabled": True, "mode": "paper",
+                    "log_path": str(Path(directory) / "orders.ndjson"),
+                },
+            }
+            event = Event(
+                id="paper-sell-1", kind="sell", handle="alice",
+                created_at=datetime.now(timezone.utc).isoformat(), symbol="MEME",
+                ca="So11111111111111111111111111111111111111112",
+                network_id=1399811149, amount_usd=3886.08,
+                market_cap=25_533_800, price=0.027,
+                source_type="large_sell",
+            )
+            with patch("fomo.app.enqueue_ndjson", return_value=0):
+                decision = paper_copy_trade(state, event, cfg)
+            self.assertEqual(decision["status"], "sell_requested")
+            self.assertEqual(decision["side"], "sell")
+            self.assertEqual(decision["targetSellUsd"], 3886.08)
+            self.assertEqual(decision["marketCapUsd"], 25_533_800)
             state.db.close()
 
 

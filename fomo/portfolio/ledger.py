@@ -410,11 +410,15 @@ class PortfolioLedger:
     def open_position_tokens(self) -> list[dict[str, Any]]:
         with self._write_lock:
             rows = self.db.execute(
-                "SELECT DISTINCT chain_id,token_address,symbol FROM portfolio_positions WHERE account_id=? AND status='open'",
+                """SELECT chain_id,token_address,MAX(symbol) AS symbol,
+                          MAX(CAST(last_price_usd AS REAL)) AS reference_price_usd
+                   FROM portfolio_positions WHERE account_id=? AND status='open'
+                   GROUP BY chain_id,token_address""",
                 (self.account_id,),
             ).fetchall()
         return [{"chainId": int(row["chain_id"]), "tokenAddress": str(row["token_address"]),
-                 "symbol": str(row["symbol"])} for row in rows]
+                 "symbol": str(row["symbol"]), "referencePriceUsd": float(row["reference_price_usd"] or 0)}
+                for row in rows]
 
     def update_market_marks(self, marks: list[dict[str, Any]]) -> int:
         """Apply independently sourced prices to every matching open position."""
@@ -743,7 +747,7 @@ class PortfolioLedger:
             ).fetchone()
             if row is None:
                 result = {"status": "ignored", "reason": "no_open_paper_position", "eventId": event.id}
-            elif paper_decision is not None and paper_decision.get("status") != "accepted":
+            elif paper_decision is not None and paper_decision.get("status") not in {"accepted", "sell_requested"}:
                 result = {"status": "ignored", "reason": str(paper_decision.get("status")), "eventId": event.id}
             elif price <= 0:
                 result = {"status": "needs_price", "reason": "missing_execution_price", "eventId": event.id}

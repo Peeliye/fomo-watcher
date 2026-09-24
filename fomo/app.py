@@ -1157,10 +1157,12 @@ def paper_copy_trade(state: State, event: Event, cfg: dict[str, Any], portfolio:
         full = str(cfg.get("portfolio", {}).get("paper_exit_mode") or "ignore") == "full_on_first_sell"
         record = {
             "recordedAt": datetime.now(timezone.utc).isoformat(), "eventId": event.id,
-            "sourceType": event.source_type, "status": "accepted" if full else "ignored_sell_policy",
+            "sourceType": event.source_type, "status": "sell_requested" if full else "ignored_sell_policy",
             "mode": "paper", "handle": event.handle, "userId": event.user_id or None,
             "symbol": event.symbol, "networkId": event.network_id, "ca": event.ca,
             "side": "sell", "paperSellRatio": 1.0 if full else 0.0,
+            "targetSellUsd": event.amount_usd, "marketCapUsd": event.market_cap,
+            "priceUsd": event.price or None,
             "stage": "fomo_sell_mirror" if full else "fomo_sell_ignored",
         }
         record["durableEnqueueLatencyMs"] = enqueue_ndjson(

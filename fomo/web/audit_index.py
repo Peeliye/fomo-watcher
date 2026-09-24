@@ -91,14 +91,19 @@ class AuditLogIndex:
             ):
                 self._increment(db, prefix + str(value), float(count))
         accepted, accepted_usd = db.execute(
-            "SELECT COUNT(*),COALESCE(SUM(amount),0) FROM audit_rows WHERE status='accepted'"
+            """SELECT COUNT(*),COALESCE(SUM(amount),0) FROM audit_rows
+               WHERE status='accepted' AND amount>0
+                 AND COALESCE(json_extract(payload_json,'$.side'),'buy')='buy'"""
         ).fetchone()
         self._increment(db, "accepted", float(accepted))
         self._increment(db, "accepted_usd", float(accepted_usd))
         eligible = int(db.execute("SELECT COUNT(*) FROM audit_rows WHERE status='eligible'").fetchone()[0])
         self._increment(db, "eligible", eligible)
         for network, count in db.execute(
-            "SELECT network_id,COUNT(*) FROM audit_rows WHERE status='accepted' GROUP BY network_id"
+            """SELECT network_id,COUNT(*) FROM audit_rows
+               WHERE status='accepted' AND amount>0
+                 AND COALESCE(json_extract(payload_json,'$.side'),'buy')='buy'
+               GROUP BY network_id"""
         ):
             self._increment(db, f"accepted_chain:{network}", float(count))
         latency_count, latency_sum = db.execute(
@@ -235,7 +240,12 @@ class AuditLogIndex:
                                 self._increment(db, "total")
                                 self._increment(db, f"status:{status}")
                                 self._increment(db, f"outcome:{outcome}")
-                                if status == "accepted":
+                                accepted_buy = (
+                                    status == "accepted"
+                                    and str(value.get("side") or "buy") == "buy"
+                                    and float(value.get("paperBuyUsd") or 0) > 0
+                                )
+                                if accepted_buy:
                                     self._increment(db, "accepted")
                                     self._increment(db, "accepted_usd", float(value.get("paperBuyUsd") or 0))
                                     self._increment(db, f"accepted_chain:{value.get('networkId') or 'unknown'}")

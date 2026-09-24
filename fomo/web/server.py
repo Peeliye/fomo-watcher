@@ -227,7 +227,88 @@ def build_status_payload(data_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_dashboard_payload(log_path: Path, limit: int = 500, retention_days: int = 30) -> dict[str, Any]:
+def _portfolio_order_outcomes(
+    database: Path,
+    account_id: str,
+    orders: list[dict[str, Any]],
+) -> tuple[int, float, dict[str, int], list[dict[str, Any]]] | None:
+    """Overlay audit decisions with authoritative committed Portfolio outcomes."""
+    if not database.is_file():
+        return None
+    db = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA query_only=ON")
+    db.execute("PRAGMA busy_timeout=5000")
+    try:
+        accepted, accepted_usd_micros = db.execute(
+            """SELECT COUNT(*),COALESCE(SUM(gross_usd_micros),0)
+               FROM portfolio_fills WHERE account_id=? AND side='buy'""",
+            (account_id,),
+        ).fetchone()
+        accepted_chains = {
+            str(row[0]): int(row[1]) for row in db.execute(
+                """SELECT chain_id,COUNT(*) FROM portfolio_fills
+                   WHERE account_id=? AND side='buy' GROUP BY chain_id""",
+                (account_id,),
+            )
+        }
+        event_ids = [str(row.get("eventId") or "") for row in orders if row.get("eventId")]
+        events: dict[str, sqlite3.Row] = {}
+        fills: dict[str, sqlite3.Row] = {}
+        for start in range(0, len(event_ids), 250):
+            chunk = event_ids[start : start + 250]
+            placeholders = ",".join("?" for _ in chunk)
+            events.update({
+                str(row["event_id"]): row for row in db.execute(
+                    f"SELECT event_id,status,reason FROM portfolio_events WHERE event_id IN ({placeholders})",
+                    chunk,
+                )
+            })
+            fills.update({
+                str(row["event_id"]): row for row in db.execute(
+                    f"""SELECT event_id,side,quantity,price_usd,gross_usd_micros,
+                               realized_pnl_micros FROM portfolio_fills
+                        WHERE account_id=? AND event_id IN ({placeholders})""",
+                    [account_id, *chunk],
+                )
+            })
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        db.close()
+
+    resolved: list[dict[str, Any]] = []
+    for source in orders:
+        row = dict(source)
+        event_id = str(row.get("eventId") or "")
+        fill = fills.get(event_id)
+        event = events.get(event_id)
+        if fill is not None:
+            side = str(fill["side"])
+            row["side"] = side
+            row["status"] = "accepted" if side == "buy" else "sold"
+            row["priceUsd"] = float(fill["price_usd"])
+            row["paperTokenAmount"] = str(fill["quantity"])
+            if side == "buy":
+                row["paperBuyUsd"] = float(fill["gross_usd_micros"]) / 1_000_000
+            else:
+                row["paperSellUsd"] = float(fill["gross_usd_micros"]) / 1_000_000
+                row["realizedPnlUsd"] = float(fill["realized_pnl_micros"]) / 1_000_000
+        elif event is not None and str(event["status"]) != "filled":
+            row["status"] = str(event["reason"] or event["status"])
+            if str(row.get("side") or "") == "sell":
+                row["paperSellUsd"] = 0.0
+        resolved.append(row)
+    return int(accepted), float(accepted_usd_micros) / 1_000_000, accepted_chains, resolved
+
+
+def build_dashboard_payload(
+    log_path: Path,
+    limit: int = 500,
+    retention_days: int = 30,
+    portfolio_database: Path | None = None,
+    portfolio_account: str = "paper-main",
+) -> dict[str, Any]:
     index=AuditLogIndex(log_path, retention_days);db=index.sync()
     try:
         metrics=index.metrics(db)
@@ -237,6 +318,10 @@ def build_dashboard_payload(log_path: Path, limit: int = 500, retention_days: in
         recent=index.recent(db,limit)
         latest_at=metrics.get("latest_at",(0,None))[1]
     finally:index.close(db)
+    if portfolio_database is not None:
+        portfolio = _portfolio_order_outcomes(portfolio_database, portfolio_account, recent)
+        if portfolio is not None:
+            accepted, accepted_usd, accepted_chains, recent = portfolio
     return {
         "total": int(total),
         "accepted": int(accepted or 0),
@@ -768,7 +853,8 @@ def start_dashboard(project_dir: Path, cfg: dict[str, Any],
                 except ValueError:
                     limit = 500
                 self._send_json(build_dashboard_payload(
-                    log_path, limit, int(copy_settings.get("audit_retention_days", 30))
+                    log_path, limit, int(copy_settings.get("audit_retention_days", 30)),
+                    portfolio_db, portfolio_account,
                 ))
                 return
             if parsed.path == "/api/status":
