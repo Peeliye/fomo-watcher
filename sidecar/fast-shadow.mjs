@@ -15,6 +15,20 @@ export function loadJson(path, fallback = null) {
   }
 }
 
+// freshness@1: the same arrival-time rule as fomo.signals.freshness.
+export function decideFreshness(sourceMs, observedMs, consumptionMs, maximumUpstreamDelayMs) {
+  if (!Number.isFinite(maximumUpstreamDelayMs) || maximumUpstreamDelayMs <= 0) {
+    throw new Error("maximum_upstream_delay_invalid");
+  }
+  const raw = observedMs - sourceMs;
+  return {
+    accepted: Number.isFinite(raw) && raw >= 0 && raw <= maximumUpstreamDelayMs,
+    upstreamDelayMs: Number.isFinite(raw) ? Math.max(0, raw) : null,
+    localQueueDelayMs: Number.isFinite(observedMs) ? Math.max(0, consumptionMs - observedMs) : null,
+    clockSkewMs: Number.isFinite(raw) ? Math.max(0, -raw) : null,
+  };
+}
+
 export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = Date.now()) {
   const event = payload?.body && !payload.tokenAddress ? { ...payload.body, ...payload } : payload || {};
   const networkId = Number(event.networkId || 0);
@@ -22,21 +36,21 @@ export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = D
   const marketCapUsd = Number(event.marketCap || event.fdv || 0);
   const createdMs = Date.parse(event.createdAt || receivedAt);
   const receivedMs = Date.parse(receivedAt);
-  const rawUpstreamAgeMs = Number.isFinite(createdMs) && Number.isFinite(receivedMs)
-    ? receivedMs - createdMs
-    : null;
-  const upstreamAgeMs = rawUpstreamAgeMs === null ? null : Math.max(0, rawUpstreamAgeMs);
-  const upstreamClockSkewMs = rawUpstreamAgeMs === null ? null : Math.max(0, -rawUpstreamAgeMs);
-  const localQueueMs = Number.isFinite(receivedMs) ? Math.max(0, nowMs - receivedMs) : null;
+  const sourceMaximumAgeMs = Number(
+    config?.sourcePolicies?.fomo_push?.maximumUpstreamDelayMs
+      ?? config?.sourcePolicies?.fomo_push?.maximumAgeMs
+      ?? Number(config.maxSignalAgeSeconds || 5) * 1000
+  );
+  const freshness = decideFreshness(createdMs, receivedMs, nowMs, sourceMaximumAgeMs);
+  const upstreamAgeMs = freshness.upstreamDelayMs;
+  const upstreamClockSkewMs = freshness.clockSkewMs;
+  const localQueueMs = freshness.localQueueDelayMs;
   const signalAgeMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : null;
   const allowedEvents = new Set(config?.eventTypes || ["swap_buy", "single_user_buy"]);
   const activeBuyEvents = new Set(config?.activeBuyEventTypes || ["swap_buy", "single_user_buy"]);
   const allowedNetworks = new Set((config?.networkIds || []).map(Number));
   const ids = new Set((whitelist?.followingIds || []).map(String));
   const whitelistAgeMs = whitelist?.updatedAt ? nowMs - Number(whitelist.updatedAt) : Infinity;
-  const sourceMaximumAgeMs = Number(
-    config?.sourcePolicies?.fomo_push?.maximumAgeMs ?? Number(config.maxSignalAgeSeconds || 5) * 1000
-  );
 
   const sourceType = String(event.type || "").toLowerCase();
   const passiveEvent = ["transfer", "airdrop", "mint", "deposit", "receive", "token_deploy"]
@@ -50,7 +64,7 @@ export function evaluateShadow(payload, receivedAt, config, whitelist, nowMs = D
   else if (!allowedEvents.has(sourceType) || !activeBuyEvents.has(sourceType)) status = "unsupported_event_type";
   else if (!String(event.tokenAddress || "")) status = "missing_ca";
   else if (!allowedNetworks.has(networkId)) status = "unsupported_network";
-  else if (signalAgeMs === null || signalAgeMs > sourceMaximumAgeMs) status = "dropped_late";
+  else if (!freshness.accepted) status = "dropped_late";
   else if (targetBuyUsd < Number(config.minTargetBuyUsd || 0)) status = "target_trade_too_small";
   else if (!marketCapUsd && config?.deferAssetChecks !== false) deferredChecks.push("missing_market_cap");
   else if (marketCapUsd < Number(config.minMarketCapUsd || 0) && config?.deferAssetChecks !== false) deferredChecks.push("market_cap_too_small");

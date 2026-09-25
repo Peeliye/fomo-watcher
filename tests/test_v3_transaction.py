@@ -1,33 +1,40 @@
 import time
 import unittest
+from unittest.mock import patch
 
 from coincurve import PrivateKey
 
 from fomo.execution.direct_v3 import CHAIN_CONFIGS, MAINNET_PROBE_POOL, BASE_PROBE_POOL
 from fomo.execution.evm_transaction import Eip1559Fields, decode_eip1559, keccak256, sign_eip1559
 from fomo.execution.v3_math import MAX_SQRT_RATIO, MIN_SQRT_RATIO
-from fomo.execution.v3_transaction import (EXACT_INPUT_SINGLE, EXACT_INPUT_SINGLE_02, build_unsigned_swap,
+from fomo.execution.v3_transaction import (EXACT_INPUT_SINGLE, EXACT_INPUT_SINGLE_02,
+                                           MULTICALL_DEADLINE, build_unsigned_swap,
                                            decode_exact_input_single,
                                            directional_price_limit,
                                            parse_signed_direct_swap)
 
 
 class V3TransactionTests(unittest.TestCase):
-    def test_base_router02_uses_deadline_free_abi_and_rejects_legacy_bytes(self):
+    def test_base_router02_binds_deadline_and_rejects_naked_legacy_bytes(self):
         target = BASE_PROBE_POOL
         self.assertEqual(EXACT_INPUT_SINGLE_02.hex(), "04e45aaf")
+        deadline = int(time.time()) + 60
         built = build_unsigned_swap(
             chain_id=8453, router=CHAIN_CONFIGS[8453].router,
             token0=target.token0, token1=target.token1, fee=target.fee,
             token_in=target.token0, wallet="0x" + "44" * 20,
             amount_in=10**15, quoted_out=10**6, slippage_bps=100,
             nonce=0, gas_limit=300000, priority_fee_wei=1, maximum_fee_wei=2,
-            deadline=int(time.time()) + 60,
+            deadline=deadline,
         )
         fields, _ = decode_eip1559(built.serialized, signed=False)
-        self.assertEqual(fields.data[:4], EXACT_INPUT_SINGLE_02)
-        self.assertEqual(len(fields.data), 4 + 7 * 32)
-        self.assertEqual(decode_exact_input_single(fields.data, chain_id=8453)["deadline"], 0)
+        self.assertEqual(fields.data[:4], MULTICALL_DEADLINE)
+        decoded = decode_exact_input_single(fields.data, chain_id=8453)
+        self.assertEqual(decoded["deadline"], deadline)
+        naked_inner = fields.data[164:164 + 4 + 7 * 32]
+        self.assertEqual(naked_inner[:4], EXACT_INPUT_SINGLE_02)
+        with self.assertRaisesRegex(ValueError, "v3_multicall_scope_invalid"):
+            decode_exact_input_single(naked_inner, chain_id=8453)
         with self.assertRaisesRegex(ValueError, "v3_swap_selector_or_length_invalid"):
             decode_exact_input_single(fields.data, chain_id=1)
         with self.assertRaisesRegex(ValueError, "v3_unsigned_scope_invalid"):
@@ -39,6 +46,31 @@ class V3TransactionTests(unittest.TestCase):
                 nonce=0, gas_limit=300000, priority_fee_wei=1, maximum_fee_wei=2,
                 deadline=int(time.time()) + 60,
             )
+
+    def test_base_signed_scope_rejects_expired_and_overlong_deadlines(self):
+        target = BASE_PROBE_POOL
+        key = b"\x04" * 32
+        wallet = "0x" + keccak256(
+            PrivateKey(key).public_key.format(compressed=False)[1:]
+        )[-20:].hex()
+        for deadline in (int(time.time()) - 1, int(time.time()) + 301):
+            with self.subTest(deadline=deadline):
+                with patch("fomo.execution.v3_transaction.time.time",
+                           return_value=deadline - 60):
+                    built = build_unsigned_swap(
+                        chain_id=8453, router=CHAIN_CONFIGS[8453].router,
+                        token0=target.token0, token1=target.token1, fee=target.fee,
+                        token_in=target.token0, wallet=wallet,
+                        amount_in=10**15, quoted_out=10**6, slippage_bps=100,
+                        nonce=0, gas_limit=300000, priority_fee_wei=1,
+                        maximum_fee_wei=2, deadline=deadline,
+                    )
+                with self.assertRaisesRegex(ValueError, "v3_signed_scope_invalid"):
+                    parse_signed_direct_swap(
+                        sign_eip1559(built.serialized, key), chain_id=8453,
+                        router=CHAIN_CONFIGS[8453].router,
+                        token0=target.token0, token1=target.token1, fee=target.fee,
+                    )
 
     def test_exact_input_single_selector_and_direction_boundaries(self):
         self.assertEqual(EXACT_INPUT_SINGLE.hex(), "414bf389")

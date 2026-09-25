@@ -24,6 +24,8 @@ MAINNET_USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 BASE_WETH9 = "0x4200000000000000000000000000000000000006"
 BASE_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 BASE_PROBE_PAIR = "0x88a43bbdf9d098eec7bceda4e2494615dfd9bb9c"
+ROBINHOOD_WETH9 = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+ROBINHOOD_USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,9 @@ CHAIN_CONFIGS: Mapping[str, V2ChainConfig] = {
     "8453": V2ChainConfig("0x8909dc15e40173ff4699343b6eb8132c65e18ec6",
                           "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
                           BASE_WETH9, BASE_USDC, BASE_PROBE_PAIR),
+    "4663": V2ChainConfig("0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
+                           "0x89e5db8b5aa49aa85ac63f691524311aeb649eba",
+                           ROBINHOOD_WETH9, ROBINHOOD_USDG, ""),
 }
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _WORD = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -193,7 +198,8 @@ class UniswapV2PoolReader:
                     data = ("0xe6a43905" + self.base_token[2:].rjust(64, "0")
                             + self.quote_token[2:].rjust(64, "0"))
                     pair = _decode_address(_eth_call(self.rpc, self.config.factory, data, tag))
-                if pair != self.config.probe_pair and {self.base_token, self.quote_token} == {self.config.weth, self.config.usdc}:
+                if (self.config.probe_pair and pair != self.config.probe_pair
+                        and {self.base_token, self.quote_token} == {self.config.weth, self.config.usdc}):
                     raise ValueError("v2_pair_identity_mismatch")
                 token0 = _decode_address(_eth_call(self.rpc, pair, "0x0dfe1681", tag))
                 token1 = _decode_address(_eth_call(self.rpc, pair, "0xd21220a7", tag))
@@ -290,6 +296,8 @@ def build_unsigned_swap(*, snapshot: V2PoolSnapshot, wallet: str, token_in: str,
 def parse_signed_direct_swap(serialized: bytes) -> Mapping[str, Any]:
     """Recover signer and reject multi-hop/non-Router02 signed transactions."""
     fields, _ = decode_eip1559(serialized, signed=True)
+    if fields.chain_id == 4663:
+        raise ValueError("v2_signed_direct_scope_invalid")  # Robinhood remains L0-only.
     config = CHAIN_CONFIGS.get(str(fields.chain_id))
     if config is None or "0x" + fields.to.hex() != config.router02:
         raise ValueError("v2_signed_direct_scope_invalid")

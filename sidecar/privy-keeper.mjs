@@ -32,7 +32,9 @@ const newestSeed = () => {
 
 const seed = newestSeed();
 if (!seed.access || !seed.refresh) throw new Error("缺少有效的 Fomo Privy 会话种子");
-const appId = JSON.parse(Buffer.from(seed.access.split(".")[1], "base64url").toString("utf8")).aud;
+const claims = JSON.parse(Buffer.from(seed.access.split(".")[1], "base64url").toString("utf8"));
+const appId = String(claims.aid || claims.aud || "").trim();
+if (!appId) throw new Error("Fomo Privy 会话缺少应用标识");
 let browser;
 let context;
 let page;

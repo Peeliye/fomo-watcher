@@ -22,12 +22,20 @@ class ExecutionIntent:
     token_out: str
     requested_usd: Decimal
     sell_ratio: Decimal | None = None
+    requested_asset_amount: str | None = None
 
     def __post_init__(self) -> None:
         if self.requested_usd < 0:
             raise ValueError("requested_usd must be non-negative")
         if self.sell_ratio is not None and not Decimal("0") < self.sell_ratio <= Decimal("1"):
             raise ValueError("sell_ratio must be within (0,1]")
+        if self.requested_asset_amount is not None:
+            try:
+                amount = int(self.requested_asset_amount)
+            except (TypeError, ValueError) as error:
+                raise ValueError("requested_asset_amount must be integer base units") from error
+            if amount <= 0 or str(amount) != self.requested_asset_amount:
+                raise ValueError("requested_asset_amount must be positive canonical base units")
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:

@@ -55,15 +55,16 @@ def _excessive_minimum(transaction: BuiltTransaction, *, reserve_out: int) -> Bu
 
 def main(argv: list[str] | None = None) -> int:
     args = argparse.ArgumentParser(description="V2 L0 read-only probe")
-    args.add_argument("--chain", choices=("1", "8453"), default="1")
+    args.add_argument("--chain", choices=("1", "8453", "4663"), default="1")
     chain = args.parse_args([] if argv is None else argv).chain
-    if chain == "8453":
+    if chain in ("8453", "4663"):
         load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
-    rpc_env = "RPC_BASE_URL" if chain == "8453" else "RPC_ETHEREUM_URL"
+    rpc_env = {"1": "RPC_ETHEREUM_URL", "8453": "RPC_BASE_URL",
+               "4663": "RPC_ROBINHOOD_URL"}[chain]
     if not os.getenv(rpc_env, "").strip():
         print(json.dumps({"status": "未注入", "tradingReady": False}))
         return 2
-    if chain == "8453":
+    if chain in ("8453", "4663"):
         started = time.monotonic()
         try:
             config = CHAIN_CONFIGS[chain]
@@ -71,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
                                                       http_env=rpc_env)])
             snapshot = UniswapV2PoolReader(rpc=rpc, chain_id=chain,
                                             base_token=config.weth, quote_token=config.usdc).snapshot()
-            if snapshot.pair != config.probe_pair:
+            if config.probe_pair and snapshot.pair != config.probe_pair:
                 raise ValueError("v2_pair_identity_mismatch")
             rows = []
             for token, amount in ((config.weth, 10**15), (config.usdc, 10**6)):
@@ -85,19 +86,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 fields, _ = decode_eip1559(unsigned.serialized, signed=False)
                 swap = decode_v2_swap(fields.data)
-                if fields.chain_id != 8453 or "0x" + fields.to.hex() != config.router02 or swap["amountIn"] != amount:
+                if fields.chain_id != int(chain) or "0x" + fields.to.hex() != config.router02 or swap["amountIn"] != amount:
                     raise ValueError("v2_base_codec_mismatch")
                 rows.append({"tokenIn": token, "amountIn": str(amount), "localAmountOut": str(output),
                              "codecRoundtrip": True, "simulationVerified": False})
             print(json.dumps({"readOnlyOk": True, "simulationVerified": False,
-                              "tradingReady": False, "chainId": 8453,
+                              "tradingReady": False, "chainId": int(chain),
                               "block": snapshot.block_height, "blockHash": snapshot.block_hash,
                               "factory": config.factory, "pair": snapshot.pair,
                               "rows": rows, "totalElapsedMs": round((time.monotonic()-started)*1000)}))
             return 0
         except Exception as error:
             print(json.dumps({"readOnlyOk": False, "simulationVerified": False,
-                              "tradingReady": False, "chainId": 8453,
+                              "tradingReady": False, "chainId": int(chain),
                               "errorType": type(error).__name__,
                               "reason": str(error) if str(error).startswith("v2_") else None}))
             return 1

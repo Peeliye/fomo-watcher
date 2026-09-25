@@ -9,6 +9,8 @@ from fomo.signals.envelope import TradeSignalEnvelope
 from fomo.signals.strategy import ExecutionIntent
 
 from .capabilities import CapabilityRegistry
+from .cached_direct_buy import (CaRouteCache, CachedDirectBuild,
+                                build_cached_direct_buy)
 from .chain_managers import EvmNonceManager, SolanaBlockhashManager
 from .coordinator import ExecutionCoordinator, MarketEvidenceProvider, RiskEvidenceProvider
 from .evm_transaction import EvmEip1559Builder, EvmTransactionParser, VaultEvmSigner
@@ -37,9 +39,26 @@ class ChainAdapters:
 
 
 class ExecutionAssembly:
-    def __init__(self, journal: ExecutionJournal) -> None:
+    def __init__(self, journal: ExecutionJournal, *, direct_cache: CaRouteCache | None = None) -> None:
         self.journal = journal
         self._chains: dict[str, ChainAdapters] = {}
+        self.direct_cache = direct_cache
+
+    def prepare_cached_direct_buy(self, intent: ExecutionIntent, *, wallet: str,
+                                  amount_in_units: int, nonce: int, gas_limit: int,
+                                  priority_fee_wei: int, maximum_fee_wei: int,
+                                  deadline: int, slippage_bps: int,
+                                  now_ms: int | None = None) -> CachedDirectBuild:
+        """Opt-in unsigned L0 branch; never arms or invokes live execution."""
+        if self.direct_cache is None:
+            raise ValueError("direct_buy_cache_unconfigured")
+        return build_cached_direct_buy(
+            intent, cache=self.direct_cache, wallet=wallet,
+            amount_in_units=amount_in_units, nonce=nonce, gas_limit=gas_limit,
+            priority_fee_wei=priority_fee_wei,
+            maximum_fee_wei=maximum_fee_wei, deadline=deadline,
+            slippage_bps=slippage_bps, now_ms=now_ms,
+        )
 
     def register(self, chain_id: str, adapters: ChainAdapters) -> None:
         if str(chain_id) in self._chains:

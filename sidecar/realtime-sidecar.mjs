@@ -6,6 +6,7 @@ import { createNdjsonQueue, evaluateShadow } from "./fast-shadow.mjs";
 import { createSignalQueue } from "./signal-queue.mjs";
 import { acquireSingletonLock } from "./process-lock.mjs";
 import { accessTokenExpiration, loadVaultAccessToken, selectNewestValidAccessToken } from "./secret-store.mjs";
+import { forwardLocalFomoBuy, shouldForwardFomoBuy } from "./local-fomo-forwarder.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const envFile = resolve(root, ".env");
@@ -72,6 +73,12 @@ function currentAccessToken() {
     catch { return ""; }
   })];
   return selectNewestValidAccessToken(candidates);
+}
+
+function localWebhookToken() {
+  if (process.env.FOMO_WEBHOOK_TOKEN) return process.env.FOMO_WEBHOOK_TOKEN;
+  try { return dotenv.parse(readFileSync(envFile, "utf8")).FOMO_WEBHOOK_TOKEN || ""; }
+  catch { return ""; }
 }
 
 async function flushStatus() {
@@ -178,6 +185,11 @@ function connect() {
         status({ reason: "durable-signal-queue-error" });
         if (ws === socket && ws.readyState === WebSocket.OPEN) ws.close(1013, "durable-queue-error");
         return;
+      }
+      if (shouldForwardFomoBuy(message.payload)) {
+        void forwardLocalFomoBuy(message.payload, localWebhookToken()).then(ok => {
+          if (!ok) status({ reason: "local-webhook-forward-unavailable" });
+        });
       }
       const enqueueStarted = performance.now();
       const eventPersisted = eventQueue.enqueue({ receivedAt, payload: message.payload });

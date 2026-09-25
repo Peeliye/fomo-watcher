@@ -122,7 +122,13 @@ class DurableSignalQueue:
             self.db.rollback()
             raise
 
-    def claim(self, owner: str, lease_ms: int = 5000) -> QueuedSignal | None:
+    def claim(self, owner: str, lease_ms: int = 5000, *, after_sequence: int = 0,
+              source: str | None = None,
+              exact_sequence: int | None = None) -> QueuedSignal | None:
+        if after_sequence < 0:
+            raise ValueError("invalid_queue_sequence_watermark")
+        if exact_sequence is not None and exact_sequence <= after_sequence:
+            raise ValueError("invalid_exact_queue_sequence")
         now = int(time.time() * 1000)
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -133,8 +139,11 @@ class DurableSignalQueue:
             if lock is None:
                 raise ValueError("execution_service_lock_required")
             row = self.db.execute(
-                "SELECT * FROM signal_queue WHERE status='queued' OR "
-                "(status='claimed' AND lease_until_ms<=?) ORDER BY sequence LIMIT 1", (now,),
+                "SELECT * FROM signal_queue WHERE sequence>? AND (? IS NULL OR source=?) "
+                "AND (? IS NULL OR sequence=?) "
+                "AND (status='queued' OR (status='claimed' AND lease_until_ms<=?)) "
+                "ORDER BY sequence LIMIT 1",
+                (after_sequence, source, source, exact_sequence, exact_sequence, now),
             ).fetchone()
             if row is None:
                 self.db.commit()

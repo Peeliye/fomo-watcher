@@ -24,9 +24,11 @@ EXACT_INPUT_SINGLE = keccak256(
 EXACT_INPUT_SINGLE_02 = keccak256(
     b"exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))"
 )[:4]
+MULTICALL_DEADLINE = keccak256(b"multicall(uint256,bytes[])")[:4]
 ROUTERS = {
     1: "0xe592427a0aece92de3edee1f18e0157c05861564",
     8453: "0x2626664c2603336e57b271c5c0b26f421741e481",
+    4663: "0xcaf681a66d020601342297493863e78c959e5cb2",
 }
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -55,6 +57,31 @@ def minimum_out(quoted_out: int, slippage_bps: int) -> int:
     return floor
 
 
+def _encode_deadline_multicall(deadline: int, inner: bytes) -> bytes:
+    if not 0 < deadline < 2**256 or not inner:
+        raise ValueError("v3_multicall_scope_invalid")
+    padding = bytes((-len(inner)) % 32)
+    return (MULTICALL_DEADLINE + deadline.to_bytes(32, "big")
+            + (64).to_bytes(32, "big") + (1).to_bytes(32, "big")
+            + (32).to_bytes(32, "big") + len(inner).to_bytes(32, "big")
+            + inner + padding)
+
+
+def _decode_deadline_multicall(data: bytes) -> tuple[int, bytes]:
+    if (len(data) < 4 + 5 * 32 or data[:4] != MULTICALL_DEADLINE
+            or int.from_bytes(data[36:68], "big") != 64
+            or int.from_bytes(data[68:100], "big") != 1
+            or int.from_bytes(data[100:132], "big") != 32):
+        raise ValueError("v3_multicall_scope_invalid")
+    deadline = int.from_bytes(data[4:36], "big")
+    length = int.from_bytes(data[132:164], "big")
+    padded = (length + 31) // 32 * 32
+    if (deadline <= 0 or length <= 0 or len(data) != 164 + padded
+            or any(data[164 + length:])):
+        raise ValueError("v3_multicall_scope_invalid")
+    return deadline, data[164:164 + length]
+
+
 def encode_exact_input_single(*, token_in: str, token_out: str, fee: int,
                               recipient: str, deadline: int, amount_in: int,
                               minimum_output: int, sqrt_price_limit_x96: int,
@@ -74,23 +101,28 @@ def encode_exact_input_single(*, token_in: str, token_out: str, fee: int,
               amount_in, minimum_output, sqrt_price_limit_x96))
     selector = EXACT_INPUT_SINGLE if chain_id == 1 else EXACT_INPUT_SINGLE_02
     encoded = selector + b"".join(value.to_bytes(32, "big") for value in words)
+    if chain_id in (8453, 4663):
+        encoded = _encode_deadline_multicall(deadline, encoded)
     if decode_exact_input_single(encoded, chain_id=chain_id)["amountIn"] != amount_in:
         raise ValueError("v3_swap_roundtrip_failed")
     return encoded
 
 
 def decode_exact_input_single(data: bytes, *, chain_id: int = 1) -> dict[str, Any]:
-    count = {1: 8, 8453: 7}.get(chain_id)
+    count = {1: 8, 8453: 7, 4663: 7}.get(chain_id)
     selector = EXACT_INPUT_SINGLE if chain_id == 1 else EXACT_INPUT_SINGLE_02
+    deadline = 0
+    if chain_id in (8453, 4663):
+        deadline, data = _decode_deadline_multicall(data)
     if count is None or len(data) != 4 + count * 32 or data[:4] != selector:
         raise ValueError("v3_swap_selector_or_length_invalid")
     words = [int.from_bytes(data[4 + index * 32:4 + (index + 1) * 32], "big")
              for index in range(count)]
-    if chain_id == 8453:
-        words.insert(4, 0)  # Router02 has no deadline field.
+    if chain_id in (8453, 4663):
+        words.insert(4, deadline)
     if (any(words[index] == 0 or words[index] >> 160 for index in (0, 1, 3))
             or words[0] == words[1] or not 0 < words[2] < 1_000_000
-            or any(words[index] <= 0 for index in ((4, 5, 6) if chain_id == 1 else (5, 6)))
+            or any(words[index] <= 0 for index in (4, 5, 6))
             or not MIN_SQRT_RATIO < words[7] < MAX_SQRT_RATIO):
         raise ValueError("v3_swap_fields_invalid")
     return {
@@ -127,6 +159,8 @@ def build_unsigned_swap(*, chain_id: int, router: str, token0: str, token1: str,
 
 def parse_signed_direct_swap(serialized: bytes, *, chain_id: int, router: str,
                              token0: str, token1: str, fee: int) -> Mapping[str, Any]:
+    if chain_id == 4663:
+        raise ValueError("v3_signed_chain_unapproved")  # Robinhood remains L0-only.
     fields, items = decode_eip1559(serialized, signed=True)
     if any(not isinstance(items[index], bytes) or
            (len(items[index]) > 1 and items[index][0] == 0)
@@ -142,7 +176,7 @@ def parse_signed_direct_swap(serialized: bytes, *, chain_id: int, router: str,
             or not 0 < s <= SECP256K1_N // 2
             or {swap["tokenIn"], swap["tokenOut"]} != {_address(token0), _address(token1)}
             or swap["fee"] != fee
-            or (chain_id == 1 and not int(time.time()) < swap["deadline"] <= int(time.time()) + 300)
+            or not int(time.time()) < swap["deadline"] <= int(time.time()) + 300
             or swap["sqrtPriceLimitX96"] != directional_price_limit(swap["tokenIn"], token0, token1)):
         raise ValueError("v3_signed_scope_invalid")
     signature = r.to_bytes(32, "big") + s.to_bytes(32, "big") + bytes([parity])

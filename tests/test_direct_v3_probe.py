@@ -4,7 +4,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from fomo.execution.direct_v3 import MAINNET_PROBE_POOL
+from fomo.execution.direct_v3 import BASE_PROBE_POOL, CHAIN_CONFIGS, MAINNET_PROBE_POOL
 from fomo.execution.v3_math import quote_exact_input, sqrt_ratio_at_tick
 from fomo.execution.v3_transaction import decode_exact_input_single
 from fomo.watching.rpc_transport import RpcUnavailable
@@ -42,6 +42,22 @@ class ProbeRpcFixture(V3RpcFixture):
 
 
 class V3ProbeTests(unittest.TestCase):
+    def test_base_probe_uses_tiny_inputs_without_simulation(self):
+        rpc = V3RpcFixture(target=BASE_PROBE_POOL, config=CHAIN_CONFIGS[8453])
+        output = io.StringIO()
+        with (patch.dict("os.environ", {"RPC_BASE_URL": "https://secret.invalid/base-key"}),
+              patch("scripts.direct_v3_probe.FailoverJsonRpc", return_value=rpc),
+              redirect_stdout(output)):
+            status = main(["--chain", "8453"])
+        result = json.loads(output.getvalue())
+        self.assertEqual(status, 0, result)
+        self.assertNotIn("secret.invalid", output.getvalue())
+        self.assertEqual(result["chainId"], 8453)
+        self.assertFalse(result["simulationVerified"])
+        self.assertFalse(result["tradingReady"])
+        self.assertLessEqual(int(result["rows"][0]["amountIn"]), 10**12)
+        self.assertLessEqual(int(result["rows"][1]["amountIn"]), 10**3)
+
     def _run(self, rpc):
         output = io.StringIO()
         with (patch.dict("os.environ", {"RPC_ETHEREUM_URL": "https://secret.invalid/private-key"}),

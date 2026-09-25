@@ -15,6 +15,7 @@ from curl_cffi.const import CurlOpt
 from dotenv import load_dotenv
 
 from fomo.execution.direct_v4 import (CHAIN_CONFIGS, MAINNET_PROBE_KEY, BASE_PROBE_KEY,
+                                      ROBINHOOD_PROBE_KEY, ROBINHOOD_PROBE_POOL_ID,
                                       UniswapV4PoolReader)
 from fomo.execution.rpc_pool import RpcEndpoint
 from fomo.execution.url_safety import validate_endpoint_url
@@ -89,17 +90,19 @@ class _BaseHttpDiagnostic:
 
 def main(argv: list[str] | None = None) -> int:
     args = argparse.ArgumentParser(description="V4 L0 read-only probe")
-    args.add_argument("--chain", choices=("1", "8453"), default="1")
-    chain = int(args.parse_args([] if argv is None else argv).chain)
+    args.add_argument("--chain", choices=("1", "8453", "4663"), default="1")
+    parsed = args.parse_args([] if argv is None else argv)
+    chain = int(parsed.chain)
     load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
-    rpc_env = "RPC_BASE_URL" if chain == 8453 else "RPC_ETHEREUM_URL"
+    rpc_env = {1: "RPC_ETHEREUM_URL", 8453: "RPC_BASE_URL",
+               4663: "RPC_ROBINHOOD_URL"}[chain]
     if not os.getenv(rpc_env, "").strip():
         print(json.dumps({"status": "未注入", "tradingReady": False}, ensure_ascii=False))
         return 2
     started = time.monotonic()
     stage = "read_pool"
     evidence = None
-    diagnostic = _BaseHttpDiagnostic() if chain == 8453 else None
+    diagnostic = _BaseHttpDiagnostic() if chain in (8453, 4663) else None
     rpc = None
     reader = None
     try:
@@ -108,16 +111,22 @@ def main(argv: list[str] | None = None) -> int:
                               **({"requester": diagnostic.request,
                                   "previous_header_fallback": True,
                                   "pin_health_during_view": True} if diagnostic else {}))
-        key = MAINNET_PROBE_KEY if chain == 1 else BASE_PROBE_KEY
+        if chain == 4663:
+            if ROBINHOOD_PROBE_KEY.pool_id != ROBINHOOD_PROBE_POOL_ID:
+                raise ValueError("v4_robinhood_probe_pool_id_mismatch")
+        stage = "read_pool"
+        key = {1: MAINNET_PROBE_KEY, 8453: BASE_PROBE_KEY,
+               4663: ROBINHOOD_PROBE_KEY}[chain]
         reader = UniswapV4PoolReader(rpc=rpc, chain_id=chain, key=key)
         snapshot = reader.snapshot()
         read_ms = round((time.monotonic() - started) * 1000)
         stage = "local_quote_and_codec"
         rows = []
-        for name, token, amount in (
-            ("ETH->USDC", key.currency0, 10**15),
-            ("USDC->ETH", key.currency1, 10**6),
-        ):
+        directions = (
+            ("ETH->" + ("USDG" if chain == 4663 else "USDC"), key.currency0, 10**15),
+            (("USDG" if chain == 4663 else "USDC") + "->ETH", key.currency1, 10**6),
+        )
+        for name, token, amount in directions:
             quote = snapshot.quote(token_in=token, amount_in=amount)
             transaction = build_unsigned_swap(
                 chain_id=chain, key=snapshot.key, token_in=token,
@@ -136,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                          "simulationVerified": False})
         evidence = {"chainId": chain, "block": snapshot.block_height,
                     "blockHash": snapshot.block_hash, "poolManager": CHAIN_CONFIGS[chain].pool_manager,
-                    "headerDiagnostic": (reader.last_header_diagnostic if chain == 8453 else None),
+                    "headerDiagnostic": (reader.last_header_diagnostic if chain in (8453, 4663) else None),
                     "poolId": snapshot.pool_id, "poolKey": {
                         "currency0": snapshot.key.currency0, "currency1": snapshot.key.currency1,
                         "fee": snapshot.key.fee, "tickSpacing": snapshot.key.tick_spacing,
@@ -151,10 +160,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"readOnlyOk": evidence is not None, "simulationVerified": False,
                           "tradingReady": False, "stage": stage,
                           "errorType": type(error).__name__,
-                          "reason": str(error) if str(error).startswith("v4_") else None,
+                          "reason": (str(error) if str(error).startswith("v4_") else None),
                           "rpcFailure": diagnostic.public(rpc) if diagnostic else None,
                           "headerDiagnostic": (reader.last_header_diagnostic
-                                               if reader is not None and chain == 8453 else None),
+                                               if reader is not None and chain in (8453, 4663) else None),
                           "totalElapsedMs": round((time.monotonic() - started) * 1000)},
                          ensure_ascii=False))
         return 1

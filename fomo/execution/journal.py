@@ -1,15 +1,17 @@
 """Durable execution state machine and atomic reservation journal.
 
-No adapter in this module signs or broadcasts. ``live_armed`` remains locked to
-zero by default; external execution services must pass every capability and
+No adapter in this module signs or broadcasts. ``live_armed`` defaults to
+zero; external execution services must pass every capability and
 preflight check before using the state-machine methods.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -59,11 +61,19 @@ CREATE TABLE IF NOT EXISTS execution_transitions (
 );
 CREATE TABLE IF NOT EXISTS execution_control (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-  live_armed INTEGER NOT NULL CHECK(live_armed=0),
+  live_armed INTEGER NOT NULL DEFAULT 0 CHECK(live_armed IN (0,1)),
   circuit_breaker_tripped INTEGER NOT NULL,
   breaker_reason TEXT NOT NULL,
   consecutive_failures INTEGER NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_operator_scope (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  chain_id INTEGER NOT NULL CHECK(chain_id=4663),
+  token_out TEXT NOT NULL,
+  native_in_wei TEXT NOT NULL,
+  route TEXT NOT NULL,
+  confirmed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_execution_state_time ON execution_intents(state,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_execution_chain_time ON execution_intents(chain_id,created_at DESC);
@@ -163,8 +173,125 @@ CREATE TABLE IF NOT EXISTS execution_solana_blockhashes (
   last_valid_block_height INTEGER NOT NULL, tx_hash TEXT,
   FOREIGN KEY(intent_id) REFERENCES execution_jobs(intent_id)
 );
-PRAGMA user_version=7;
+PRAGMA user_version=8;
 """
+
+
+def _apply_schema(db: sqlite3.Connection) -> None:
+    statement = ""
+    for line in SCHEMA.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            db.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.DatabaseError("execution_schema_incomplete")
+
+
+def _table_fingerprints(db: sqlite3.Connection) -> dict[str, tuple[int, str]]:
+    result: dict[str, tuple[int, str]] = {}
+    names = [str(row[0]) for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    )]
+    for name in names:
+        digest = hashlib.sha256()
+        count = 0
+        quoted = '"' + name.replace('"', '""') + '"'
+        for row in db.execute(f"SELECT * FROM {quoted} ORDER BY rowid"):
+            digest.update(repr(tuple(row)).encode("utf-8"))
+            digest.update(b"\n")
+            count += 1
+        result[name] = (count, digest.hexdigest())
+    return result
+
+
+def _backup_before_migration(db: sqlite3.Connection, path: Path
+                             ) -> tuple[Path, dict[str, tuple[int, str]]]:
+    directory = path.parent / "backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    version = int(db.execute("PRAGMA user_version").fetchone()[0])
+    target_path = directory / f"{path.stem}.pre-v8.from-v{version}.{stamp}.{uuid.uuid4().hex[:8]}.sqlite3"
+    target = sqlite3.connect(target_path)
+    try:
+        db.backup(target)
+        if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise sqlite3.DatabaseError("execution_migration_backup_integrity_failed")
+        if target.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise sqlite3.DatabaseError("execution_migration_backup_foreign_key_failed")
+        fingerprint = _table_fingerprints(target)
+    finally:
+        target.close()
+    if target_path.stat().st_size == 0:
+        raise sqlite3.DatabaseError("execution_migration_backup_empty")
+    return target_path, fingerprint
+
+
+def migrate_execution_database(path: str | Path) -> Path | None:
+    """Back up and transactionally upgrade an existing execution DB to v8."""
+    db_path = Path(path)
+    if not db_path.is_file() or db_path.stat().st_size == 0:
+        raise FileNotFoundError("execution_database_missing")
+    db = sqlite3.connect(db_path, timeout=5)
+    try:
+        db.execute("PRAGMA busy_timeout=5000")
+        db.execute("PRAGMA foreign_keys=ON")
+        version = int(db.execute("PRAGMA user_version").fetchone()[0])
+        if version > 8:
+            raise ValueError("unsupported_execution_journal_schema")
+        if version == 8:
+            control_sql = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_control'"
+            ).fetchone()
+            if (control_sql is None or "CHECK(live_armed IN (0,1))" not in control_sql[0]
+                    or db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                  "AND name='execution_operator_scope'").fetchone() is None):
+                raise ValueError("execution_control_schema_invalid")
+            return None
+        backup_path, before = _backup_before_migration(db, db_path)
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            if _table_fingerprints(db) != before:
+                raise sqlite3.DatabaseError("execution_migration_changed_since_backup")
+            control = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_control'"
+            ).fetchone()
+            if control is not None:
+                old_rows = db.execute("SELECT * FROM execution_control").fetchall()
+                if len(old_rows) != 1 or old_rows[0][0] != 1 or old_rows[0][1] != 0:
+                    raise sqlite3.DatabaseError("execution_migration_control_invalid")
+                db.execute("""CREATE TABLE execution_control_v8 (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    live_armed INTEGER NOT NULL DEFAULT 0 CHECK(live_armed IN (0,1)),
+                    circuit_breaker_tripped INTEGER NOT NULL,
+                    breaker_reason TEXT NOT NULL,
+                    consecutive_failures INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL)""")
+                db.execute("INSERT INTO execution_control_v8 SELECT * FROM execution_control")
+                db.execute("DROP TABLE execution_control")
+                db.execute("ALTER TABLE execution_control_v8 RENAME TO execution_control")
+                if db.execute("SELECT * FROM execution_control").fetchall() != old_rows:
+                    raise sqlite3.DatabaseError("execution_migration_control_mismatch")
+            _apply_schema(db)
+            now = datetime.now(timezone.utc).isoformat()
+            db.execute("INSERT OR IGNORE INTO execution_control VALUES(1,0,1,'startup_read_only',0,?)", (now,))
+            after = _table_fingerprints(db)
+            if any(after.get(name) != value for name, value in before.items()
+                   if name != "execution_control"):
+                raise sqlite3.DatabaseError("execution_migration_data_mismatch")
+            if db.execute("SELECT live_armed FROM execution_control WHERE singleton=1").fetchone()[0] != 0:
+                raise sqlite3.DatabaseError("execution_migration_armed")
+            if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError("execution_migration_integrity_failed")
+            if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise sqlite3.DatabaseError("execution_migration_foreign_key_failed")
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        return backup_path
+    finally:
+        db.close()
 
 JOB_TRANSITIONS: dict[str, frozenset[str]] = {
     "reserved": frozenset({"quoted", "failed", "dropped", "expired"}),
@@ -187,29 +314,27 @@ class ExecutionJournal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.account_id = account_id
         existed = self.path.exists() and self.path.stat().st_size > 0
+        if existed:
+            migrate_execution_database(self.path)
         self.db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self._write_lock = threading.RLock()
         version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
-        if version > 7:
+        if version > 8:
             self.db.close()
             raise ValueError("unsupported_execution_journal_schema")
-        if existed and version < 7:
-            directory = self.path.parent / "backups"
-            directory.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            target = sqlite3.connect(directory / f"{self.path.stem}.pre-v7.from-v{version}.{stamp}.sqlite3")
-            try:
-                self.db.backup(target)
-                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise sqlite3.DatabaseError("execution migration backup integrity check failed")
-            finally:
-                target.close()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
-        self.db.executescript(SCHEMA)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            _apply_schema(self.db)
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            self.db.close()
+            raise
         now = datetime.now(timezone.utc).isoformat()
         self.db.execute(
             "INSERT OR IGNORE INTO execution_control VALUES(1,0,1,'startup_read_only',0,?)", (now,)

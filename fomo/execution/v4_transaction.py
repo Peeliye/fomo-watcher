@@ -43,6 +43,8 @@ def encode_single_swap(*, chain_id: int, key: V4PoolKey, token_in: str,
     if config is None:
         raise ValueError("v4_chain_unapproved")
     key.validate(config)
+    if key.hooks != ZERO:
+        raise ValueError("v4_hook_encoding_not_verified")
     if (token_in not in {key.currency0, key.currency1}
             or not 0 < amount_in < 1 << 128 or not 0 < minimum_out < 1 << 128
             or not 0 < deadline < 1 << 256):
@@ -111,6 +113,8 @@ def _decode(data: bytes, *, chain_id: int) -> dict[str, Any]:
     if config is None:
         raise ValueError("v4_chain_unapproved")
     key.validate(config)
+    if key.hooks != ZERO:
+        raise ValueError("v4_hook_encoding_not_verified")
     if values[5] not in (0, 1) or _bytes(swap, values[8]) != b"":
         raise ValueError("v4_hook_or_direction_invalid")
     token_in = key.currency0 if values[5] else key.currency1

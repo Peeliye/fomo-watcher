@@ -66,9 +66,19 @@ CHAIN_CONFIGS: Mapping[int, V4ChainConfig] = {
         "0x6ff5693b99212da76ad316178a184ab56d299b43",
         frozenset({ZERO, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"}),
     ),
+    4663: V4ChainConfig(
+        4663, "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
+        "0x8876789976decbfcbbbe364623c63652db8c0904",
+        frozenset({ZERO, "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+                   "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+                   "0x314ad0f11422842d28b4f950a64cd40fafb029fd"}),
+    ),
 }
 MAINNET_PROBE_KEY = V4PoolKey(ZERO, USDC, 500, 10)
 BASE_PROBE_KEY = V4PoolKey(ZERO, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", 3000, 60)
+ROBINHOOD_PROBE_KEY = V4PoolKey(ZERO, "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 500, 10)
+ROBINHOOD_PROBE_POOL_ID = "0x387bf619da4d3fb62bb276482693dba1b9b3520f573cabdfe033384a24125982"
 
 
 def _selector(signature: str) -> str:
@@ -94,6 +104,53 @@ def _call(rpc: RpcTransport, to: str, signature: str, block_tag: str,
     return rpc.call("eth_call", [{"to": to, "data": data}, block_tag])
 
 
+def _read_tick_batch(rpc: RpcTransport, requests: list[tuple[str, list[Any]]],
+                     tag: str) -> list[Any]:
+    """Bounded same-height batch; fixture transports retain individual calls."""
+    if not 0 < len(requests) <= 3 or any(
+        method != "eth_call" or len(params) != 2 or params[1] != tag
+        for method, params in requests
+    ):
+        raise ValueError("v4_tick_batch_scope_invalid")
+    batch = getattr(rpc, "call_batch", None)
+    if callable(batch):
+        result = batch(requests)
+        if not isinstance(result, list):
+            raise ValueError("v4_tick_batch_response_invalid")
+        return result
+    return [rpc.call(method, params) for method, params in requests]
+
+
+def _tick_request(to: str, signature: str, tag: str, *args: int) -> tuple[str, list[Any]]:
+    data = _selector(signature) + "".join(f"{arg % (1 << 256):064x}" for arg in args)
+    return "eth_call", [{"to": to, "data": data}, tag]
+
+
+def _bitmap_position(tick: int, tick_spacing: int) -> tuple[int, int, int]:
+    """Uniswap v4 TickBitmap.compress/position, including negative ticks."""
+    if not -887272 <= tick <= 887272 or not 0 < tick_spacing <= 32767:
+        raise ValueError("v4_tick_position_invalid")
+    compressed = tick // tick_spacing  # Solidity sdiv plus negative remainder fix.
+    return compressed, compressed >> 8, compressed & 0xff
+
+
+def _initialized_ticks(word_index: int, bitmap: int, tick_spacing: int) -> tuple[int, ...]:
+    """Decode only set bits in one already-fetched 256-bit bitmap word."""
+    if not -(1 << 15) <= word_index < 1 << 15 or not 0 <= bitmap < 1 << 256:
+        raise ValueError("v4_bitmap_word_invalid")
+    ticks = []
+    remaining = bitmap
+    while remaining:
+        lowest = remaining & -remaining
+        bit = lowest.bit_length() - 1
+        tick = ((word_index << 8) + bit) * tick_spacing
+        if not -887272 <= tick <= 887272:
+            raise ValueError("v4_bitmap_tick_out_of_range")
+        ticks.append(tick)
+        remaining ^= lowest
+    return tuple(ticks)
+
+
 @dataclass(frozen=True, slots=True)
 class V4PoolSnapshot:
     chain_id: int
@@ -109,6 +166,12 @@ class V4PoolSnapshot:
     nearest_lower_tick: int | None
     nearest_upper_tick: int | None
     observed_at_ms: int
+    bitmap_words_read: int = 1
+    tick_info_read: int = 0
+    compressed_tick: int = 0
+    bitmap_word_index: int = 0
+    bitmap_bit_index: int = 0
+    bitmap_diagnostics: tuple[tuple[int, int, tuple[int, ...]], ...] = ()
 
     def quote(self, *, token_in: str, amount_in: int) -> V4Quote:
         config = CHAIN_CONFIGS.get(self.chain_id)
@@ -133,7 +196,8 @@ class UniswapV4PoolReader:
     def __init__(self, *, rpc: RpcTransport, chain_id: int = 1,
                  key: V4PoolKey | None = None) -> None:
         config = CHAIN_CONFIGS.get(chain_id)
-        key = key or {1: MAINNET_PROBE_KEY, 8453: BASE_PROBE_KEY}.get(chain_id)
+        key = key or {1: MAINNET_PROBE_KEY, 8453: BASE_PROBE_KEY,
+                      4663: ROBINHOOD_PROBE_KEY}.get(chain_id)
         if config is None or key is None:
             raise ValueError("v4_chain_unapproved")
         key.validate(config)
@@ -142,7 +206,7 @@ class UniswapV4PoolReader:
 
     def snapshot(self) -> V4PoolSnapshot:
         with rpc_view(self.rpc):
-            if self.config.chain_id == 8453:
+            if self.config.chain_id in (8453, 4663):
                 head = int(str(self.rpc.call("eth_blockNumber", [])), 16)
                 self.last_header_diagnostic = {"head": head, "selected": None,
                                                "fallback": False, "attempted": []}
@@ -174,7 +238,7 @@ class UniswapV4PoolReader:
             if (height <= 0 or not _HASH.fullmatch(block_hash)
                     or not 0 <= time.time() - timestamp <= 60):
                 raise ValueError("v4_block_stale_or_invalid")
-            if self.config.chain_id == 8453 and height != self.last_header_diagnostic["selected"]:
+            if self.config.chain_id in (8453, 4663) and height != self.last_header_diagnostic["selected"]:
                 raise ValueError("v4_block_stale_or_invalid")
             tag, config, key = hex(height), self.config, self.key
             for address in (config.pool_manager, config.state_view, config.universal_router):
@@ -203,20 +267,23 @@ class UniswapV4PoolReader:
                     or (packed >> 208) & 0xffffff != lp_fee
                     or raw_liquidity & ((1 << 128) - 1) != liquidity):
                 raise ValueError("v4_state_view_manager_mismatch")
-            compressed = tick // key.tick_spacing
-            bitmap_word, position = compressed >> 8, compressed & 255
-            bits = _word(_call(self.rpc, config.state_view, "getTickBitmap(bytes32,int16)",
-                               tag, pool_word, bitmap_word))
-            lower_bits = bits & ((1 << (position + 1)) - 1)
-            upper_bits = bits >> (position + 1)
-            lower = ((bitmap_word << 8) + lower_bits.bit_length() - 1) * key.tick_spacing if lower_bits else None
-            upper = ((bitmap_word << 8) + position + 1
-                     + (upper_bits & -upper_bits).bit_length() - 1) * key.tick_spacing if upper_bits else None
-            for boundary in (lower, upper):
-                if boundary is None:
-                    continue
-                raw = _call(self.rpc, config.state_view, "getTickInfo(bytes32,int24)",
-                            tag, pool_word, boundary)
+            compressed, bitmap_word, position = _bitmap_position(tick, key.tick_spacing)
+            words = [bitmap_word]
+            bitmap_raw = _read_tick_batch(self.rpc, [
+                _tick_request(config.state_view, "getTickBitmap(bytes32,int16)",
+                              tag, pool_word, index) for index in words], tag)
+            bitmaps = {index: _word(raw) for index, raw in zip(words, bitmap_raw)}
+            diagnostics = tuple((index, bitmaps[index],
+                                 _initialized_ticks(index, bitmaps[index], key.tick_spacing))
+                                for index in words)
+            parsed = [candidate for _, _, ticks in diagnostics for candidate in ticks]
+            lower = max((candidate for candidate in parsed if candidate <= tick), default=None)
+            upper = min((candidate for candidate in parsed if candidate > tick), default=None)
+            boundaries = [boundary for boundary in (lower, upper) if boundary is not None]
+            tick_raw = _read_tick_batch(self.rpc, [
+                _tick_request(config.state_view, "getTickInfo(bytes32,int24)",
+                              tag, pool_word, boundary) for boundary in boundaries], tag) if boundaries else []
+            for raw in tick_raw:
                 if (not isinstance(raw, str) or len(raw) != 2 + 64 * 4
                         or int(raw[2:66], 16) <= 0):
                     raise ValueError("v4_initialized_tick_missing")
@@ -228,7 +295,9 @@ class UniswapV4PoolReader:
             raise ValueError("v4_block_stale_after_read")
         return V4PoolSnapshot(config.chain_id, key, pool_id, height, block_hash,
                               sqrt_price, tick, protocol_fee, lp_fee, liquidity,
-                              lower, upper, observed)
+                              lower, upper, observed,
+                              len(words), len(tick_raw), compressed, bitmap_word,
+                              position, diagnostics)
 
 
 def attempt_same_block_simulation(rpc: RpcTransport, *, transaction: BuiltTransaction,

@@ -1,7 +1,8 @@
 import time
 import unittest
 
-from fomo.execution.direct_v4 import (CHAIN_CONFIGS, MAINNET_PROBE_KEY, BASE_PROBE_KEY, ZERO,
+from fomo.execution.direct_v4 import (CHAIN_CONFIGS, MAINNET_PROBE_KEY, BASE_PROBE_KEY,
+                                      ROBINHOOD_PROBE_KEY, ZERO,
                                       UniswapV4PoolReader, V4PoolKey, _selector,
                                       attempt_same_block_simulation)
 from fomo.execution.v3_math import sqrt_ratio_at_tick
@@ -48,7 +49,8 @@ class V4RpcFixture:
             call = params[0]
             data = call["data"]
             config = CHAIN_CONFIGS[self.chain_id]
-            key = MAINNET_PROBE_KEY if self.chain_id == 1 else BASE_PROBE_KEY
+            key = {1: MAINNET_PROBE_KEY, 8453: BASE_PROBE_KEY,
+                   4663: ROBINHOOD_PROBE_KEY}[self.chain_id]
             packed = (sqrt_ratio_at_tick(5) + (5 << 160) + (key.fee << 208))
             if call["to"] == config.universal_router:
                 return "0x"
@@ -70,6 +72,13 @@ class V4RpcFixture:
 
 
 class DirectV4Tests(unittest.TestCase):
+    def test_robinhood_zero_hook_reader_has_no_hook_policy_reads(self):
+        rpc = V4RpcFixture(chain_id=4663)
+        snapshot = UniswapV4PoolReader(rpc=rpc, chain_id=4663).snapshot()
+        self.assertEqual(snapshot.key, ROBINHOOD_PROBE_KEY)
+        self.assertGreater(snapshot.quote(token_in=ZERO, amount_in=10**12).amount_out, 0)
+        self.assertFalse(any(method == "eth_getLogs" for method, _ in rpc.calls))
+
     def test_base_reader_rejects_when_both_headers_unavailable(self):
         class MissingHeaders(V4RpcFixture):
             def call(self, method, params):

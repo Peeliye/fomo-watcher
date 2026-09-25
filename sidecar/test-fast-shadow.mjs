@@ -5,7 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzip } from "node:zlib";
 import { promisify } from "node:util";
-import { createNdjsonQueue, evaluateShadow } from "./fast-shadow.mjs";
+import { createNdjsonQueue, decideFreshness, evaluateShadow } from "./fast-shadow.mjs";
+
+test("freshness@1 matches Python arrival-time golden vectors", async () => {
+  const vectors = JSON.parse(await readFile(new URL("../tests/fixtures/freshness-v1.json", import.meta.url), "utf8"));
+  for (const [source, observed, consume, accepted, upstream, queue, skew] of vectors) {
+    assert.deepEqual(decideFreshness(source, observed, consume, 5000), {
+      accepted, upstreamDelayMs: upstream, localQueueDelayMs: queue, clockSkewMs: skew,
+    });
+  }
+});
 
 const gunzipAsync = promisify(gunzip);
 

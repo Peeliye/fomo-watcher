@@ -32,11 +32,13 @@ BLOCK = "0x" + "cd" * 32
 
 class HermesFixture:
     def __init__(self, *, feed_id: str = FEED, requested_feed_id: str = FEED,
-                 age_seconds: int = 0, confidence: str = "100000") -> None:
+                 age_seconds: int = 0, confidence: str = "100000",
+                 publish_time: int | None = None) -> None:
         self.feed_id = feed_id
         self.requested_feed_id = requested_feed_id
         self.age_seconds = age_seconds
         self.confidence = confidence
+        self.publish_time = publish_time
         self.calls = 0
 
     def request(self, method, url, *, params, payload, headers):
@@ -46,7 +48,8 @@ class HermesFixture:
         assert payload is None and headers["Authorization"].startswith("Bearer ")
         return {"parsed": [{"id": self.feed_id, "price": {
             "price": "250000000000", "conf": self.confidence, "expo": -8,
-            "publish_time": int(time.time()) - self.age_seconds,
+            "publish_time": (int(time.time()) if self.publish_time is None
+                             else self.publish_time) - self.age_seconds,
         }}]}
 
 
@@ -266,7 +269,7 @@ class MarketEvidenceTests(unittest.TestCase):
                                 datetime.fromtimestamp(now / 1000, timezone.utc).isoformat(),
                                 "10", True, ("route",))
         adapter = PythHermesPriceAdapter(chain_id=1, asset="ETH", feed_id=FEED,
-                                         transport=HermesFixture())
+                                         transport=HermesFixture(publish_time=now // 1000))
         with patch.dict("os.environ", {"PYTH_API_KEY": ""}):
             with self.assertRaisesRegex(ValueError, "credential_unavailable"):
                 collect_market_evidence(quote, price_adapter=adapter, rpc=EvmRpcFixture(),

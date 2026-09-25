@@ -16,6 +16,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from fomo.execution.direct_v3 import (CHAIN_CONFIGS, MAINNET_PROBE_POOL, BASE_PROBE_POOL,
+                                      ROBINHOOD_PROBE_POOL,
                                       UniswapV3PoolReader, mainnet_probe_override,
                                       simulate_same_block, verify_mainnet_probe_override)
 from fomo.execution.rpc_pool import RpcEndpoint
@@ -23,6 +24,7 @@ from fomo.execution.v3_transaction import (build_unsigned_swap, decode_exact_inp
                                            encode_exact_input_single)
 from fomo.execution.evm_transaction import decode_eip1559
 from fomo.watching.rpc_transport import FailoverJsonRpc, RpcUnavailable, rpc_view
+from scripts._robinhood_probe_transport import proxy_configured, read_only_proxy_request
 
 
 PUBLIC_WALLET = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
@@ -34,37 +36,55 @@ SYNTHETIC_USDC_UNITS = 10 * 10**6
 
 def main(argv: list[str] | None = None) -> int:
     args = argparse.ArgumentParser(description="V3 L0 read-only probe")
-    args.add_argument("--chain", choices=("1", "8453"), default="1")
+    args.add_argument("--chain", choices=("1", "8453", "4663"), default="1")
     chain = int(args.parse_args([] if argv is None else argv).chain)
     load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
-    rpc_env = "RPC_BASE_URL" if chain == 8453 else "RPC_ETHEREUM_URL"
+    rpc_env = {1: "RPC_ETHEREUM_URL", 8453: "RPC_BASE_URL",
+               4663: "RPC_ROBINHOOD_URL"}[chain]
     if not os.getenv(rpc_env, "").strip():
         print(json.dumps({"status": "未注入", "tradingReady": False}))
         return 2
-    if chain == 8453:
+    if chain in (8453, 4663):
         started = time.monotonic()
         stage = "read_pool"
         reader = None
         rpc = None
         try:
-            config, target = CHAIN_CONFIGS[chain], BASE_PROBE_POOL
+            config = CHAIN_CONFIGS[chain]
+            target = BASE_PROBE_POOL if chain == 8453 else ROBINHOOD_PROBE_POOL
+            proxy_requester = (read_only_proxy_request
+                               if chain == 4663 and proxy_configured() else None)
             rpc = FailoverJsonRpc(str(chain), [RpcEndpoint(str(chain), "direct-v3-base-l0",
                                                            "primary", http_env=rpc_env)],
-                                  previous_header_fallback=True)
+                                  previous_header_fallback=True,
+                                  requester=proxy_requester)
+            if proxy_requester is not None:
+                rpc.uses_network_transport = True  # Retain pinned-block Multicall3 reads.
             reader = UniswapV3PoolReader(rpc=rpc, chain_id=chain, target=target)
             snapshot = reader.snapshot()
             stage = "local_quote_and_codec"
             rows = []
-            for token, initial in ((target.token0, 10**15), (target.token1, 10**6)):
+            # Small Base probes should stay in the current tick whenever
+            # possible. Never enlarge the read window to satisfy a probe.
+            amounts = ((target.token0, 10**12), (target.token1, 10**3)) if chain == 8453 else (
+                (target.token0, 10**15), (target.token1, 10**6))
+            for token, initial in amounts:
                 amount = initial
                 for _ in range(4):
                     try:
                         quote = snapshot.quote(token_in=token, amount_in=amount)
-                        break
                     except ValueError as error:
                         if str(error) not in {"v3_initialized_tick_missing", "v3_bitmap_word_missing"}:
                             raise
                         amount //= 10
+                        if amount == 0:
+                            raise ValueError("v3_probe_amount_not_covered") from error
+                        continue
+                    if len(quote.crossed_ticks) <= 2 and quote.amount_in == amount:
+                        break
+                    amount //= 10
+                    if amount == 0:
+                        raise ValueError("v3_probe_amount_not_covered")
                 else:
                     raise ValueError("v3_probe_amount_not_covered")
                 if quote.amount_in != amount or quote.block_hash != snapshot.block_hash:
@@ -83,12 +103,14 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("v3_base_codec_mismatch")
                 rows.append({"tokenIn": token, "amountIn": str(amount),
                              "localAmountOut": str(quote.amount_out),
+                             "crossedTicks": len(quote.crossed_ticks),
                              "codecRoundtrip": True, "simulationVerified": False})
             print(json.dumps({"readOnlyOk": True, "simulationVerified": False,
                               "tradingReady": False, "chainId": chain,
                               "block": snapshot.block_height, "blockHash": snapshot.block_hash,
                               "blockDiagnostic": reader.last_block_diagnostic,
                               "factory": config.factory, "pool": snapshot.pool,
+                              "getPoolVerified": snapshot.pool == target.pool,
                               "fee": snapshot.fee, "rows": rows,
                               "totalElapsedMs": round((time.monotonic()-started)*1000)}))
             return 0
@@ -99,12 +121,12 @@ def main(argv: list[str] | None = None) -> int:
                               "reason": str(error) if str(error).startswith("v3_") else None,
                               "blockDiagnostic": (reader.last_block_diagnostic
                                                   if reader is not None else None),
-                              "rpcFailure": ({"method": rpc.last_request_method,
-                                              "blockTagged": rpc.last_block_tagged,
-                                              "httpStatus": rpc.last_http_status,
-                                              "providerErrorCode": rpc.last_provider_error_code,
-                                              "transportErrorType": rpc.last_transport_error_type,
-                                              "rpcDiagnostic": rpc.last_diagnostic}
+                              "rpcFailure": ({"method": getattr(rpc, "last_request_method", None),
+                                              "blockTagged": getattr(rpc, "last_block_tagged", None),
+                                              "httpStatus": getattr(rpc, "last_http_status", None),
+                                              "providerErrorCode": getattr(rpc, "last_provider_error_code", None),
+                                              "transportErrorType": getattr(rpc, "last_transport_error_type", None),
+                                              "rpcDiagnostic": getattr(rpc, "last_diagnostic", None)}
                                              if rpc is not None else None),
                               "totalElapsedMs": round((time.monotonic()-started)*1000)}))
             return 1

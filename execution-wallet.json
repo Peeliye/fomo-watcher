@@ -3,8 +3,8 @@
   "walletId": "primary-multichain",
   "mode": "disabled",
   "signer": {
-    "backend": "disabled",
-    "reference": null
+    "backend": "os_credential_store",
+    "reference": "live-wallet"
   },
   "accounts": [
     {

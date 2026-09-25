@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import re
 from typing import Any, Mapping
 
 from .envelope import TradeSignalEnvelope, raw_payload_hash
@@ -34,18 +36,27 @@ class FomoPushAdapter:
         observed_dt = datetime.fromisoformat(observed.replace("Z", "+00:00"))
         source_dt = datetime.fromisoformat(source_timestamp.replace("Z", "+00:00"))
         delay = max(0, int((observed_dt - source_dt).total_seconds() * 1000))
-        trade_reference = str(event.get("txHash") or event.get("tradeId") or "").strip() or None
+        raw_tx_hash = str(event.get("txHash") or "").strip()
+        tx_hash = raw_tx_hash.lower() if re.fullmatch(r"0x[0-9a-fA-F]{64}", raw_tx_hash) else None
+        trade_id = str(event.get("tradeId") or "").strip()
+        # Fomo's trade identifier groups multiple platform notifications about
+        # one economic event. It is not a chain transaction hash.
+        event_group = ("fomo:trade:" + hashlib.sha256(trade_id.encode()).hexdigest()
+                       if trade_id else f"fomo:event:{source_event_id}")
+        signature = str(event.get("signature") or event.get("tradeId") or "").strip() or None
         return TradeSignalEnvelope.create(
             source="fomo_push", source_event_id=source_event_id, observed_at=observed,
             source_timestamp=source_timestamp, delivery_delay_ms=delay, chain_id=chain_id,
             actor_wallet=event.get("wallet"), kol_id=user_id, side=side,
-            token_in=token if side == "sell" else str(event.get("quoteToken") or ""),
+            # The original quoteToken remains in the durable raw payload. It is
+            # source metadata, not a verified asset for our native-ETH route.
+            token_in=token if side == "sell" else "",
             token_out=token if side == "buy" else str(event.get("quoteToken") or ""),
             source_amount=event.get("tokenAmount") or event.get("amount"),
             estimated_usd=event.get("usdAmount") or event.get("amountUsd"),
-            tx_hash=trade_reference if chain_id != "1399811149" else None,
-            signature=trade_reference if chain_id == "1399811149" else None,
+            tx_hash=tx_hash if chain_id != "1399811149" else None,
+            signature=signature if chain_id == "1399811149" else None,
             log_index=event.get("logIndex"), instruction_index=event.get("instructionIndex"),
-            confirmation_level="confirmed", reorg_key=f"fomo:{source_event_id}",
+            confirmation_level="pending", reorg_key=event_group,
             decoder_version=self.decoder_version, raw_payload_hash=raw_payload_hash(payload),
         )
